@@ -3,9 +3,13 @@ const { readFileSync } = require("fs");
 const { resolve } = require("path");
 
 let pool = null;
+let poolConfigHash = "";
 
 function getPool(settings) {
-  if (!pool) {
+  const configHash = `${settings.pgHost}:${settings.pgPort}:${settings.pgDatabase}:${settings.pgUser}`;
+  if (!pool || configHash !== poolConfigHash) {
+    if (pool) pool.end().catch(() => {});
+    poolConfigHash = configHash;
     pool = new Pool({
       host: settings.pgHost || "localhost",
       port: settings.pgPort || 5432,

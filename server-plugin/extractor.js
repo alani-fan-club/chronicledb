@@ -69,7 +69,7 @@ ${msgBlock}
 JSON:`;
 
   const apiKey = settings.geminiApiKey || "";
-  const model = settings.extractionModel || "gemini-2.0-flash";
+  const model = settings.extractionModel || "gemini-2.5-flash-lite";
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   const res = await fetch(geminiUrl, {

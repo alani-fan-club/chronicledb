@@ -122,16 +122,21 @@ async function ingestLorebook(settings, filename, embedFn) {
 
 /**
  * Classify a lorebook entry into a domain based on heuristics.
+ *
+ * IMPORTANT: never return 'secret', 'lore', or 'backstory' here — those
+ * domains are reserved for getKnowledgeBoundaries() (per-character knowledge
+ * boundaries). Lorebook entries are global worldbuilding, not per-character
+ * secrets, so they must use a separate domain or every character would be
+ * marked as "does not know" every lorebook entry.
  */
 function classifyEntry(comment, keys, content) {
   const text = `${comment} ${keys.join(" ")} ${content}`.toLowerCase();
 
-  if (text.match(/\b(race|species|class|ability|magic|spell|skill)\b/)) return "lore";
-  if (text.match(/\b(secret|hidden|unknown|forbidden|only .* knows)\b/)) return "secret";
+  if (text.match(/\b(race|species|class|ability|magic|spell|skill)\b/)) return "worldbuilding";
   if (text.match(/\b(rule|law|custom|tradition|taboo|must|always|never)\b/)) return "rule";
-  if (text.match(/\b(born|childhood|past|history|origin|backstory|used to)\b/)) return "backstory";
-  if (text.match(/\b(city|town|village|forest|mountain|river|kingdom|realm|land)\b/)) return "lore";
-  return "lore";
+  if (text.match(/\b(born|childhood|past|history|origin|used to)\b/)) return "background";
+  if (text.match(/\b(city|town|village|forest|mountain|river|kingdom|realm|land)\b/)) return "setting";
+  return "worldbuilding";
 }
 
 /**

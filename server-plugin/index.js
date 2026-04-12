@@ -81,13 +81,16 @@ async function init(router) {
           firstSeen: new Date().toISOString(),
         });
 
-        // Store character facts
+        // Store character "new_facts" as traits (innate properties).
+        // Matches /ingest-chat semantics — traits is the canonical home
+        // for character personality/background, not the facts table.
+        const charId = db.slugify(char.name);
         for (const fact of (char.new_facts || [])) {
-          await db.upsertFact(settings, {
+          await db.upsertTrait(settings, {
+            characterId: charId,
+            category: "personality",
             content: fact,
-            domain: "character",
-            confidence: 0.8,
-            characterScope: [char.name],
+            sourceChat: chatId || "",
           });
         }
       }
@@ -117,18 +120,16 @@ async function init(router) {
 
       // Items
       for (const item of (extraction.items || [])) {
-        const p = db.getPool(settings);
-        const itemId = `item-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-        let ownerId = null;
-        let locationId = null;
-        if (item.owner) ownerId = db.slugify(item.owner);
-        if (item.location) locationId = await db.upsertLocation(settings, item.location, "");
-        await p.query(
-          `INSERT INTO items (id, name, description, powers, significance, owner_id, location_id, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT DO NOTHING`,
-          [itemId, item.name, item.description || "", item.powers || "", item.significance || 3, ownerId, locationId, item.status || "intact"],
-        );
+        await db.upsertItem(settings, {
+          name: item.name,
+          description: item.description,
+          powers: item.powers,
+          significance: item.significance,
+          owner: item.owner,
+          location: item.location,
+          status: item.status,
+          chatId,
+        });
       }
 
       // Location detail updates
@@ -147,7 +148,7 @@ async function init(router) {
       }
 
       for (const event of (extraction.events || [])) {
-        const eventId = await db.insertEvent(settings, {
+        const eventId = await db.upsertEvent(settings, {
           summary: event.summary,
           participants: event.participants,
           location: event.location,
@@ -202,6 +203,28 @@ async function init(router) {
           emotionalTone: snap.emotional_tone || "",
           worldStateSnapshot: wsSnapshot,
         });
+
+        // Mark these characters as currently present at this location.
+        // retriever.js::getLocations reads present_at to populate the
+        // "Current Scene" section, so without these writes that section
+        // is always empty.
+        if (snap.location && snap.present_characters?.length > 0) {
+          const locationId = await db.upsertLocation(settings, snap.location, "");
+          const p = db.getPool(settings);
+          const charIds = snap.present_characters.map((n) => db.slugify(n));
+          await p.query(
+            `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
+            [charIds],
+          ).catch(() => {});
+          for (const charName of snap.present_characters) {
+            const charId = db.slugify(charName);
+            await db.upsertCharacter(settings, { name: charName });
+            await p.query(
+              `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
+              [charId, locationId],
+            ).catch(() => {});
+          }
+        }
       }
 
       // 4. Ingest plot threads
@@ -255,13 +278,21 @@ async function init(router) {
         ? await db.getCharacterMemoryConfig(settings, characterName)
         : { sessionMode: "persistent", selectedChats: [] };
 
+      // Honor the chat picker. If the user hasn't picked any chats, fall back
+      // to the current chatId so retrieval is at least scoped to this chat
+      // (avoids cross-chat pollution between e.g. ChatB and Protagonist).
+      const configuredChats = Array.isArray(charConfig.selectedChats) ? charConfig.selectedChats : [];
+      const selectedChats = configuredChats.length > 0
+        ? configuredChats
+        : (chatId ? [chatId] : []);
+
       const result = await retrieve(settings, {
         chatId,
         activeCharacters: activeCharacters || [],
         recentText: recentText || "",
         sessionMode: charConfig.sessionMode || "persistent",
         sessionId,
-        selectedChats: charConfig.selectedChats || [], // scoped chat IDs
+        selectedChats, // scoped chat IDs (defaults to [chatId] when no preference set)
       });
 
       const memoryBlock = formatMemoryBlock(result, maxTokens || 1500);
@@ -491,7 +522,7 @@ async function init(router) {
           // Events — track event_key → event_id mapping for arcs/chains
           const eventKeyToId = new Map();
           for (const event of (extraction.events || [])) {
-            const eventId = await db.insertEvent(settings, { summary: event.summary, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
+            const eventId = await db.upsertEvent(settings, { summary: event.summary, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
             if (event.event_key) eventKeyToId.set(event.event_key, eventId);
           }
 
@@ -546,12 +577,16 @@ async function init(router) {
 
           // Items
           for (const item of (extraction.items || [])) {
-            const p = db.getPool(settings);
-            const itemId = `item-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
-            let ownerId = item.owner ? db.slugify(item.owner) : null;
-            let locationId = item.location ? await db.upsertLocation(settings, item.location, "") : null;
-            await p.query(`INSERT INTO items (id,name,description,powers,significance,owner_id,location_id,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
-              [itemId, item.name, item.description||"", item.powers||"", item.significance||3, ownerId, locationId, item.status||"intact"]).catch(()=>{});
+            await db.upsertItem(settings, {
+              name: item.name,
+              description: item.description,
+              powers: item.powers,
+              significance: item.significance,
+              owner: item.owner,
+              location: item.location,
+              status: item.status,
+              chatId,
+            }).catch(()=>{});
           }
 
           // Context snapshot
@@ -560,6 +595,28 @@ async function init(router) {
             const wsSnap = {};
             for (const ws of (extraction.world_state || [])) wsSnap[ws.key] = ws.value;
             await db.insertContextSnapshot(settings, { chatId, messageIndex: i, summary: snap.summary||"", locationName: snap.location||null, presentChars: snap.present_characters||[], emotionalTone: snap.emotional_tone||"", worldStateSnapshot: wsSnap });
+
+            // Mark these characters as currently present at this location.
+            // retriever.js::getLocations reads present_at to populate the
+            // "Current Scene" section, so without these writes that section
+            // is always empty.
+            if (snap.location && snap.present_characters?.length > 0) {
+              const locationId = await db.upsertLocation(settings, snap.location, "");
+              const p = db.getPool(settings);
+              const charIds = snap.present_characters.map((n) => db.slugify(n));
+              await p.query(
+                `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
+                [charIds],
+              ).catch(() => {});
+              for (const charName of snap.present_characters) {
+                const charId = db.slugify(charName);
+                await db.upsertCharacter(settings, { name: charName });
+                await p.query(
+                  `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
+                  [charId, locationId],
+                ).catch(() => {});
+              }
+            }
           }
 
           // Plot threads

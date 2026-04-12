@@ -8,18 +8,22 @@ const db = require("./db");
 const { embed } = require("./extractor");
 
 async function retrieve(settings, { chatId, activeCharacters, recentText, sessionMode, sessionId, selectedChats }) {
-  // If character has selected specific chats, use those for vector search scope
-  // Empty selectedChats = all chats (persistent mode)
-  const chatScope = (selectedChats && selectedChats.length > 0)
+  // Compute the chat-id scope once and thread it through every helper.
+  // - explicit selectedChats wins (per-character preference from the chat picker UI)
+  // - otherwise default to the current chatId (always scope to the current chat)
+  // Vector search keeps the same scope; passing null falls back to global only when
+  // no chatId is available at all (e.g. ad-hoc tooling calls).
+  const chatIds = (selectedChats && selectedChats.length > 0)
     ? selectedChats
-    : (sessionMode === "isolated" ? [chatId] : null);
+    : (chatId ? [chatId] : null);
+  const chatScope = chatIds; // vector search uses the same scope
 
   // Run all queries in parallel
   const [relationships, events, knowledge, worldState, vectorResults, locations, snapshots, plotThreads] = await Promise.all([
-    db.getRelationships(settings, activeCharacters),
-    db.getRecentEvents(settings, chatId, 5),
-    db.getKnowledgeBoundaries(settings, activeCharacters),
-    db.getWorldState(settings),
+    db.getRelationships(settings, activeCharacters, chatIds),
+    db.getRecentEvents(settings, chatId, 5, chatIds),
+    db.getKnowledgeBoundaries(settings, activeCharacters, chatIds),
+    db.getWorldState(settings, chatIds),
     recentText ? semanticSearchScoped(settings, recentText, chatScope) : [],
     getLocations(settings, activeCharacters),
     db.getRecentSnapshots(settings, chatId, 2),

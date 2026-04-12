@@ -1,9 +1,20 @@
 const { Pool } = require("pg");
 const { readFileSync } = require("fs");
 const { resolve } = require("path");
+const { createHash } = require("crypto");
 
 let pool = null;
 let poolConfigHash = "";
+
+/**
+ * Compute a deterministic content-addressed ID from a semantic key.
+ * Re-ingesting the same content will produce the same ID, allowing
+ * ON CONFLICT clauses to dedupe rows instead of inserting duplicates.
+ */
+function contentId(prefix, key) {
+  const hash = createHash("sha1").update(key).digest("hex").slice(0, 16);
+  return `${prefix}-${hash}`;
+}
 
 function getPool(settings) {
   const configHash = `${settings.pgHost}:${settings.pgPort}:${settings.pgDatabase}:${settings.pgUser}`;
@@ -76,18 +87,19 @@ async function upsertRelationship(settings, { from, to, sentiment, intensity, de
   // Ensure both characters exist
   await upsertCharacter(settings, { name: from });
   await upsertCharacter(settings, { name: to });
+  // Upsert keys on (from_char, to_char, session_id) so per-chat sentiment is preserved
   await p.query(
     `INSERT INTO feels_about (from_char, to_char, sentiment, intensity, description, session_id)
      VALUES ($1, $2, $3, $4, $5, $6)
-     ON CONFLICT (from_char, to_char) DO UPDATE
-     SET sentiment = $3, intensity = $4, description = $5, session_id = $6, updated_at = NOW()`,
+     ON CONFLICT (from_char, to_char, session_id) DO UPDATE
+     SET sentiment = $3, intensity = $4, description = $5, updated_at = NOW()`,
     [fromId, toId, sentiment || 0, intensity || 0.5, description || "", sessionId || ""],
   );
 }
 
-async function insertEvent(settings, { summary, participants, location, significance, messageIndex, sessionId }) {
+async function upsertEvent(settings, { summary, participants, location, significance, messageIndex, sessionId }) {
   const p = getPool(settings);
-  const id = `evt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const id = contentId("evt", `${summary}|${sessionId || ""}|${messageIndex || 0}`);
 
   let locationId = null;
   if (location) {
@@ -96,7 +108,8 @@ async function insertEvent(settings, { summary, participants, location, signific
 
   await p.query(
     `INSERT INTO events (id, summary, significance, message_index, location_id, chat_id, timestamp)
-     VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+     VALUES ($1, $2, $3, $4, $5, $6, NOW())
+     ON CONFLICT (id) DO UPDATE SET summary = EXCLUDED.summary, significance = EXCLUDED.significance`,
     [id, summary, significance || 3, messageIndex || 0, locationId, sessionId || ""],
   );
 
@@ -115,10 +128,11 @@ async function insertEvent(settings, { summary, participants, location, signific
 
 async function upsertFact(settings, { content, domain, confidence, characterScope }) {
   const p = getPool(settings);
-  const id = `fact-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const id = contentId("fact", `${content}|${domain || "other"}`);
   await p.query(
     `INSERT INTO facts (id, content, domain, confidence)
-     VALUES ($1, $2, $3, $4)`,
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (id) DO NOTHING`,
     [id, content, domain || "other", confidence || 0.8],
   );
 
@@ -250,23 +264,18 @@ async function getRecentSnapshots(settings, chatId, limit) {
 
 async function upsertPlotThread(settings, { chatId, title, description, threadType, involvedChars, plantedAt, resolvedAt, importance }) {
   const p = getPool(settings);
-  const { rows: existing } = await p.query(
-    `SELECT id FROM plot_threads WHERE chat_id = $1 AND title = $2`, [chatId, title],
+  const plotId = contentId("plot", `${chatId || ""}|${title}`);
+  await p.query(
+    `INSERT INTO plot_threads (id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (id) DO UPDATE SET
+       thread_type = EXCLUDED.thread_type,
+       description = EXCLUDED.description,
+       resolved_at = EXCLUDED.resolved_at,
+       importance = EXCLUDED.importance,
+       updated_at = NOW()`,
+    [plotId, chatId, threadType || "pending", title, description || "", involvedChars || [], plantedAt || null, resolvedAt || null, importance || 3],
   );
-  let plotId;
-  if (existing.length > 0) {
-    plotId = existing[0].id;
-    await p.query(
-      `UPDATE plot_threads SET thread_type = $2, description = $3, involved_chars = $4, resolved_at = $5, importance = $6, updated_at = NOW() WHERE id = $1`,
-      [plotId, threadType || "pending", description || "", involvedChars || [], resolvedAt || null, importance || 3],
-    );
-  } else {
-    plotId = `plot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    await p.query(
-      `INSERT INTO plot_threads (id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [plotId, chatId, threadType || "pending", title, description || "", involvedChars || [], plantedAt || null, resolvedAt || null, importance || 3],
-    );
-  }
 
   // Link to characters (ensure they exist first)
   for (const charName of (involvedChars || [])) {
@@ -286,6 +295,28 @@ async function getActivePlotThreads(settings, chatId) {
   const p = getPool(settings);
   const { rows } = await p.query(`SELECT * FROM plot_threads WHERE chat_id = $1 AND resolved_at IS NULL ORDER BY importance DESC`, [chatId]);
   return rows;
+}
+
+// ── Items ──────────────────────────────────────────────────────
+
+async function upsertItem(settings, { name, description, powers, significance, owner, location, status, chatId }) {
+  const p = getPool(settings);
+  const id = contentId("item", `${name}|${chatId || ""}`);
+  const ownerId = owner ? slugify(owner) : null;
+  const locationId = location ? await upsertLocation(settings, location, "") : null;
+  await p.query(
+    `INSERT INTO items (id, name, description, powers, significance, owner_id, location_id, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (id) DO UPDATE SET
+       description = EXCLUDED.description,
+       powers = EXCLUDED.powers,
+       significance = EXCLUDED.significance,
+       owner_id = EXCLUDED.owner_id,
+       location_id = EXCLUDED.location_id,
+       status = EXCLUDED.status`,
+    [id, name, description || "", powers || "", significance || 3, ownerId, locationId, status || "intact"],
+  );
+  return id;
 }
 
 // ── Vector operations ───────────────────────────────────────��──
@@ -334,17 +365,20 @@ async function vectorSearchScoped(settings, { embedding, chatIds, limit }) {
 
 // ── Query helpers for retrieval ────────────────────────────────
 
-async function getRelationships(settings, characters) {
+async function getRelationships(settings, characters, chatIds) {
   const p = getPool(settings);
   const charIds = characters.map(slugify);
+  const scoped = Array.isArray(chatIds) && chatIds.length > 0;
+  const params = scoped ? [charIds, chatIds] : [charIds];
+  const sessionFilter = scoped ? ` AND fa.session_id = ANY($2::text[])` : "";
   const { rows } = await p.query(
     `SELECT c1.name as from_name, c2.name as to_name,
             fa.sentiment, fa.intensity, fa.description
      FROM feels_about fa
      JOIN characters c1 ON fa.from_char = c1.id
      JOIN characters c2 ON fa.to_char = c2.id
-     WHERE fa.from_char = ANY($1::text[]) OR fa.to_char = ANY($1::text[])`,
-    [charIds],
+     WHERE (fa.from_char = ANY($1::text[]) OR fa.to_char = ANY($1::text[]))${sessionFilter}`,
+    params,
   );
   return rows.map((r) => ({
     from: r.from_name, to: r.to_name,
@@ -353,20 +387,38 @@ async function getRelationships(settings, characters) {
   }));
 }
 
-async function getKnowledgeBoundaries(settings, characters) {
+async function getKnowledgeBoundaries(settings, characters, chatIds) {
   const p = getPool(settings);
   const boundaries = [];
+  // Scope facts by chat via memory_embeddings.chat_id when chatIds is provided.
+  // Facts without an embedding row in the requested chats are excluded so that
+  // e.g. ChatB's secrets don't leak into Protagonist's retrieval.
+  // NOTE: lorebook facts (worldbuilding/setting/background) are intentionally
+  // excluded from the "doesNotKnow" set above and remain globally visible via
+  // their own retrieval path.
+  const scoped = Array.isArray(chatIds) && chatIds.length > 0;
   for (const name of characters) {
     const charId = slugify(name);
+    const knownParams = scoped ? [charId, chatIds] : [charId];
+    const knownChatFilter = scoped
+      ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
+      : "";
     const { rows: known } = await p.query(
-      `SELECT f.content FROM knows k JOIN facts f ON k.fact_id = f.id WHERE k.character_id = $1`,
-      [charId],
+      `SELECT f.content FROM knows k JOIN facts f ON k.fact_id = f.id
+       WHERE k.character_id = $1${knownChatFilter}`,
+      knownParams,
     );
+    const unknownChatFilter = scoped
+      ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
+      : "";
     const { rows: unknown } = await p.query(
+      // 'lore' is intentionally excluded: lorebook ingestion uses
+      // 'worldbuilding'/'setting'/'background', so the only domains here are
+      // actual per-character secrets/backstory.
       `SELECT f.content FROM facts f
-       WHERE f.domain IN ('secret', 'lore', 'backstory')
-       AND f.id NOT IN (SELECT fact_id FROM knows WHERE character_id = $1)`,
-      [charId],
+       WHERE f.domain IN ('secret', 'backstory')
+       AND f.id NOT IN (SELECT fact_id FROM knows WHERE character_id = $1)${unknownChatFilter}`,
+      knownParams,
     );
     boundaries.push({
       character: name,
@@ -377,25 +429,38 @@ async function getKnowledgeBoundaries(settings, characters) {
   return boundaries;
 }
 
-async function getRecentEvents(settings, chatId, limit) {
+async function getRecentEvents(settings, chatId, limit, chatIds) {
   const p = getPool(settings);
+  // Build chat-scope filter. Prefer the explicit chatIds list if provided,
+  // otherwise fall back to the single chatId. If neither is set we return
+  // events globally (legacy behavior — only happens when callers haven't
+  // been migrated yet).
+  const scopeIds = (Array.isArray(chatIds) && chatIds.length > 0)
+    ? chatIds
+    : (chatId ? [chatId] : null);
+  const params = scopeIds ? [limit || 5, scopeIds] : [limit || 5];
+  const where = scopeIds ? `WHERE e.chat_id = ANY($2::text[])` : "";
   const { rows } = await p.query(
     `SELECT e.summary, e.significance, e.timestamp, e.message_index,
             array_agg(c.name) as participants
      FROM events e
      LEFT JOIN participated_in pi ON e.id = pi.event_id
      LEFT JOIN characters c ON pi.character_id = c.id
+     ${where}
      GROUP BY e.id ORDER BY e.timestamp DESC LIMIT $1`,
-    [limit || 5],
+    params,
   );
   return rows;
 }
 
-async function getWorldState(settings) {
+async function getWorldState(settings, chatIds) {
   const p = getPool(settings);
-  const { rows } = await p.query(
-    `SELECT key, value, valid_from as since FROM world_state WHERE valid_until IS NULL`,
-  );
+  const scoped = Array.isArray(chatIds) && chatIds.length > 0;
+  const sql = scoped
+    ? `SELECT key, value, valid_from as since FROM world_state
+       WHERE valid_until IS NULL AND chat_id = ANY($1::text[])`
+    : `SELECT key, value, valid_from as since FROM world_state WHERE valid_until IS NULL`;
+  const { rows } = await p.query(sql, scoped ? [chatIds] : []);
   return rows;
 }
 
@@ -829,10 +894,10 @@ async function closePool() {
 
 module.exports = {
   getPool, initSchema, slugify,
-  upsertCharacter, upsertLocation, upsertRelationship, insertEvent, upsertFact, upsertWorldState,
+  upsertCharacter, upsertLocation, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
   upsertTrait, getTraitsForCharacter,
   insertContextSnapshot, getRecentSnapshots,
-  upsertPlotThread, getActivePlotThreads,
+  upsertPlotThread, getActivePlotThreads, upsertItem,
   upsertStoryArc, linkEventToArc, createEventChain,
   storeEmbedding, vectorSearch, vectorSearchScoped,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,

@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS events (
     timestamp     TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE INDEX IF NOT EXISTS idx_events_chat        ON events (chat_id);
+
 CREATE TABLE IF NOT EXISTS facts (
     id         TEXT PRIMARY KEY,
     content    TEXT NOT NULL,
@@ -71,8 +73,10 @@ CREATE TABLE IF NOT EXISTS feels_about (
     description TEXT DEFAULT '',
     session_id  TEXT,
     updated_at  TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(from_char, to_char)
+    UNIQUE(from_char, to_char, session_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_feels_about_session ON feels_about (session_id);
 
 CREATE TABLE IF NOT EXISTS knows (
     id          SERIAL PRIMARY KEY,
@@ -83,6 +87,8 @@ CREATE TABLE IF NOT EXISTS knows (
     UNIQUE(character_id, fact_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_knows_fact         ON knows (fact_id);
+
 CREATE TABLE IF NOT EXISTS participated_in (
     id           SERIAL PRIMARY KEY,
     character_id TEXT NOT NULL REFERENCES characters(id),
@@ -90,6 +96,8 @@ CREATE TABLE IF NOT EXISTS participated_in (
     role         TEXT DEFAULT 'participant',
     UNIQUE(character_id, event_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_participated_event ON participated_in (event_id);
 
 CREATE TABLE IF NOT EXISTS present_at (
     id           SERIAL PRIMARY KEY,
@@ -138,6 +146,12 @@ CREATE TABLE IF NOT EXISTS plot_threads (
 
 CREATE INDEX IF NOT EXISTS idx_plot_active
     ON plot_threads (chat_id) WHERE resolved_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS plot_thread_characters (
+    plot_id      TEXT NOT NULL REFERENCES plot_threads(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    PRIMARY KEY (plot_id, character_id)
+);
 
 -- ── Story arcs (manga-style narrative containers) ─────────────
 
@@ -207,6 +221,9 @@ CREATE TABLE IF NOT EXISTS items (
     status       TEXT DEFAULT 'intact',
     created_at   TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_items_owner        ON items (owner_id);
+CREATE INDEX IF NOT EXISTS idx_items_location     ON items (location_id);
 
 -- ── Ingestion status tracking ──────────────────────────────────
 

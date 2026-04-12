@@ -46,27 +46,33 @@ ${msgBlock}
 
 JSON:`;
 
-  const endpoint = settings.ollamaEndpoint || "http://localhost:11434/v1";
-  const model = settings.extractionModel || "qwen3:8b";
+  const apiKey = settings.geminiApiKey || "";
+  const model = settings.extractionModel || "gemini-2.0-flash";
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-  const res = await fetch(`${endpoint}/chat/completions`, {
+  const res = await fetch(geminiUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
     body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.1,
-      max_tokens: 4096,
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 4096,
+        responseMimeType: "application/json",
+      },
     }),
   });
 
   if (!res.ok) {
-    throw new Error(`Extraction LLM error: ${res.status} ${await res.text()}`);
+    throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
   }
 
   const data = await res.json();
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) throw new Error("LLM returned empty response");
+  const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!content) throw new Error("Gemini returned empty response");
 
   return parseResponse(content);
 }

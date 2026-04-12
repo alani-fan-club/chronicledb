@@ -277,13 +277,16 @@ async function init(router) {
 
   router.get("/graph", async (req, res) => {
     try {
-      const data = await db.getGraphData(settings, {
-        scope: req.query.scope || "global",
-        character: req.query.character,
-        chatId: req.query.chatId,
-        nodeId: req.query.nodeId,
-        depth: parseInt(req.query.depth) || 2,
-      });
+      const scope = req.query.scope || "global";
+      const depth = parseInt(req.query.depth) || 3;
+      let data;
+
+      if (scope === "character" && req.query.character) {
+        // N-hop recursive traversal from a character
+        data = await db.traverseFromCharacter(settings, req.query.character, depth);
+      } else {
+        data = await db.getGraphData(settings, { scope, character: req.query.character });
+      }
       res.json(data);
     } catch (err) {
       console.error("[ChronicleDB] Graph query error:", err);

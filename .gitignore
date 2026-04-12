@@ -2,3 +2,26 @@ node_modules/
 dist/
 *.env
 .DS_Store
+
+# Secrets / per-deployment config
+chronicledb.config.json
+server-plugin/.settings-cache.json
+
+# Per-user corpus, eval questions, and generated bundles — these contain
+# chat/character content and should never be committed. Use the .example
+# files in each directory as a template.
+eval/.local-corpus.json
+eval/questions.json
+eval/questions.json.bak
+eval/test_bundle.json
+eval/results/
+/tmp/haiku-bundle/
+/tmp/haiku-split/
+/tmp/haiku-results/
+/tmp/gemini-results/
+
+# Session-private planning docs
+IMPROVEMENTS.md
+RESEARCH.md
+RETRIEVAL_TODO.md
+CODE_REVIEW.md

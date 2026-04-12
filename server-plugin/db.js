@@ -2,6 +2,7 @@ const { Pool } = require("pg");
 const { readFileSync } = require("fs");
 const { resolve } = require("path");
 const { createHash } = require("crypto");
+const { buildOrTsquery } = require("../shared/ts-query");
 
 let pool = null;
 let poolConfigHash = "";
@@ -437,15 +438,28 @@ async function vectorSearchScoped(settings, { embedding, chatIds, limit }) {
  * Uses the GENERATED tsv column + GIN index. Returns rows ordered
  * by ts_rank descending. chatIds may be an array (scoped) or a
  * single string; if falsy, searches globally.
+ *
+ * Uses OR semantics via `buildOrTsquery` (from shared/ts-query.js).
+ * Aligned with the eval-side lexical search so ST retrieval recall
+ * matches what the eval harness measures — see REVIEW §2a. Previously
+ * used `plainto_tsquery` (AND), which was ~30% less recall on multi-
+ * term queries like "what did X say about Y".
+ *
+ * Kept in db.js as a standalone entry point even though the canonical
+ * retrieval pipeline in retriever.js now goes through shared/retrieval-
+ * core.js directly. Retained for db.hybridSearch legacy callers and
+ * for the test suite.
  */
 async function lexicalSearch(settings, { query, chatId, chatIds, limit }) {
   const p = getPool(settings);
-  const conditions = ["tsv @@ plainto_tsquery('english', $1)"];
-  const params = [query, limit || 20];
-  let idx = 3;
+  const tsquery = buildOrTsquery(query);
+  if (!tsquery) return [];
   const scopedIds = Array.isArray(chatIds) && chatIds.length > 0
     ? chatIds
     : (chatId ? [chatId] : null);
+  const conditions = ["tsv @@ to_tsquery('english', $1)"];
+  const params = [tsquery, limit || 20];
+  let idx = 3;
   if (scopedIds) {
     conditions.push(`chat_id = ANY($${idx}::text[])`);
     params.push(scopedIds);
@@ -455,9 +469,9 @@ async function lexicalSearch(settings, { query, chatId, chatIds, limit }) {
     `SELECT id, chat_id, node_type, node_id, content, COALESCE(raw_text, content) as raw_text,
             character_scope, message_index, context_prefix,
             ts_headline('english', COALESCE(raw_text, content),
-              plainto_tsquery('english', $1),
+              to_tsquery('english', $1),
               'MaxWords=150, MinWords=30, MaxFragments=5, FragmentDelimiter=" ... "') as headline,
-            ts_rank(tsv, plainto_tsquery('english', $1)) as rank
+            ts_rank(tsv, to_tsquery('english', $1)) as rank
      FROM memory_embeddings
      WHERE ${conditions.join(" AND ")}
      ORDER BY rank DESC
@@ -538,45 +552,67 @@ async function getRelationships(settings, characters, chatIds) {
 }
 
 async function getKnowledgeBoundaries(settings, characters, chatIds) {
+  // Two queries total (not 2*N) — REVIEW §5a N+1 collapse.
+  // Scope facts by chat via memory_embeddings.chat_id when chatIds is
+  // provided so e.g. ChatB's secrets don't leak into Protagonist's retrieval.
+  // Lorebook facts (worldbuilding/setting/background) are intentionally
+  // excluded from the "doesNotKnow" set and remain globally visible via
+  // their own retrieval path — 'lore' domain is left off.
+  if (!characters || characters.length === 0) return [];
   const p = getPool(settings);
-  const boundaries = [];
-  // Scope facts by chat via memory_embeddings.chat_id when chatIds is provided.
-  // Facts without an embedding row in the requested chats are excluded so that
-  // e.g. ChatB's secrets don't leak into Protagonist's retrieval.
-  // NOTE: lorebook facts (worldbuilding/setting/background) are intentionally
-  // excluded from the "doesNotKnow" set above and remain globally visible via
-  // their own retrieval path.
   const scoped = Array.isArray(chatIds) && chatIds.length > 0;
-  for (const name of characters) {
-    const charId = slugify(name);
-    const knownParams = scoped ? [charId, chatIds] : [charId];
-    const knownChatFilter = scoped
-      ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
-      : "";
-    const { rows: known } = await p.query(
-      `SELECT f.content FROM knows k JOIN facts f ON k.fact_id = f.id
-       WHERE k.character_id = $1${knownChatFilter}`,
-      knownParams,
-    );
-    const unknownChatFilter = scoped
-      ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
-      : "";
-    const { rows: unknown } = await p.query(
-      // 'lore' is intentionally excluded: lorebook ingestion uses
-      // 'worldbuilding'/'setting'/'background', so the only domains here are
-      // actual per-character secrets/backstory.
-      `SELECT f.content FROM facts f
-       WHERE f.domain IN ('secret', 'backstory')
-       AND f.id NOT IN (SELECT fact_id FROM knows WHERE character_id = $1)${unknownChatFilter}`,
-      knownParams,
-    );
-    boundaries.push({
-      character: name,
-      knows: known.map((r) => r.content),
-      doesNotKnow: unknown.map((r) => r.content),
-    });
+  const charIds = characters.map(slugify);
+  const nameById = new Map();
+  characters.forEach((n, i) => nameById.set(charIds[i], n));
+
+  // `known` — one query, all characters, chat-scoped via the facts'
+  // embedding rows. Returns character_id + content; group in JS.
+  const knownChatFilter = scoped
+    ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
+    : "";
+  const knownParams = scoped ? [charIds, chatIds] : [charIds];
+  const { rows: knownRows } = await p.query(
+    `SELECT DISTINCT k.character_id, f.content
+     FROM knows k JOIN facts f ON k.fact_id = f.id
+     WHERE k.character_id = ANY($1::text[])${knownChatFilter}`,
+    knownParams,
+  );
+
+  // `doesNotKnow` — one query; cross product of the character list and
+  // secret/backstory facts, minus what's already in `knows`. UNNEST gives
+  // us one row per (character × fact) in-SQL; the anti-join is indexed.
+  const unknownChatFilter = scoped
+    ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
+    : "";
+  const { rows: unknownRows } = await p.query(
+    `SELECT c_param AS character_id, f.content
+     FROM UNNEST($1::text[]) AS c_param
+     CROSS JOIN facts f
+     WHERE f.domain IN ('secret', 'backstory')
+       AND NOT EXISTS (
+         SELECT 1 FROM knows k WHERE k.character_id = c_param AND k.fact_id = f.id
+       )${unknownChatFilter}`,
+    knownParams,
+  );
+
+  const knownByChar = new Map();
+  for (const r of knownRows) {
+    let arr = knownByChar.get(r.character_id);
+    if (!arr) { arr = []; knownByChar.set(r.character_id, arr); }
+    arr.push(r.content);
   }
-  return boundaries;
+  const unknownByChar = new Map();
+  for (const r of unknownRows) {
+    let arr = unknownByChar.get(r.character_id);
+    if (!arr) { arr = []; unknownByChar.set(r.character_id, arr); }
+    arr.push(r.content);
+  }
+
+  return charIds.map((cid) => ({
+    character: nameById.get(cid),
+    knows: knownByChar.get(cid) || [],
+    doesNotKnow: unknownByChar.get(cid) || [],
+  }));
 }
 
 async function getRecentEvents(settings, chatId, limit, chatIds) {

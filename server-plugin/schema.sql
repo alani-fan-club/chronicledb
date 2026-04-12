@@ -54,3 +54,12 @@ CREATE TABLE IF NOT EXISTS chronicle_sessions (
     created_at     TIMESTAMPTZ DEFAULT NOW(),
     updated_at     TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Per-character memory configuration
+-- Stores which chats a character "remembers" and their session mode
+CREATE TABLE IF NOT EXISTS character_memory_config (
+    character_name TEXT PRIMARY KEY,
+    session_mode   TEXT NOT NULL DEFAULT 'persistent',
+    selected_chats TEXT[] DEFAULT '{}',  -- chat IDs this character remembers (empty = all)
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);

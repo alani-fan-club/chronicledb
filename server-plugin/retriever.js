@@ -7,14 +7,20 @@
 const db = require("./db");
 const { embed } = require("./extractor");
 
-async function retrieve(settings, { chatId, activeCharacters, recentText, sessionMode, sessionId }) {
+async function retrieve(settings, { chatId, activeCharacters, recentText, sessionMode, sessionId, selectedChats }) {
+  // If character has selected specific chats, use those for vector search scope
+  // Empty selectedChats = all chats (persistent mode)
+  const chatScope = (selectedChats && selectedChats.length > 0)
+    ? selectedChats
+    : (sessionMode === "isolated" ? [chatId] : null);
+
   // Run all queries in parallel
   const [relationships, events, knowledge, worldState, vectorResults, locations] = await Promise.all([
     db.getRelationships(settings, activeCharacters),
     db.getRecentEvents(settings, chatId, 5),
     db.getKnowledgeBoundaries(settings, activeCharacters),
     db.getWorldState(settings),
-    recentText ? semanticSearch(settings, recentText, chatId) : [],
+    recentText ? semanticSearchScoped(settings, recentText, chatScope) : [],
     getLocations(settings, activeCharacters),
   ]);
 
@@ -28,9 +34,12 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
   };
 }
 
-async function semanticSearch(settings, text, chatId) {
+async function semanticSearchScoped(settings, text, chatIds) {
   const embedding = await embed(settings, text);
-  return db.vectorSearch(settings, { embedding, chatId, limit: 5 });
+  if (chatIds && chatIds.length > 0) {
+    return db.vectorSearchScoped(settings, { embedding, chatIds, limit: 5 });
+  }
+  return db.vectorSearch(settings, { embedding, limit: 5 });
 }
 
 async function getLocations(settings, characters) {

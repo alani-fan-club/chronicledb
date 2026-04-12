@@ -30,3 +30,51 @@
   border-top: 1px solid var(--SmartThemeBorderColor, #333);
   margin: 8px 0;
 }
+
+.chronicle-hint {
+  font-size: 11px;
+  color: var(--SmartThemeQuoteColor, #888);
+  margin-bottom: 6px;
+}
+
+.chronicle-chat-selector {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--SmartThemeBorderColor, #333);
+  border-radius: 4px;
+  padding: 4px;
+  background: var(--SmartThemeBlurTintColor, rgba(0,0,0,0.2));
+}
+
+.chronicle-chat-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.chronicle-chat-item:hover {
+  background: var(--SmartThemeBorderColor, #333);
+}
+
+.chronicle-chat-item input[type="checkbox"] {
+  margin: 0;
+}
+
+.chronicle-chat-date {
+  color: var(--SmartThemeQuoteColor, #888);
+  font-size: 10px;
+  margin-left: auto;
+}
+
+.chronicle-chat-msgs {
+  color: var(--SmartThemeQuoteColor, #888);
+  font-size: 10px;
+}
+
+.menu_button_small {
+  padding: 2px 8px;
+  font-size: 11px;
+}

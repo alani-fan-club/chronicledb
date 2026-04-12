@@ -162,20 +162,90 @@ async function init(router) {
 
   router.post("/retrieve", async (req, res) => {
     try {
-      const { chatId, activeCharacters, recentText, sessionMode, sessionId, maxTokens } = req.body;
+      const { chatId, characterName, activeCharacters, recentText, sessionId, maxTokens } = req.body;
+
+      // Load per-character config to know which chats to remember
+      const charConfig = characterName
+        ? await db.getCharacterMemoryConfig(settings, characterName)
+        : { sessionMode: "persistent", selectedChats: [] };
 
       const result = await retrieve(settings, {
         chatId,
         activeCharacters: activeCharacters || [],
         recentText: recentText || "",
-        sessionMode: sessionMode || "persistent",
+        sessionMode: charConfig.sessionMode || "persistent",
         sessionId,
+        selectedChats: charConfig.selectedChats || [], // scoped chat IDs
       });
 
       const memoryBlock = formatMemoryBlock(result, maxTokens || 1500);
       res.json({ result, memoryBlock });
     } catch (err) {
       console.error("[ChronicleDB] Retrieval error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Per-character memory config ────────────────────────────────
+  // Tied to character card: stores which chats this character remembers
+
+  router.get("/character-config/:characterName", async (req, res) => {
+    try {
+      const config = await db.getCharacterMemoryConfig(settings, req.params.characterName);
+      res.json(config);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post("/character-config/:characterName", async (req, res) => {
+    try {
+      await db.saveCharacterMemoryConfig(settings, {
+        characterName: req.params.characterName,
+        sessionMode: req.body.sessionMode,
+        selectedChats: req.body.selectedChats,
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── List chats for a character (reads ST data dir) ───────────
+
+  router.get("/chats/:characterName", async (req, res) => {
+    try {
+      const { readdirSync, statSync } = require("fs");
+      const { join, resolve } = require("path");
+
+      const dataRoot = settings.stDataRoot || "";
+      const chatsBase = resolve(dataRoot, "chats");
+      const charName = req.params.characterName;
+      const entries = readdirSync(chatsBase);
+      const matchingDir = entries.find((e) => e === charName || e.startsWith(charName));
+
+      if (!matchingDir) return res.json([]);
+
+      const dirPath = join(chatsBase, matchingDir);
+      if (!statSync(dirPath).isDirectory()) return res.json([]);
+
+      const chatFiles = readdirSync(dirPath)
+        .filter((f) => f.endsWith(".jsonl"))
+        .sort()
+        .map((f) => {
+          const stat = statSync(join(dirPath, f));
+          const dateMatch = f.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
+          return {
+            filename: f,
+            chatId: f.replace(".jsonl", ""),
+            date: dateMatch ? dateMatch[1] : "",
+            size: stat.size,
+            messageEstimate: Math.max(1, Math.floor(stat.size / 2000)),
+          };
+        });
+
+      res.json(chatFiles);
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });

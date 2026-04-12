@@ -62,6 +62,16 @@ jQuery(async () => {
   // Push settings to server plugin
   await syncSettings(settings);
 
+  // ── Load chat selector when character changes ───────────────
+
+  eventSource.on(event_types.CHAT_CHANGED, async () => {
+    if (!settings.enabled) return;
+    await loadChatSelector();
+  });
+
+  // Load on init too if a chat is already open
+  await loadChatSelector();
+
   // ── Event hooks ────────────────────────────────────────────
 
   // After AI generates a response → extract memories (async)
@@ -162,10 +172,10 @@ async function injectMemoryContext() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chatId: String(chatId),
+        characterName,
         activeCharacters: [...recentNames],
         recentText,
-        sessionMode: settings.sessionMode,
-        sessionId: `${chatId}-${settings.sessionMode}`,
+        sessionId: `${chatId}`,
         maxTokens: settings.maxInjectionTokens,
       }),
     });
@@ -280,5 +290,105 @@ async function syncSettings(settings) {
     });
   } catch (err) {
     console.warn("[ChronicleDB] Failed to sync settings:", err);
+  }
+}
+
+// ── Per-character chat selector ────────────────────────────────
+
+let currentCharacterConfig = null;
+
+async function loadChatSelector() {
+  const ctx = getContext();
+  const characterName = ctx.name2;
+  const container = $("#chronicle_chatSelector");
+
+  if (!characterName) {
+    container.html('<p class="chronicle-hint">Open a chat to see available sessions.</p>');
+    return;
+  }
+
+  try {
+    // Load the character's memory config and available chats in parallel
+    const [configRes, chatsRes] = await Promise.all([
+      fetch(`${PLUGIN_BASE}/character-config/${encodeURIComponent(characterName)}`),
+      fetch(`${PLUGIN_BASE}/chats/${encodeURIComponent(characterName)}`),
+    ]);
+
+    const charConfig = await configRes.json();
+    const chats = await chatsRes.json();
+    currentCharacterConfig = charConfig;
+
+    if (chats.length === 0) {
+      container.html('<p class="chronicle-hint">No chat history found for this character.</p>');
+      return;
+    }
+
+    // If no chats are explicitly selected, default to all selected (persistent mode)
+    const selected = new Set(
+      charConfig.selectedChats && charConfig.selectedChats.length > 0
+        ? charConfig.selectedChats
+        : chats.map((c) => c.chatId),
+    );
+
+    let html = "";
+    for (const chat of chats) {
+      const checked = selected.has(chat.chatId) ? "checked" : "";
+      const dateLabel = chat.date || "unknown date";
+      html += `
+        <label class="chronicle-chat-item">
+          <input type="checkbox" value="${chat.chatId}" ${checked}
+                 class="chronicle-chat-checkbox">
+          <span>${chat.chatId.split(" - ").pop() || chat.chatId}</span>
+          <span class="chronicle-chat-msgs">~${chat.messageEstimate} msgs</span>
+          <span class="chronicle-chat-date">${dateLabel}</span>
+        </label>`;
+    }
+
+    container.html(html);
+
+    // Save on change
+    container.find(".chronicle-chat-checkbox").on("change", () => {
+      saveCharacterChatSelection(characterName);
+    });
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to load chat selector:", err);
+    container.html('<p class="chronicle-hint">Could not load chat list.</p>');
+  }
+
+  // Select All / Select None buttons
+  $("#chronicle_selectAllChats").off("click").on("click", () => {
+    $("#chronicle_chatSelector .chronicle-chat-checkbox").prop("checked", true);
+    saveCharacterChatSelection(characterName);
+  });
+
+  $("#chronicle_selectNoneChats").off("click").on("click", () => {
+    $("#chronicle_chatSelector .chronicle-chat-checkbox").prop("checked", false);
+    saveCharacterChatSelection(characterName);
+  });
+}
+
+async function saveCharacterChatSelection(characterName) {
+  const selectedChats = [];
+  $("#chronicle_chatSelector .chronicle-chat-checkbox:checked").each(function () {
+    selectedChats.push($(this).val());
+  });
+
+  // Determine mode: no chats selected = isolated, some = selective, all = persistent
+  const allCheckboxes = $("#chronicle_chatSelector .chronicle-chat-checkbox");
+  let sessionMode = "persistent";
+  if (selectedChats.length === 0) {
+    sessionMode = "isolated";
+  } else if (selectedChats.length < allCheckboxes.length) {
+    sessionMode = "selective";
+  }
+
+  try {
+    await fetch(`${PLUGIN_BASE}/character-config/${encodeURIComponent(characterName)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionMode, selectedChats }),
+    });
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to save character config:", err);
   }
 }

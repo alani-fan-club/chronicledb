@@ -317,6 +317,68 @@ async function getGraphData(settings, { scope, character, chatId, nodeId, depth 
   return { nodes, edges };
 }
 
+// ── Per-character memory config ────────────────────────────────
+
+async function getCharacterMemoryConfig(settings, characterName) {
+  const p = getPool(settings);
+  const { rows } = await p.query(
+    `SELECT * FROM character_memory_config WHERE character_name = $1`,
+    [characterName],
+  );
+  if (rows.length === 0) {
+    return { characterName, sessionMode: "persistent", selectedChats: [] };
+  }
+  return {
+    characterName: rows[0].character_name,
+    sessionMode: rows[0].session_mode,
+    selectedChats: rows[0].selected_chats || [],
+  };
+}
+
+async function saveCharacterMemoryConfig(settings, { characterName, sessionMode, selectedChats }) {
+  const p = getPool(settings);
+  await p.query(
+    `INSERT INTO character_memory_config (character_name, session_mode, selected_chats, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (character_name) DO UPDATE
+     SET session_mode = $2, selected_chats = $3, updated_at = NOW()`,
+    [characterName, sessionMode || "persistent", selectedChats || []],
+  );
+}
+
+// ── Chat-scoped vector search ──────────────────────────────────
+
+async function vectorSearchScoped(settings, { embedding, chatIds, limit, characterScope }) {
+  const p = getPool(settings);
+  const conditions = [];
+  const params = [JSON.stringify(embedding), limit || 10];
+  let idx = 3;
+
+  if (chatIds && chatIds.length > 0) {
+    conditions.push(`chat_id = ANY($${idx}::text[])`);
+    params.push(chatIds);
+    idx++;
+  }
+  if (characterScope) {
+    conditions.push(`character_scope && $${idx}::text[]`);
+    params.push(characterScope);
+    idx++;
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const { rows } = await p.query(
+    `SELECT id, chat_id, node_type, node_id, content, character_scope, message_index,
+            1 - (embedding <=> $1::vector) as similarity
+     FROM memory_embeddings
+     ${where}
+     ORDER BY embedding <=> $1::vector
+     LIMIT $2`,
+    params,
+  );
+  return rows;
+}
+
 async function closePool() {
   if (pool) {
     await pool.end();
@@ -327,7 +389,7 @@ async function closePool() {
 module.exports = {
   getPool, initSchema, cypher,
   upsertCharacter, upsertRelationship, insertEvent, upsertFact, upsertWorldState,
-  storeEmbedding, vectorSearch,
+  storeEmbedding, vectorSearch, vectorSearchScoped,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
-  getGraphData, closePool,
+  getGraphData, getCharacterMemoryConfig, saveCharacterMemoryConfig, closePool,
 };

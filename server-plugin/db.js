@@ -321,16 +321,28 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   const p = getPool(settings);
   const startId = slugify(characterName);
 
-  // Get list of chat IDs that belong to this character (from ingestion_status)
-  // This scopes the traversal to data extracted from THIS character's RPs only,
-  // preventing cross-contamination via shared user personas like "REDACTED"
+  // Get list of chat IDs that belong to this character.
+  // Primary source: ingestion_status table. Fallback: session_id prefix
+  // match in feels_about (for data ingested before tracking existed).
   const { rows: chats } = await p.query(
     `SELECT chat_file FROM ingestion_status WHERE character_name = $1 AND status = 'done'`,
     [characterName],
   );
-  const chatIds = chats.map((c) => c.chat_file.replace(".jsonl", ""));
+  let chatIds = chats.map((c) => c.chat_file.replace(".jsonl", ""));
 
-  // Build session_id pattern for filtering. If no chats ingested yet, return empty
+  // Fallback: find session_ids that start with the character name
+  // (ST chat files are named "Character Name - date.jsonl")
+  if (chatIds.length === 0) {
+    const { rows: sessions } = await p.query(
+      `SELECT DISTINCT session_id FROM feels_about WHERE session_id LIKE $1
+       UNION
+       SELECT DISTINCT chat_id FROM events WHERE chat_id LIKE $1`,
+      [`${characterName}%`],
+    );
+    chatIds = sessions.map((s) => s.session_id).filter(Boolean);
+  }
+
+  // If still nothing, return empty
   if (chatIds.length === 0) {
     return { nodes: [], edges: [] };
   }

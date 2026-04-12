@@ -76,7 +76,7 @@ async function init(router) {
       for (const char of (extraction.characters || [])) {
         await db.upsertCharacter(settings, {
           name: char.name,
-          aliases: [],
+          aliases: char.aliases || [],
           description: (char.new_facts || []).join("; "),
           firstSeen: new Date().toISOString(),
         });
@@ -150,6 +150,7 @@ async function init(router) {
       for (const event of (extraction.events || [])) {
         const eventId = await db.upsertEvent(settings, {
           summary: event.summary,
+          sourceText: event.source_quote,
           participants: event.participants,
           location: event.location,
           significance: event.significance,
@@ -482,7 +483,7 @@ async function init(router) {
           // Ingest characters + traits
           for (const char of (extraction.characters || [])) {
             const description = (char.traits || []).map((t) => t.content).join("; ");
-            await db.upsertCharacter(settings, { name: char.name, aliases: [], description, firstSeen: chatId });
+            await db.upsertCharacter(settings, { name: char.name, aliases: char.aliases || [], description, firstSeen: chatId });
             const charId = db.slugify(char.name);
 
             if (char.role || char.status || char.significance) {
@@ -522,7 +523,7 @@ async function init(router) {
           // Events — track event_key → event_id mapping for arcs/chains
           const eventKeyToId = new Map();
           for (const event of (extraction.events || [])) {
-            const eventId = await db.upsertEvent(settings, { summary: event.summary, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
+            const eventId = await db.upsertEvent(settings, { summary: event.summary, sourceText: event.source_quote, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
             if (event.event_key) eventKeyToId.set(event.event_key, eventId);
           }
 
@@ -628,6 +629,31 @@ async function init(router) {
           const batchText = batch.filter(m=>!m.is_system).map(m=>`${m.name}: ${m.mes}`).join("\n").slice(0,8000);
           const batchEmbed = await embed(settings, batchText);
           await db.storeEmbedding(settings, { chatId, nodeType: "conversation", nodeId: `ingest-${chatId}-${i}`, content: batchText.slice(0,2000), embedding: batchEmbed, characterScope: [charName, userName], messageIndex: i });
+
+          // Per-message embeddings: each non-trivial message gets its own vector
+          // so needle-in-haystack queries can find specific quoted lines
+          for (let mi = 0; mi < batch.length; mi++) {
+            const m = batch[mi];
+            if (m.is_system) continue;
+            const text = `${m.name}: ${m.mes}`;
+            if (text.length < 80) continue; // skip trivial msgs
+            try {
+              const msgEmbedding = await embed(settings, text);
+              await db.storeEmbedding(settings, {
+                chatId,
+                nodeType: "message",
+                nodeId: `msg-${chatId}-${i + mi}`,
+                content: text.slice(0, 2000),
+                rawText: m.mes,
+                embedding: msgEmbedding,
+                characterScope: [m.name],
+                messageIndex: i + mi,
+              });
+            } catch (err) {
+              // Don't fail the whole batch if one message embed fails
+              console.warn(`[ChronicleDB] msg embed ${i+mi} failed:`, err.message);
+            }
+          }
 
           extracted++;
           } catch (err) {

@@ -44,6 +44,13 @@ const COLORS = {
   // Text
   text:    "#f5f5f5",
   textDim: "#6a6a6a",
+
+  // Tonal tiers — neutral brightness levels for legend dots
+  // (legacy aliases used by detail-panel rendering)
+  tier1: "#f0f0f0",
+  tier2: "#b8b8b8",
+  tier3: "#6a6a6a",
+  tier4: "#3a3a3a",
 };
 
 // ── State ───────────────────────────────────────────────────────

@@ -68,8 +68,8 @@ ${msgBlock}
 
 JSON:`;
 
-  const apiKey = settings.geminiApiKey || "";
-  const model = settings.extractionModel || "gemini-2.5-flash-lite";
+  const apiKey = (settings.geminiApiKey || "").trim();
+  const model = (settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   const res = await fetch(geminiUrl, {
@@ -120,8 +120,8 @@ function parseResponse(raw) {
 const GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 
 async function embed(settings, text) {
-  const model = settings.geminiEmbeddingModel || "gemini-embedding-2-preview";
-  const apiKey = settings.geminiApiKey || "";
+  const model = (settings.geminiEmbeddingModel || "gemini-embedding-2-preview").trim();
+  const apiKey = (settings.geminiApiKey || "").trim();
   const dimension = settings.geminiEmbeddingDimension || 768;
 
   const res = await fetch(`${GEMINI_EMBED_URL}/${model}:embedContent`, {

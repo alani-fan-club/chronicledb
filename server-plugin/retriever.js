@@ -15,13 +15,15 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     : (sessionMode === "isolated" ? [chatId] : null);
 
   // Run all queries in parallel
-  const [relationships, events, knowledge, worldState, vectorResults, locations] = await Promise.all([
+  const [relationships, events, knowledge, worldState, vectorResults, locations, snapshots, plotThreads] = await Promise.all([
     db.getRelationships(settings, activeCharacters),
     db.getRecentEvents(settings, chatId, 5),
     db.getKnowledgeBoundaries(settings, activeCharacters),
     db.getWorldState(settings),
     recentText ? semanticSearchScoped(settings, recentText, chatScope) : [],
     getLocations(settings, activeCharacters),
+    db.getRecentSnapshots(settings, chatId, 2),
+    db.getActivePlotThreads(settings, chatId),
   ]);
 
   return {
@@ -31,6 +33,8 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     worldState,
     vectorResults,
     locations,
+    snapshots,
+    plotThreads,
   };
 }
 
@@ -107,6 +111,27 @@ function formatMemoryBlock(result, maxTokens = 1500) {
       .map((v) => `- (${(v.similarity * 100).toFixed(0)}%) ${v.content.slice(0, 200)}`)
       .join("\n");
     sections.push(`## Relevant Past Context\n${lines}`);
+  }
+
+  // Context snapshots (recent scene state)
+  if (result.snapshots && result.snapshots.length > 0) {
+    const lines = result.snapshots.map((s) => {
+      let line = `- ${s.summary}`;
+      if (s.location_name) line += ` [at: ${s.location_name}]`;
+      if (s.emotional_tone) line += ` (tone: ${s.emotional_tone})`;
+      if (s.present_chars && s.present_chars.length > 0) line += ` — present: ${s.present_chars.join(", ")}`;
+      return line;
+    }).join("\n");
+    sections.push(`## Scene Context\n${lines}`);
+  }
+
+  // Active plot threads
+  if (result.plotThreads && result.plotThreads.length > 0) {
+    const lines = result.plotThreads.map((pt) => {
+      const typeIcon = { pending: "⏳", foreshadowing: "🔮", unresolved: "❓" }[pt.thread_type] || "📌";
+      return `- ${typeIcon} [${pt.thread_type}] ${pt.title}: ${pt.description}${pt.involved_chars?.length ? ` (involves: ${pt.involved_chars.join(", ")})` : ""}`;
+    }).join("\n");
+    sections.push(`## Active Plot Threads\n${lines}`);
   }
 
   const block = `[ChronicleDB Memory Context]\n\n${sections.join("\n\n")}\n\n[/ChronicleDB Memory Context]`;

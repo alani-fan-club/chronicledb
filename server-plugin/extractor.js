@@ -13,11 +13,14 @@ Extract:
 3. **Events** — significant things that happened (significance 1-5)
 4. **World state** — environmental/setting changes (key-value)
 5. **Knowledge updates** — what each character learned AND what they explicitly do not know
+6. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
+7. **Plot threads** — any foreshadowing, pending events, unresolved tensions, promises, threats, or open questions. Mark if a prior thread got resolved.
 
 RULES:
 - Only attribute knowledge to characters who were PRESENT and could perceive it
 - Narrator descriptions are omniscient — characters only know what they witnessed or were told
 - Track the active message text only, not alternative swipes
+- Plot threads should capture NARRATIVE tension: secrets about to be revealed, fights brewing, promises made, mysteries introduced, foreshadowing of future events
 
 Return ONLY valid JSON:
 {
@@ -28,6 +31,21 @@ Return ONLY valid JSON:
   "knowledge_updates": [
     { "character": "", "learned": "", "source": "" },
     { "character": "", "does_not_know": "" }
+  ],
+  "context_snapshot": {
+    "summary": "Brief description of the current scene",
+    "location": "Where the scene is taking place",
+    "present_characters": ["names of characters currently present"],
+    "emotional_tone": "tense/warm/hostile/playful/melancholic/etc"
+  },
+  "plot_threads": [
+    {
+      "title": "Short title for the thread",
+      "description": "What's unresolved or being foreshadowed",
+      "type": "pending | foreshadowing | unresolved | resolved",
+      "involved_characters": ["names"],
+      "importance": 3
+    }
   ]
 }`;
 

@@ -145,6 +145,59 @@ async function upsertWorldState(settings, { key, value, reason }) {
   );
 }
 
+// ── Context snapshots ──────────────────────────────────────────
+
+async function insertContextSnapshot(settings, { chatId, messageIndex, summary, locationName, presentChars, emotionalTone, worldStateSnapshot }) {
+  const p = getPool(settings);
+  const id = `ctx-${chatId}-${messageIndex}`;
+  let locationId = null;
+  if (locationName) locationId = await upsertLocation(settings, locationName, "");
+  await p.query(
+    `INSERT INTO context_snapshots (id, chat_id, message_index, summary, location_id, present_chars, emotional_tone, world_state_snapshot)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (id) DO UPDATE SET summary = $4, location_id = $5, present_chars = $6, emotional_tone = $7, world_state_snapshot = $8, timestamp = NOW()`,
+    [id, chatId, messageIndex, summary, locationId, presentChars || [], emotionalTone || "", JSON.stringify(worldStateSnapshot || {})],
+  );
+  return id;
+}
+
+async function getRecentSnapshots(settings, chatId, limit) {
+  const p = getPool(settings);
+  const { rows } = await p.query(
+    `SELECT cs.*, l.name as location_name FROM context_snapshots cs LEFT JOIN locations l ON cs.location_id = l.id WHERE cs.chat_id = $1 ORDER BY cs.message_index DESC LIMIT $2`,
+    [chatId, limit || 3],
+  );
+  return rows;
+}
+
+// ── Plot threads ───────────────────────────────────────────────
+
+async function upsertPlotThread(settings, { chatId, title, description, threadType, involvedChars, plantedAt, resolvedAt, importance }) {
+  const p = getPool(settings);
+  const { rows: existing } = await p.query(
+    `SELECT id FROM plot_threads WHERE chat_id = $1 AND title = $2`, [chatId, title],
+  );
+  if (existing.length > 0) {
+    await p.query(
+      `UPDATE plot_threads SET thread_type = $2, description = $3, involved_chars = $4, resolved_at = $5, importance = $6, updated_at = NOW() WHERE id = $1`,
+      [existing[0].id, threadType || "pending", description || "", involvedChars || [], resolvedAt || null, importance || 3],
+    );
+    return existing[0].id;
+  }
+  const id = `plot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  await p.query(
+    `INSERT INTO plot_threads (id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [id, chatId, threadType || "pending", title, description || "", involvedChars || [], plantedAt || null, resolvedAt || null, importance || 3],
+  );
+  return id;
+}
+
+async function getActivePlotThreads(settings, chatId) {
+  const p = getPool(settings);
+  const { rows } = await p.query(`SELECT * FROM plot_threads WHERE chat_id = $1 AND resolved_at IS NULL ORDER BY importance DESC`, [chatId]);
+  return rows;
+}
+
 // ── Vector operations ───────────────────────────────────────��──
 
 async function storeEmbedding(settings, { chatId, nodeType, nodeId, content, embedding, characterScope, messageIndex }) {
@@ -410,6 +463,8 @@ async function closePool() {
 module.exports = {
   getPool, initSchema, slugify,
   upsertCharacter, upsertLocation, upsertRelationship, insertEvent, upsertFact, upsertWorldState,
+  insertContextSnapshot, getRecentSnapshots,
+  upsertPlotThread, getActivePlotThreads,
   storeEmbedding, vectorSearch, vectorSearchScoped,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
   getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig, closePool,

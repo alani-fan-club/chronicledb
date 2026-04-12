@@ -98,6 +98,42 @@ CREATE TABLE IF NOT EXISTS present_at (
 CREATE INDEX IF NOT EXISTS idx_present_at_current
     ON present_at (character_id) WHERE is_current = TRUE;
 
+-- ── Context snapshots (scene state at a point in time) ─────────
+
+CREATE TABLE IF NOT EXISTS context_snapshots (
+    id              TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    message_index   INT NOT NULL,
+    summary         TEXT NOT NULL,
+    location_id     TEXT REFERENCES locations(id),
+    present_chars   TEXT[] DEFAULT '{}',
+    emotional_tone  TEXT DEFAULT '',
+    world_state_snapshot JSONB DEFAULT '{}',
+    timestamp       TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ctx_chat
+    ON context_snapshots (chat_id, message_index);
+
+-- ── Plot threads (foreshadowing, pending events, unresolved arcs)
+
+CREATE TABLE IF NOT EXISTS plot_threads (
+    id              TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    thread_type     TEXT NOT NULL DEFAULT 'pending',
+    title           TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    involved_chars  TEXT[] DEFAULT '{}',
+    planted_at      INT,
+    resolved_at     INT,
+    importance      INT DEFAULT 3,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_plot_active
+    ON plot_threads (chat_id) WHERE resolved_at IS NULL;
+
 -- ── Vector table ───────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS memory_embeddings (

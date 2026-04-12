@@ -133,7 +133,39 @@ async function init(router) {
         // doesn't have a KNOWS edge to those facts
       }
 
-      // 3. Embed the full message batch for vector search
+      // 3. Ingest context snapshot
+      if (extraction.context_snapshot) {
+        const snap = extraction.context_snapshot;
+        const wsSnapshot = {};
+        for (const ws of (extraction.world_state || [])) {
+          wsSnapshot[ws.key] = ws.value;
+        }
+        await db.insertContextSnapshot(settings, {
+          chatId: chatId || "",
+          messageIndex: messageIndex || 0,
+          summary: snap.summary || "",
+          locationName: snap.location || null,
+          presentChars: snap.present_characters || [],
+          emotionalTone: snap.emotional_tone || "",
+          worldStateSnapshot: wsSnapshot,
+        });
+      }
+
+      // 4. Ingest plot threads
+      for (const thread of (extraction.plot_threads || [])) {
+        await db.upsertPlotThread(settings, {
+          chatId: chatId || "",
+          title: thread.title,
+          description: thread.description || "",
+          threadType: thread.type || "pending",
+          involvedChars: thread.involved_characters || [],
+          plantedAt: messageIndex || null,
+          resolvedAt: thread.type === "resolved" ? messageIndex : null,
+          importance: thread.importance || 3,
+        });
+      }
+
+      // 5. Embed the full message batch for vector search
       const batchText = messages
         .filter((m) => !m.is_system)
         .map((m) => `${m.name}: ${m.mes}`)

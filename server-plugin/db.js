@@ -174,18 +174,30 @@ async function upsertFact(settings, { content, domain, confidence, characterScop
   return id;
 }
 
-async function upsertWorldState(settings, { key, value, reason }) {
+async function upsertWorldState(settings, { key, value, reason, chatId }) {
   if (!key || typeof key !== "string" || !key.trim()) return;
   if (value === undefined || value === null) return;
   const p = getPool(settings);
   const k = key.trim();
+  // Scope supersession to this chat so two chats tracking the same key
+  // don't kick each other's state into valid_until. NULL-chat legacy rows
+  // remain queryable as global fallback via getWorldState.
+  if (chatId) {
+    await p.query(
+      `UPDATE world_state SET valid_until = NOW()
+       WHERE key = $1 AND valid_until IS NULL AND chat_id = $2`,
+      [k, chatId],
+    );
+  } else {
+    await p.query(
+      `UPDATE world_state SET valid_until = NOW()
+       WHERE key = $1 AND valid_until IS NULL AND chat_id IS NULL`,
+      [k],
+    );
+  }
   await p.query(
-    `UPDATE world_state SET valid_until = NOW() WHERE key = $1 AND valid_until IS NULL`,
-    [k],
-  );
-  await p.query(
-    `INSERT INTO world_state (key, value, reason) VALUES ($1, $2, $3)`,
-    [k, String(value), reason || ""],
+    `INSERT INTO world_state (key, value, reason, chat_id) VALUES ($1, $2, $3, $4)`,
+    [k, String(value), reason || "", chatId || null],
   );
 }
 
@@ -594,10 +606,19 @@ async function getRecentEvents(settings, chatId, limit, chatIds) {
 async function getWorldState(settings, chatIds) {
   const p = getPool(settings);
   const scoped = Array.isArray(chatIds) && chatIds.length > 0;
+  // Legacy world_state rows lack chat_id (upsertWorldState only started
+  // writing it after this was flagged). NULL chat_id is treated as global
+  // so pre-fix data remains visible. Cap at 20 newest so a runaway
+  // extraction can't eat the entire token budget.
   const sql = scoped
     ? `SELECT key, value, valid_from as since FROM world_state
-       WHERE valid_until IS NULL AND chat_id = ANY($1::text[])`
-    : `SELECT key, value, valid_from as since FROM world_state WHERE valid_until IS NULL`;
+       WHERE valid_until IS NULL AND (chat_id = ANY($1::text[]) OR chat_id IS NULL)
+       ORDER BY valid_from DESC
+       LIMIT 20`
+    : `SELECT key, value, valid_from as since FROM world_state
+       WHERE valid_until IS NULL
+       ORDER BY valid_from DESC
+       LIMIT 20`;
   const { rows } = await p.query(sql, scoped ? [chatIds] : []);
   return rows;
 }

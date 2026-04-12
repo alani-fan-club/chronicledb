@@ -184,7 +184,7 @@ async function run() {
       }
 
       for (const ws of (extraction.world_state || [])) {
-        await db.upsertWorldState(settings, ws);
+        await db.upsertWorldState(settings, { ...ws, chatId });
       }
 
       for (const ku of (extraction.knowledge_updates || [])) {

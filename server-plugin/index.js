@@ -172,7 +172,7 @@ async function init(router) {
       }
 
       for (const ws of (extraction.world_state || [])) {
-        await db.upsertWorldState(settings, ws);
+        await db.upsertWorldState(settings, { ...ws, chatId: chatId || null });
       }
 
       for (const ku of (extraction.knowledge_updates || [])) {
@@ -568,7 +568,7 @@ async function init(router) {
 
           // World state
           for (const ws of (extraction.world_state || [])) {
-            await db.upsertWorldState(settings, ws);
+            await db.upsertWorldState(settings, { ...ws, chatId });
           }
 
           // Knowledge

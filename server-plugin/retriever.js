@@ -206,49 +206,25 @@ async function getLocations(settings, characters) {
 function formatMemoryBlock(result, maxTokens = 1500) {
   const sections = [];
 
+  // Ground-truth sections first so truncation at maxTokens*4 never eats
+  // them. These reflect CURRENT state (present_at.is_current, world_state
+  // where valid_until IS NULL, active plot threads).
   if (result.locations && result.locations.length > 0) {
     const lines = result.locations.map((l) => `- ${l.entity}: ${l.location}`).join("\n");
     sections.push(`## Current Scene\n${lines}`);
   }
 
-  if (result.relationships && result.relationships.length > 0) {
-    const lines = result.relationships.map((r) => {
-      const sent = typeof r.sentiment === "number" ? ` (${r.sentiment.toFixed(1)})` : "";
-      return `- ${r.from} → ${r.to}: ${r.description || "unknown"}${sent}${r.intensity ? ` — intensity ${(r.intensity * 100).toFixed(0)}%` : ""}`;
-    }).join("\n");
-    sections.push(`## Active Relationships\n${lines}`);
-  }
-
-  if (result.events && result.events.length > 0) {
-    const lines = result.events.map((e, i) => {
-      let line = `${i + 1}. [sig ${e.significance || "?"}/5] ${e.summary}`;
-      if (e.source_text && e.source_text.trim().length > 0) {
-        // Trim and indent the quote
-        const quote = e.source_text.replace(/\s+/g, " ").slice(0, 200).trim();
-        line += `\n   > "${quote}"`;
-      }
-      return line;
-    }).join("\n");
-    sections.push(`## Recent Events\n${lines}`);
-  }
-
-  if (result.knowledge && result.knowledge.length > 0) {
-    const lines = result.knowledge.map((kb) => {
-      const parts = [];
-      if (kb.knows && kb.knows.length > 0) {
-        parts.push(`- ${kb.character} knows: ${kb.knows.join("; ")}`);
-      }
-      if (kb.doesNotKnow && kb.doesNotKnow.length > 0) {
-        parts.push(`- ${kb.character} does NOT know: ${kb.doesNotKnow.join("; ")}`);
-      }
-      return parts.join("\n");
-    }).join("\n");
-    sections.push(`## Character Knowledge Boundaries\n${lines}`);
-  }
-
   if (result.worldState && result.worldState.length > 0) {
     const lines = result.worldState.map((ws) => `- ${ws.key}: ${ws.value}`).join("\n");
     sections.push(`## World State\n${lines}`);
+  }
+
+  if (result.plotThreads && result.plotThreads.length > 0) {
+    const lines = result.plotThreads.map((pt) => {
+      const typeIcon = { pending: "⏳", foreshadowing: "🔮", unresolved: "❓" }[pt.thread_type] || "📌";
+      return `- ${typeIcon} [${pt.thread_type}] ${pt.title}: ${pt.description}${pt.involved_chars?.length ? ` (involves: ${pt.involved_chars.join(", ")})` : ""}`;
+    }).join("\n");
+    sections.push(`## Active Plot Threads\n${lines}`);
   }
 
   if (result.vectorResults && result.vectorResults.length > 0) {
@@ -288,7 +264,8 @@ function formatMemoryBlock(result, maxTokens = 1500) {
     sections.push(`## Matched Dialogue Quotes\n${lines}`);
   }
 
-  // Context snapshots (recent scene state)
+  // Narrative context: append-only views of recent history. Less critical
+  // than current-state but still useful for chronological framing.
   if (result.snapshots && result.snapshots.length > 0) {
     const lines = result.snapshots.map((s) => {
       let line = `- ${s.summary}`;
@@ -300,13 +277,39 @@ function formatMemoryBlock(result, maxTokens = 1500) {
     sections.push(`## Scene Context\n${lines}`);
   }
 
-  // Active plot threads
-  if (result.plotThreads && result.plotThreads.length > 0) {
-    const lines = result.plotThreads.map((pt) => {
-      const typeIcon = { pending: "⏳", foreshadowing: "🔮", unresolved: "❓" }[pt.thread_type] || "📌";
-      return `- ${typeIcon} [${pt.thread_type}] ${pt.title}: ${pt.description}${pt.involved_chars?.length ? ` (involves: ${pt.involved_chars.join(", ")})` : ""}`;
+  if (result.events && result.events.length > 0) {
+    const lines = result.events.map((e, i) => {
+      let line = `${i + 1}. [sig ${e.significance || "?"}/5] ${e.summary}`;
+      if (e.source_text && e.source_text.trim().length > 0) {
+        const quote = e.source_text.replace(/\s+/g, " ").slice(0, 200).trim();
+        line += `\n   > "${quote}"`;
+      }
+      return line;
     }).join("\n");
-    sections.push(`## Active Plot Threads\n${lines}`);
+    sections.push(`## Recent Events\n${lines}`);
+  }
+
+  if (result.knowledge && result.knowledge.length > 0) {
+    const lines = result.knowledge.map((kb) => {
+      const parts = [];
+      if (kb.knows && kb.knows.length > 0) {
+        parts.push(`- ${kb.character} knows: ${kb.knows.join("; ")}`);
+      }
+      if (kb.doesNotKnow && kb.doesNotKnow.length > 0) {
+        parts.push(`- ${kb.character} does NOT know: ${kb.doesNotKnow.join("; ")}`);
+      }
+      return parts.join("\n");
+    }).join("\n");
+    sections.push(`## Character Knowledge Boundaries\n${lines}`);
+  }
+
+  // Bulky destructively-updated relationship snapshot goes last.
+  if (result.relationships && result.relationships.length > 0) {
+    const lines = result.relationships.map((r) => {
+      const sent = typeof r.sentiment === "number" ? ` (${r.sentiment.toFixed(1)})` : "";
+      return `- ${r.from} → ${r.to}: ${r.description || "unknown"}${sent}${r.intensity ? ` — intensity ${(r.intensity * 100).toFixed(0)}%` : ""}`;
+    }).join("\n");
+    sections.push(`## Active Relationships\n${lines}`);
   }
 
   const block = `[ChronicleDB Memory Context]\n\n${sections.join("\n\n")}\n\n[/ChronicleDB Memory Context]`;

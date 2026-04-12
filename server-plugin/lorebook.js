@@ -90,10 +90,7 @@ async function ingestLorebook(settings, filename, embedFn) {
     // If entry looks like a location, create a Location node
     const locMatch = detectLocationEntry(comment, keys, cleanContent);
     if (locMatch) {
-      await db.cypher(settings, `
-        MERGE (l:Location {name: $name})
-        SET l.description = $desc
-      `, { name: locMatch, desc: cleanContent.slice(0, 500) });
+      await db.upsertLocation(settings, locMatch, cleanContent.slice(0, 500));
     }
 
     // Embed the content for vector search

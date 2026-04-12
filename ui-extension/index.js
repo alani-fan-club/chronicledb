@@ -26,19 +26,15 @@ const DEFAULT_SETTINGS = {
   pgHost: "localhost",
   pgPort: 5432,
   pgDatabase: "chronicledb",
-  pgUser: "samantha",
+  pgUser: "",
   pgPassword: "",
-  stDataRoot: "/Users/REDACTED/SillyTavern-Launcher/SillyTavern/data/default-user",
-  extractionApiUrl: "https://generativelanguage.googleapis.com/v1beta",
+  stDataRoot: "",
+  extractionApiUrl: "",
   extractionApiKey: "",
   extractionApiType: "gemini",
-  extractionModel: "gemini-2.5-flash-lite",
-  // Used for contextual-retrieval situating blurbs at ingest time.
-  // Separate from extractionModel so users can route blurbs to an even cheaper
-  // model if they want; falls back to extractionModel if left blank.
-  contextModel: "gemini-2.5-flash-lite",
+  extractionModel: "",
   geminiApiKey: "",
-  geminiEmbeddingModel: "gemini-embedding-2-preview",
+  geminiEmbeddingModel: "",
   geminiEmbeddingDimension: 768,
   extractEveryN: 1,
   maxInjectionTokens: 3000,
@@ -46,7 +42,10 @@ const DEFAULT_SETTINGS = {
   enableEvents: true,
   enableKnowledge: true,
   enableWorldState: true,
-  sessionMode: "persistent", // persistent | isolated | readonly
+  sessionMode: "persistent",
+  // Flipped to true the first time the user successfully initializes the DB.
+  // Persists so subsequent ST boots auto-reconnect without user action.
+  initialized: false,
 };
 
 let messageCounter = 0;
@@ -55,9 +54,14 @@ let isExtracting = false;
 // ── Initialization ─────────────────────────────────────────────
 
 (async function init() {
-  // Load settings
+  // Merge defaults under existing settings so existing users keep their values
+  // but new keys get sane defaults. Never overwrite user-set fields.
   if (!extension_settings[EXT_NAME]) {
     extension_settings[EXT_NAME] = { ...DEFAULT_SETTINGS };
+  } else {
+    for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+      if (!(k in extension_settings[EXT_NAME])) extension_settings[EXT_NAME][k] = v;
+    }
   }
   const settings = extension_settings[EXT_NAME];
 
@@ -73,6 +77,17 @@ let isExtracting = false;
 
   // Push settings to server plugin
   await syncSettings(settings);
+
+  // Auto-reconnect on every boot after the first successful initialization.
+  // The server's initSchema is idempotent, so running it unconditionally is
+  // safe and ensures schema migrations land without user action.
+  if (settings.initialized) {
+    autoConnect(settings).catch((err) => {
+      console.warn("[ChronicleDB] Auto-connect failed:", err);
+    });
+  } else {
+    refreshStatus();
+  }
 
   // ── Load chat selector when character changes ───────────────
 
@@ -228,14 +243,11 @@ function bindSettings(settings) {
     });
   }
 
-  // LLM text fields. Note: these keys must match what server-plugin/extractor.js
-  // actually reads — adding a key here that the server doesn't read creates
-  // dead UI; removing a key the server does read breaks config.
+  // These keys must match what server-plugin/extractor.js actually reads.
   for (const field of [
     "extractionApiUrl",
     "extractionApiKey",
     "extractionModel",
-    "contextModel",
     "geminiApiKey",
     "geminiEmbeddingModel",
   ]) {
@@ -283,17 +295,27 @@ function bindSettings(settings) {
     saveAndSync(settings);
   });
 
-  // Init DB button
+  // Connect & initialize button. After the first success, `initialized: true`
+  // is persisted so future ST boots auto-reconnect without any button press.
   $("#chronicle_initDb").on("click", async () => {
+    setStatus("connecting", "Connecting…");
     try {
+      // Push latest settings first so the server has fresh credentials.
+      await syncSettings(settings);
       const res = await fetch(`${PLUGIN_BASE}/init-db`, { method: "POST", headers: getRequestHeaders() });
       if (res.ok) {
-        toastr.success("Database schema initialized.");
+        toastr.success("Connected. Memory is ready.");
+        settings.initialized = true;
+        saveAndSync(settings);
+        setStatus("connected", "Connected");
       } else {
-        toastr.error("DB init failed. Check server logs.");
+        const body = await res.text().catch(() => "");
+        toastr.error("Could not connect. Check database settings.");
+        setStatus("error", body || `HTTP ${res.status}`);
       }
     } catch (err) {
-      toastr.error(`DB init error: ${err.message}`);
+      toastr.error(`Connection error: ${err.message}`);
+      setStatus("error", err.message);
     }
   });
 
@@ -367,6 +389,60 @@ async function syncSettings(settings) {
     await pluginFetch("/settings", settings);
   } catch (err) {
     console.warn("[ChronicleDB] Failed to sync settings:", err);
+  }
+}
+
+// ── Connection status ──────────────────────────────────────────
+
+function setStatus(state, detail) {
+  const badge = $("#chronicle_statusBadge");
+  if (!badge.length) return;
+  const labels = {
+    connected: "Connected",
+    connecting: "Connecting…",
+    "not-configured": "Not configured",
+    error: "Error",
+    unknown: "Unknown",
+  };
+  badge
+    .removeClass("chronicle-status-connected chronicle-status-error chronicle-status-unknown chronicle-status-connecting chronicle-status-notconfigured")
+    .addClass(`chronicle-status-${state === "not-configured" ? "notconfigured" : state}`)
+    .text(labels[state] || state);
+  $("#chronicle_statusDetail").text(detail || "");
+}
+
+async function refreshStatus() {
+  try {
+    const res = await fetch(`${PLUGIN_BASE}/status`, { headers: getRequestHeaders() });
+    if (!res.ok) {
+      setStatus("unknown", `HTTP ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    if (data.connected) {
+      setStatus("connected", "");
+    } else if (data.error) {
+      setStatus("error", data.error);
+    } else {
+      setStatus("not-configured", "Fill in database settings and press Connect.");
+    }
+  } catch (err) {
+    setStatus("unknown", err.message);
+  }
+}
+
+async function autoConnect(settings) {
+  setStatus("connecting", "Connecting…");
+  try {
+    const res = await fetch(`${PLUGIN_BASE}/init-db`, { method: "POST", headers: getRequestHeaders() });
+    if (res.ok) {
+      setStatus("connected", "");
+    } else {
+      const body = await res.text().catch(() => "");
+      setStatus("error", body || `HTTP ${res.status}`);
+    }
+  } catch (err) {
+    setStatus("error", err.message);
   }
 }
 

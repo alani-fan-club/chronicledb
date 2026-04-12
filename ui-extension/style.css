@@ -149,3 +149,43 @@
   border-radius: 10px;
   background: rgba(63, 185, 80, 0.08);
 }
+
+.chronicle-status-label {
+  font-size: 12px;
+  color: var(--SmartThemeBodyColor, #ccc);
+  margin-right: 6px;
+}
+
+.chronicle-status {
+  display: inline-block;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 10px;
+  margin-right: 6px;
+}
+
+.chronicle-status-connected {
+  color: #3fb950;
+  border: 1px solid rgba(63, 185, 80, 0.3);
+  background: rgba(63, 185, 80, 0.08);
+}
+
+.chronicle-status-connecting {
+  color: #58a6ff;
+  border: 1px solid rgba(88, 166, 255, 0.3);
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.chronicle-status-error {
+  color: #f85149;
+  border: 1px solid rgba(248, 81, 73, 0.3);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.chronicle-status-notconfigured,
+.chronicle-status-unknown {
+  color: #8b949e;
+  border: 1px solid rgba(139, 148, 158, 0.3);
+  background: rgba(139, 148, 158, 0.08);
+}

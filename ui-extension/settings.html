@@ -14,22 +14,30 @@
         </label>
       </div>
 
+      <!-- Connection status -->
+      <div class="chronicle-setting">
+        <span class="chronicle-status-label">Status:</span>
+        <span id="chronicle_statusBadge" class="chronicle-status chronicle-status-unknown">Checking…</span>
+        <span id="chronicle_statusDetail" class="chronicle-hint"></span>
+      </div>
+
       <hr>
 
-      <!-- Session mode -->
+      <!-- Memory mode -->
       <div class="chronicle-setting">
-        <label for="chronicle_sessionMode">Session Mode:</label>
+        <label for="chronicle_sessionMode">Memory mode:</label>
         <select id="chronicle_sessionMode" class="text_pole">
-          <option value="persistent">Persistent — memories carry across chats</option>
-          <option value="isolated">Isolated — fresh session, no prior memories</option>
-          <option value="readonly">Read-only — reads memories but won't write new ones</option>
+          <option value="persistent">Persistent — remember across chats</option>
+          <option value="isolated">Isolated — fresh start, no prior memory</option>
+          <option value="readonly">Read-only — use existing memory, don't add new</option>
         </select>
       </div>
 
       <hr>
 
       <!-- Database settings -->
-      <h4>PostgreSQL Connection</h4>
+      <h4>Database</h4>
+      <p class="chronicle-hint">PostgreSQL connection for the memory store. Connects automatically on startup after the first initialization.</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
           <label for="chronicle_pgHost">Host:</label>
@@ -55,78 +63,68 @@
         </div>
       </div>
       <div class="chronicle-setting">
-        <input type="button" id="chronicle_initDb" class="menu_button" value="Initialize Database Schema">
+        <input type="button" id="chronicle_initDb" class="menu_button" value="Connect &amp; initialize">
       </div>
 
       <hr>
 
-      <!-- Extraction LLM -->
-      <h4>Extraction LLM</h4>
-      <p class="chronicle-hint">Reads RP messages and extracts structured memories (characters, events, relationships, plot threads). Any OpenAI-compatible or Gemini endpoint.</p>
+      <!-- Memory LLM -->
+      <h4>Memory model</h4>
+      <p class="chronicle-hint">LLM that reads your chats and builds the memory. Any OpenAI-compatible or Gemini endpoint works. A cheap, fast model is fine.</p>
       <div class="chronicle-setting">
         <label for="chronicle_extractionApiUrl">API URL:</label>
         <input type="text" id="chronicle_extractionApiUrl" class="text_pole" placeholder="https://generativelanguage.googleapis.com/v1beta">
       </div>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_extractionApiKey">API Key:</label>
+          <label for="chronicle_extractionApiKey">API key:</label>
           <input type="password" id="chronicle_extractionApiKey" class="text_pole" placeholder="">
         </div>
         <div class="chronicle-setting">
           <label for="chronicle_extractionModel">Model:</label>
-          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="gemini-2.5-flash-lite">
+          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="e.g. gemini-2.5-flash-lite">
         </div>
       </div>
       <div class="chronicle-setting">
-        <label for="chronicle_extractionApiType">API Type:</label>
+        <label for="chronicle_extractionApiType">API type:</label>
         <select id="chronicle_extractionApiType" class="text_pole">
           <option value="gemini">Gemini</option>
           <option value="openai">OpenAI-compatible</option>
         </select>
       </div>
 
-      <!-- Context / situating blurb LLM -->
-      <h4>Context LLM</h4>
-      <p class="chronicle-hint">Cheap model that writes a 1-2 sentence "situating blurb" for each ingested message — who, where, what's happening — prepended to the text before embedding so search hits carry scene context. Shares the Extraction API URL, key and type. Leave blank to reuse the extraction model.</p>
-      <div class="chronicle-setting">
-        <label for="chronicle_contextModel">Model:</label>
-        <input type="text" id="chronicle_contextModel" class="text_pole" placeholder="gemini-2.5-flash-lite">
-      </div>
-
       <!-- Embedding model -->
-      <h4>Embedding Model</h4>
-      <p class="chronicle-hint">Generates vector embeddings for semantic search. Currently Gemini-only (server plugin calls the Gemini embed endpoint directly).</p>
+      <h4>Embedding model</h4>
+      <p class="chronicle-hint">Converts memories into vectors for semantic search. Gemini-only for now; reuses the memory model's API key.</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
           <label for="chronicle_geminiEmbeddingModel">Model:</label>
-          <input type="text" id="chronicle_geminiEmbeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview">
+          <input type="text" id="chronicle_geminiEmbeddingModel" class="text_pole" placeholder="e.g. gemini-embedding-2-preview">
         </div>
         <div class="chronicle-setting">
           <label for="chronicle_geminiEmbeddingDimension">Dimension:</label>
           <input type="number" id="chronicle_geminiEmbeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
         </div>
       </div>
-      <p class="chronicle-hint">The embedder reuses the Extraction API key (or the legacy Gemini API key if set). 768 matches the current <code>memory_embeddings.embedding</code> column width — changing dimension requires a schema migration.</p>
 
       <hr>
 
-      <!-- Extraction settings -->
+      <!-- Behavior -->
       <h4>Behavior</h4>
+      <p class="chronicle-hint">How much story history to include, and how often to update memory.</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_extractEveryN" title="Run the extraction LLM after every Nth AI response. Higher = cheaper but memories take longer to land.">Extract every N messages:</label>
+          <label for="chronicle_extractEveryN">Update memory every N replies:</label>
           <input type="number" id="chronicle_extractEveryN" class="text_pole" min="1" max="20" placeholder="1">
         </div>
         <div class="chronicle-setting">
-          <label for="chronicle_maxInjectionTokens" title="Rough character budget (/4 ≈ tokens) for the injected ChronicleDB memory block.">Memory budget (tokens):</label>
+          <label for="chronicle_maxInjectionTokens">Memory budget (tokens):</label>
           <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="8000" placeholder="3000">
         </div>
       </div>
-      <p class="chronicle-hint">Retrieval is hybrid: vector similarity + full-text matched events + matched dialogue quotes + recent snapshots + plot threads, all scored together and truncated to the budget above.</p>
 
       <!-- Memory type toggles -->
-      <h4>Memory Types</h4>
-      <p class="chronicle-hint">Which categories the memory block surfaces. Extraction still writes all types — these toggles only affect retrieval display.</p>
+      <h4>What to remember</h4>
       <div class="chronicle-setting">
         <label class="checkbox_label" for="chronicle_enableRelationships">
           <input type="checkbox" id="chronicle_enableRelationships">
@@ -136,42 +134,42 @@
       <div class="chronicle-setting">
         <label class="checkbox_label" for="chronicle_enableEvents">
           <input type="checkbox" id="chronicle_enableEvents">
-          <span>Events &amp; Timeline</span>
+          <span>Events &amp; timeline</span>
         </label>
       </div>
       <div class="chronicle-setting">
         <label class="checkbox_label" for="chronicle_enableKnowledge">
           <input type="checkbox" id="chronicle_enableKnowledge">
-          <span>Character Knowledge Boundaries</span>
+          <span>What each character knows</span>
         </label>
       </div>
       <div class="chronicle-setting">
         <label class="checkbox_label" for="chronicle_enableWorldState">
           <input type="checkbox" id="chronicle_enableWorldState">
-          <span>World State</span>
+          <span>World state</span>
         </label>
       </div>
 
       <hr>
 
       <!-- Per-character chat memory selector -->
-      <h4>Character Memory</h4>
-      <p class="chronicle-hint">Select which past chats this character remembers. Unchecked chats are invisible to the character — like a fresh start.</p>
+      <h4>Character memory</h4>
+      <p class="chronicle-hint">Pick which past chats this character remembers. Unchecked chats are hidden from them.</p>
       <div id="chronicle_chatSelector" class="chronicle-chat-selector">
         <p class="chronicle-hint">Open a chat to see available sessions.</p>
       </div>
       <div class="chronicle-setting-row" style="margin-top: 6px;">
-        <input type="button" id="chronicle_selectAllChats" class="menu_button menu_button_small" value="Select All">
-        <input type="button" id="chronicle_selectNoneChats" class="menu_button menu_button_small" value="Select None">
-        <input type="button" id="chronicle_ingestAllChats" class="menu_button menu_button_small" value="Ingest All" title="Process all chats through the extraction pipeline">
+        <input type="button" id="chronicle_selectAllChats" class="menu_button menu_button_small" value="Select all">
+        <input type="button" id="chronicle_selectNoneChats" class="menu_button menu_button_small" value="Select none">
+        <input type="button" id="chronicle_ingestAllChats" class="menu_button menu_button_small" value="Build memory from all" title="Read every chat and build memory from them">
       </div>
       <div id="chronicle_ingestStatus" class="chronicle-hint" style="margin-top: 4px;"></div>
 
       <hr>
 
       <!-- Lorebook ingestion -->
-      <h4>Lorebook Ingestion</h4>
-      <p class="chronicle-hint">Import lorebook/World Info entries into the memory graph as Fact, Character, and Location nodes.</p>
+      <h4>Lorebook import</h4>
+      <p class="chronicle-hint">Pull in a lorebook so the world's facts, people, and places become part of memory.</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting" style="flex: 2;">
           <select id="chronicle_lorebookSelect" class="text_pole">
@@ -179,7 +177,7 @@
           </select>
         </div>
         <div class="chronicle-setting">
-          <input type="button" id="chronicle_ingestLorebook" class="menu_button" value="Ingest">
+          <input type="button" id="chronicle_ingestLorebook" class="menu_button" value="Import">
         </div>
       </div>
       <div id="chronicle_lorebookStatus" class="chronicle-hint"></div>
@@ -188,7 +186,7 @@
 
       <!-- Actions -->
       <div class="chronicle-setting">
-        <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open Mind Map">
+        <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open mind map">
       </div>
 
     </div>

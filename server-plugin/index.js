@@ -9,8 +9,59 @@ const db = require("./db");
 const { extract, embed } = require("./extractor");
 const { retrieve, formatMemoryBlock } = require("./retriever");
 const { ingestLorebook, listLorebooks } = require("./lorebook");
+const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
+const { resolve: pathResolve, dirname: pathDirname } = require("path");
 
 let settings = {};
+// Tracks live DB state so /status can report it without touching the pool.
+let connectionState = { connected: false, error: null, initializedAt: null };
+
+// Settings are cached on disk so the server can auto-reconnect on ST boot
+// without waiting for the UI extension to push them via /settings.
+const SETTINGS_CACHE_PATH = pathResolve(__dirname, ".settings-cache.json");
+
+function loadCachedSettings() {
+  try {
+    if (!existsSync(SETTINGS_CACHE_PATH)) return null;
+    return JSON.parse(readFileSync(SETTINGS_CACHE_PATH, "utf-8"));
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to read cached settings:", err.message);
+    return null;
+  }
+}
+
+function saveCachedSettings(s) {
+  try {
+    const dir = pathDirname(SETTINGS_CACHE_PATH);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(SETTINGS_CACHE_PATH, JSON.stringify(s, null, 2));
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to cache settings:", err.message);
+  }
+}
+
+async function tryAutoConnect() {
+  if (!settings.pgHost || !settings.pgDatabase) {
+    connectionState = { connected: false, error: null, initializedAt: null };
+    return;
+  }
+  try {
+    await db.initSchema(settings);
+    connectionState = {
+      connected: true,
+      error: null,
+      initializedAt: new Date().toISOString(),
+    };
+    console.log("[ChronicleDB] Auto-connected to database.");
+  } catch (err) {
+    connectionState = {
+      connected: false,
+      error: err.message,
+      initializedAt: null,
+    };
+    console.error("[ChronicleDB] Auto-connect failed:", err.message);
+  }
+}
 
 /**
  * Plugin info — displayed in ST's plugin list.
@@ -28,6 +79,17 @@ const info = {
 async function init(router) {
   console.log("[ChronicleDB] Initializing server plugin...");
 
+  // Hydrate settings from the on-disk cache so we can auto-reconnect before
+  // the UI extension pushes anything via POST /settings.
+  const cached = loadCachedSettings();
+  if (cached) {
+    settings = { ...settings, ...cached };
+    if (cached.initialized) {
+      // Fire and forget — don't block plugin init on DB reachability.
+      tryAutoConnect().catch(() => {});
+    }
+  }
+
   // ── Serve mind map UI ────────────────────────────────────────
   const { resolve, dirname } = require("path");
   const { realpathSync } = require("fs");
@@ -40,9 +102,23 @@ async function init(router) {
 
   // ── Settings endpoint (UI extension saves/loads settings here) ──
 
-  router.post("/settings", (req, res) => {
+  router.post("/settings", async (req, res) => {
+    const prev = settings;
     settings = { ...settings, ...req.body };
-    console.log("[ChronicleDB] Settings updated.");
+    saveCachedSettings(settings);
+
+    // If credentials changed while we weren't connected, attempt reconnect
+    // in the background. Idempotent initSchema makes this safe to re-run.
+    const credsChanged =
+      prev.pgHost !== settings.pgHost ||
+      prev.pgPort !== settings.pgPort ||
+      prev.pgDatabase !== settings.pgDatabase ||
+      prev.pgUser !== settings.pgUser ||
+      prev.pgPassword !== settings.pgPassword;
+    if (settings.initialized && (credsChanged || !connectionState.connected)) {
+      tryAutoConnect().catch(() => {});
+    }
+
     res.json({ ok: true });
   });
 
@@ -50,13 +126,35 @@ async function init(router) {
     res.json(settings);
   });
 
+  // ── Connection status ────────────────────────────────────────
+
+  router.get("/status", (_req, res) => {
+    res.json({
+      connected: connectionState.connected,
+      error: connectionState.error,
+      initializedAt: connectionState.initializedAt,
+      configured: Boolean(settings.pgHost && settings.pgDatabase),
+    });
+  });
+
   // ── Schema init ──────────────────────────────────────────────
 
   router.post("/init-db", async (_req, res) => {
     try {
       await db.initSchema(settings);
+      connectionState = {
+        connected: true,
+        error: null,
+        initializedAt: new Date().toISOString(),
+      };
+      // Persist the fact that we've initialized so subsequent ST boots
+      // know to auto-reconnect. The UI also sets this flag, but doing it
+      // here too means standalone /init-db POSTs still work.
+      settings.initialized = true;
+      saveCachedSettings(settings);
       res.json({ ok: true });
     } catch (err) {
+      connectionState = { connected: false, error: err.message, initializedAt: null };
       console.error("[ChronicleDB] DB init error:", err);
       res.status(500).json({ error: err.message });
     }

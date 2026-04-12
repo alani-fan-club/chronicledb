@@ -241,7 +241,9 @@ async function embed(settings, text) {
 
 async function generateSituatingBlurb(settings, { chatTitle, surroundingContext, message }) {
   const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
-  const model = (settings.contextModel || "gemini-2.5-flash-lite").trim();
+  // contextModel is legacy — the UI now surfaces a single model. Fall back
+  // through contextModel (if user had it set) → extractionModel → hardcoded.
+  const model = (settings.contextModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
 
   const prompt = `You are situating a passage from a roleplay chat for a search index.

@@ -33,6 +33,14 @@ const DEFAULT_SETTINGS = {
   geminiApiKey: "",
   geminiEmbeddingModel: "gemini-embedding-2-preview",
   geminiEmbeddingDimension: 768,
+  extractionApiUrl: "https://generativelanguage.googleapis.com/v1beta",
+  extractionApiKey: "",
+  extractionApiType: "gemini",
+  embeddingApiUrl: "https://generativelanguage.googleapis.com/v1beta",
+  embeddingApiKey: "",
+  embeddingApiType: "gemini",
+  embeddingModel: "gemini-embedding-2-preview",
+  embeddingDimension: 768,
   extractEveryN: 1,          // extract after every N messages
   maxInjectionTokens: 1500,
   enableRelationships: true,
@@ -222,16 +230,40 @@ function bindSettings(settings) {
   }
 
   // LLM settings
-  for (const field of ["ollamaEndpoint", "extractionModel", "geminiApiKey", "geminiEmbeddingModel"]) {
+  for (const field of [
+    "ollamaEndpoint",
+    "extractionModel",
+    "geminiApiKey",
+    "geminiEmbeddingModel",
+    "extractionApiUrl",
+    "extractionApiKey",
+    "embeddingApiUrl",
+    "embeddingApiKey",
+    "embeddingModel",
+  ]) {
     $(`#chronicle_${field}`).val(settings[field]).on("input", function () {
       settings[field] = $(this).val();
       saveAndSync(settings);
     });
   }
 
-  // Gemini dimension (numeric)
+  // Provider type selects
+  for (const field of ["extractionApiType", "embeddingApiType"]) {
+    $(`#chronicle_${field}`).val(settings[field]).on("change", function () {
+      settings[field] = $(this).val();
+      saveAndSync(settings);
+    });
+  }
+
+  // Gemini dimension (numeric, legacy field)
   $("#chronicle_geminiEmbeddingDimension").val(settings.geminiEmbeddingDimension).on("input", function () {
     settings.geminiEmbeddingDimension = parseInt($(this).val()) || 768;
+    saveAndSync(settings);
+  });
+
+  // Embedding dimension (numeric)
+  $("#chronicle_embeddingDimension").val(settings.embeddingDimension).on("input", function () {
+    settings.embeddingDimension = parseInt($(this).val()) || 768;
     saveAndSync(settings);
   });
 

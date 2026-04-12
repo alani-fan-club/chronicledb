@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS events (
     timestamp         TIMESTAMPTZ DEFAULT NOW(),
     tier              TEXT DEFAULT 'recent',
     condensed_summary TEXT,
-    is_major          BOOLEAN GENERATED ALWAYS AS (significance >= 4) STORED
+    is_major          BOOLEAN GENERATED ALWAYS AS (significance >= 4) STORED,
+    embedding         vector(768)
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_chat ON events (chat_id);
@@ -50,9 +51,12 @@ CREATE INDEX IF NOT EXISTS idx_events_major ON events (chat_id) WHERE is_major =
 ALTER TABLE events ADD COLUMN IF NOT EXISTS source_text TEXT DEFAULT '';
 ALTER TABLE events ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'recent';
 ALTER TABLE events ADD COLUMN IF NOT EXISTS condensed_summary TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS embedding vector(768);
 
 CREATE INDEX IF NOT EXISTS idx_events_source_tsv
     ON events USING GIN (to_tsvector('english', source_text));
+CREATE INDEX IF NOT EXISTS idx_events_embed_hnsw
+    ON events USING hnsw (embedding vector_cosine_ops);
 
 CREATE TABLE IF NOT EXISTS facts (
     id         TEXT PRIMARY KEY,
@@ -135,11 +139,16 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
     present_chars   TEXT[] DEFAULT '{}',
     emotional_tone  TEXT DEFAULT '',
     world_state_snapshot JSONB DEFAULT '{}',
-    timestamp       TIMESTAMPTZ DEFAULT NOW()
+    timestamp       TIMESTAMPTZ DEFAULT NOW(),
+    embedding       vector(768)
 );
+
+ALTER TABLE context_snapshots ADD COLUMN IF NOT EXISTS embedding vector(768);
 
 CREATE INDEX IF NOT EXISTS idx_ctx_chat
     ON context_snapshots (chat_id, message_index);
+CREATE INDEX IF NOT EXISTS idx_ctx_embed_hnsw
+    ON context_snapshots USING hnsw (embedding vector_cosine_ops);
 
 -- ── Plot threads (foreshadowing, pending events, unresolved arcs)
 

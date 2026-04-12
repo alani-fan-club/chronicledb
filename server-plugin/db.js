@@ -181,19 +181,33 @@ async function upsertPlotThread(settings, { chatId, title, description, threadTy
   const { rows: existing } = await p.query(
     `SELECT id FROM plot_threads WHERE chat_id = $1 AND title = $2`, [chatId, title],
   );
+  let plotId;
   if (existing.length > 0) {
+    plotId = existing[0].id;
     await p.query(
       `UPDATE plot_threads SET thread_type = $2, description = $3, involved_chars = $4, resolved_at = $5, importance = $6, updated_at = NOW() WHERE id = $1`,
-      [existing[0].id, threadType || "pending", description || "", involvedChars || [], resolvedAt || null, importance || 3],
+      [plotId, threadType || "pending", description || "", involvedChars || [], resolvedAt || null, importance || 3],
     );
-    return existing[0].id;
+  } else {
+    plotId = `plot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    await p.query(
+      `INSERT INTO plot_threads (id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [plotId, chatId, threadType || "pending", title, description || "", involvedChars || [], plantedAt || null, resolvedAt || null, importance || 3],
+    );
   }
-  const id = `plot-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  await p.query(
-    `INSERT INTO plot_threads (id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-    [id, chatId, threadType || "pending", title, description || "", involvedChars || [], plantedAt || null, resolvedAt || null, importance || 3],
-  );
-  return id;
+
+  // Link to characters (ensure they exist first)
+  for (const charName of (involvedChars || [])) {
+    if (!charName) continue;
+    const charId = slugify(charName);
+    await upsertCharacter(settings, { name: charName });
+    await p.query(
+      `INSERT INTO plot_thread_characters (plot_id, character_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [plotId, charId],
+    ).catch(() => {});
+  }
+
+  return plotId;
 }
 
 async function getActivePlotThreads(settings, chatId) {
@@ -456,21 +470,12 @@ async function getGraphData(settings, { scope, character }) {
   const p = getPool(settings);
   const nodes = [];
   const edges = [];
-
-  // Get all edges first so we know which nodes are connected
-  const { rows: rels } = await p.query(
-    `SELECT fa.from_char, fa.to_char, fa.sentiment, fa.intensity, fa.description
-     FROM feels_about fa`,
-  );
-  const { rows: parts } = await p.query(
-    `SELECT character_id, event_id, role FROM participated_in`,
-  );
-  const { rows: knowledgeEdges } = await p.query(
-    `SELECT character_id, fact_id FROM knows LIMIT 500`,
-  );
-
-  // Collect IDs of all connected nodes
   const connectedIds = new Set();
+
+  // All edge types
+  const { rows: rels } = await p.query(
+    `SELECT fa.from_char, fa.to_char, fa.sentiment, fa.intensity, fa.description FROM feels_about fa`,
+  );
   for (const r of rels) {
     connectedIds.add(r.from_char);
     connectedIds.add(r.to_char);
@@ -482,6 +487,10 @@ async function getGraphData(settings, { scope, character }) {
       intensity: parseFloat(r.intensity) || 0.5,
     });
   }
+
+  const { rows: parts } = await p.query(
+    `SELECT character_id, event_id, role FROM participated_in`,
+  );
   for (const pi of parts) {
     connectedIds.add(pi.character_id);
     connectedIds.add(pi.event_id);
@@ -492,47 +501,81 @@ async function getGraphData(settings, { scope, character }) {
       sentiment: 0, intensity: 0.5,
     });
   }
-  for (const k of knowledgeEdges) {
-    connectedIds.add(k.character_id);
-    connectedIds.add(k.fact_id);
+
+  // Items: OWNED by characters + LOCATED_AT locations
+  const { rows: itemOwners } = await p.query(
+    `SELECT id, name, owner_id, location_id FROM items WHERE owner_id IS NOT NULL OR location_id IS NOT NULL`,
+  );
+  for (const it of itemOwners) {
+    connectedIds.add(it.id);
+    if (it.owner_id) {
+      connectedIds.add(it.owner_id);
+      edges.push({
+        id: `own-${it.owner_id}-${it.id}`,
+        source: it.owner_id, target: it.id,
+        type: "OWNS", label: "owns",
+        sentiment: 0, intensity: 0.4,
+      });
+    }
+    if (it.location_id) {
+      connectedIds.add(it.location_id);
+      edges.push({
+        id: `at-${it.id}-${it.location_id}`,
+        source: it.id, target: it.location_id,
+        type: "LOCATED_AT", label: "located at",
+        sentiment: 0, intensity: 0.3,
+      });
+    }
+  }
+
+  // Events at locations
+  const { rows: evtLocs } = await p.query(
+    `SELECT id, location_id FROM events WHERE location_id IS NOT NULL`,
+  );
+  for (const e of evtLocs) {
+    connectedIds.add(e.id);
+    connectedIds.add(e.location_id);
     edges.push({
-      id: `kn-${k.character_id}-${k.fact_id}`,
-      source: k.character_id, target: k.fact_id,
-      type: "KNOWS", label: "knows",
+      id: `at-${e.id}-${e.location_id}`,
+      source: e.id, target: e.location_id,
+      type: "OCCURRED_AT", label: "at",
       sentiment: 0, intensity: 0.3,
     });
   }
 
-  // Only include nodes that have at least one edge
+  // Plot threads: linked to characters
+  const { rows: plotChars } = await p.query(
+    `SELECT plot_id, character_id FROM plot_thread_characters`,
+  );
+  for (const pc of plotChars) {
+    connectedIds.add(pc.plot_id);
+    connectedIds.add(pc.character_id);
+    edges.push({
+      id: `pt-${pc.character_id}-${pc.plot_id}`,
+      source: pc.character_id, target: pc.plot_id,
+      type: "INVOLVED_IN", label: "involved in",
+      sentiment: 0, intensity: 0.4,
+    });
+  }
+
+  // Hydrate all nodes
   if (connectedIds.size > 0) {
     const idArray = [...connectedIds];
-    const { rows: chars } = await p.query(
-      `SELECT * FROM characters WHERE id = ANY($1)`, [idArray],
-    );
-    for (const c of chars) {
-      nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
-    }
 
-    const { rows: evts } = await p.query(
-      `SELECT * FROM events WHERE id = ANY($1)`, [idArray],
-    );
-    for (const e of evts) {
-      nodes.push({ id: e.id, label: (e.summary || "").slice(0, 40), type: "event", metadata: e });
-    }
+    const { rows: chars } = await p.query(`SELECT * FROM characters WHERE id = ANY($1)`, [idArray]);
+    for (const c of chars) nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
 
-    const { rows: fcts } = await p.query(
-      `SELECT * FROM facts WHERE id = ANY($1) LIMIT 100`, [idArray],
-    );
-    for (const f of fcts) {
-      nodes.push({ id: f.id, label: (f.content || "").slice(0, 40), type: "fact", metadata: f });
-    }
+    const { rows: locs } = await p.query(`SELECT * FROM locations WHERE id = ANY($1)`, [idArray]);
+    for (const l of locs) nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
 
-    const { rows: locs } = await p.query(
-      `SELECT * FROM locations WHERE id = ANY($1)`, [idArray],
-    );
-    for (const l of locs) {
-      nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
-    }
+    const { rows: evts } = await p.query(`SELECT * FROM events WHERE id = ANY($1)`, [idArray]);
+    for (const e of evts) nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
+
+    const { rows: its } = await p.query(`SELECT * FROM items WHERE id = ANY($1)`, [idArray]);
+    for (const i of its) nodes.push({ id: i.id, label: i.name, type: "item", metadata: i });
+
+    const { rows: pts } = await p.query(`SELECT * FROM plot_threads WHERE id = ANY($1)`, [idArray]);
+    for (const pt of pts) nodes.push({ id: pt.id, label: pt.title, type: "plot_thread", metadata: pt });
   }
 
   return { nodes, edges };

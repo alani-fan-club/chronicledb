@@ -20,6 +20,7 @@ const COLORS = {
   event: "#d4a574",         // warm amber
   fact: "#555",             // dim grey
   scene: "#444",
+  plot_thread: "#c77d5c",   // dusty orange
   positive: "#4ade80",
   negative: "#ef4444",
   neutral: "#94a3b8",
@@ -103,6 +104,13 @@ function initCytoscape() {
       {
         selector: "node[type='fact']",
         style: { "background-color": COLORS.fact },
+      },
+      {
+        selector: "node[type='plot_thread']",
+        style: {
+          "background-color": COLORS.plot_thread,
+          shape: "diamond",
+        },
       },
       // Edges — subtle thin lines
       {
@@ -258,17 +266,21 @@ function renderGraph(data) {
     const size = Math.min(40, 8 + Math.log(degree + 1) * 8);
     const isCharacter = node.type === "character";
 
+    // Keep full label in data for detail panel, but show short label on canvas
+    const fullLabel = node.label || "";
+    const canvasLabel = isCharacter ? fullLabel : ""; // only characters show labels on canvas
     elements.push({
       group: "nodes",
       data: {
         id: node.id,
-        label: isCharacter ? (node.label || "") : "",
+        label: canvasLabel,
+        fullLabel: fullLabel,
         type: node.type,
         size,
         degree,
         isPC: node.metadata?.is_player_character ?? false,
-        avatarUrl: isCharacter && node.label
-          ? `${API_BASE}/character-image/${encodeURIComponent(node.label)}.png`
+        avatarUrl: isCharacter && fullLabel
+          ? `${API_BASE}/character-image/${encodeURIComponent(fullLabel)}.png`
           : undefined,
         ...node.metadata,
       },
@@ -345,40 +357,85 @@ function showLoading(visible) {
 function showDetailPanel(data) {
   const panel = document.getElementById("detail-panel");
   const content = document.getElementById("detail-content");
+  const title = data.fullLabel || data.label || data.id;
 
   let html = "";
   if (data.type === "character") {
-    const avatarUrl = `${API_BASE}/character-image/${encodeURIComponent(data.label)}.png`;
-    html += `<div class="detail-avatar"><img src="${avatarUrl}" onerror="this.style.display='none'"></div>`;
+    const avatarUrl = `${API_BASE}/character-image/${encodeURIComponent(title)}.png`;
+    html += `<div class="detail-avatar"><img src="${avatarUrl}" onerror="this.style.display='none'; this.parentElement.classList.add('no-img');"></div>`;
   }
-  html += `<h2>${data.label || data.id}</h2>`;
+  html += `<h2>${escapeHtml(title)}</h2>`;
   html += `<div class="detail-type">${data.type || "node"}</div>`;
 
-  if (data.description) html += `<p class="detail-desc">${data.description}</p>`;
-  if (data.role) html += `<div class="detail-row"><span>Role</span><b>${data.role}</b></div>`;
-  if (data.status) html += `<div class="detail-row"><span>Status</span><b>${data.status}</b></div>`;
-  if (data.degree !== undefined) html += `<div class="detail-row"><span>Connections</span><b>${data.degree}</b></div>`;
+  if (data.description) html += `<p class="detail-desc">${escapeHtml(data.description)}</p>`;
+  if (data.content && data.type === "fact") html += `<p class="detail-desc">${escapeHtml(data.content)}</p>`;
+  if (data.summary && data.type === "event") html += `<p class="detail-desc">${escapeHtml(data.summary)}</p>`;
+  if (data.role) html += `<div class="detail-row"><span class="detail-key">Role</span><span class="detail-val">${escapeHtml(data.role)}</span></div>`;
+  if (data.status) html += `<div class="detail-row"><span class="detail-key">Status</span><span class="detail-val">${escapeHtml(data.status)}</span></div>`;
+  if (data.significance) html += `<div class="detail-row"><span class="detail-key">Significance</span><span class="detail-val">${data.significance}/5</span></div>`;
+  if (data.degree !== undefined) html += `<div class="detail-row"><span class="detail-key">Connections</span><span class="detail-val">${data.degree}</span></div>`;
 
-  // Connected nodes
+  // Connected nodes — grouped by edge type
   const node = cy.getElementById(data.id);
   if (node.length) {
     const edges = node.connectedEdges();
     if (edges.length > 0) {
-      html += `<h3>Connections</h3><ul>`;
+      // Group by edge type
+      const groups = new Map();
       edges.forEach((edge) => {
         const ed = edge.data();
-        const other = edge.source().id() === data.id
-          ? edge.target().data("label")
-          : edge.source().data("label");
-        const sentClass = sentimentClass(ed.sentiment);
-        html += `<li>${ed.label || ed.type} <span class="sentiment-badge ${sentClass}">${other}</span></li>`;
+        const otherId = edge.source().id() === data.id ? edge.target().id() : edge.source().id();
+        const otherNode = cy.getElementById(otherId);
+        if (!otherNode.length) return;
+        const otherData = otherNode.data();
+        const otherLabel = otherData.fullLabel || otherData.label || otherData.content || otherData.summary || otherId;
+
+        if (!groups.has(ed.type)) groups.set(ed.type, []);
+        groups.get(ed.type).push({
+          label: otherLabel.slice(0, 80),
+          type: otherData.type,
+          sentiment: ed.sentiment,
+          edgeLabel: ed.label,
+        });
       });
-      html += `</ul>`;
+
+      const typeDisplayNames = {
+        FEELS_ABOUT: "Relationships",
+        KNOWS: "Knows",
+        PARTICIPATED_IN: "Events",
+        WITNESSED: "Witnessed",
+        LOCATED_AT: "Locations",
+      };
+
+      for (const [edgeType, items] of groups) {
+        html += `<h3>${typeDisplayNames[edgeType] || edgeType} <span class="detail-count">${items.length}</span></h3>`;
+        html += `<ul class="detail-list">`;
+        // Limit to first 15 to avoid flooding
+        const shown = items.slice(0, 15);
+        for (const it of shown) {
+          const sentClass = sentimentClass(it.sentiment);
+          const dotColor = it.type === "character" ? "#8b95a8" : it.type === "event" ? "#d4a574" : it.type === "fact" ? "#666" : it.type === "location" ? "#6b8e7a" : it.type === "item" ? "#b08968" : it.type === "plot_thread" ? "#c77d5c" : "#999";
+          html += `<li class="${sentClass}"><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(it.label)}</span></li>`;
+        }
+        if (items.length > 15) {
+          html += `<li class="detail-more">+ ${items.length - 15} more</li>`;
+        }
+        html += `</ul>`;
+      }
     }
   }
 
   content.innerHTML = html;
   panel.classList.remove("hidden");
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function showEdgeDetail(data) {

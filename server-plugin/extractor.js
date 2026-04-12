@@ -128,7 +128,7 @@ JSON:`;
           model,
           messages: [{ role: "user", content: prompt }],
           temperature: 0.1,
-          max_tokens: 4096,
+          max_tokens: 16384,
         }),
       });
       if (!res.ok) throw new Error(`Extraction LLM error: ${res.status} ${await res.text()}`);
@@ -144,14 +144,18 @@ JSON:`;
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.1,
-            maxOutputTokens: 4096,
+            maxOutputTokens: 16384,
             responseMimeType: "application/json",
           },
         }),
       });
       if (!res.ok) throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
       const data = await res.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text;
+      const candidate = data.candidates?.[0];
+      if (candidate?.finishReason && candidate.finishReason !== "STOP") {
+        console.warn(`[ChronicleDB] Finish reason: ${candidate.finishReason}`);
+      }
+      return candidate?.content?.parts?.[0]?.text;
     });
   }
 

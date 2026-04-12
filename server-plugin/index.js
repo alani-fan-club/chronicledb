@@ -574,7 +574,7 @@ async function init(router) {
 
           extracted++;
           } catch (err) {
-            console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message);
+            console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message, err.stack?.split("\n").slice(0, 3).join(" | "));
           }
         } // end for k (serial DB writes for group)
       } // end for g (parallel extraction groups)

@@ -321,23 +321,41 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   const p = getPool(settings);
   const startId = slugify(characterName);
 
-  // Recursive CTE: walk through a unified edges view
-  // Single self-reference required by PostgreSQL
+  // Get list of chat IDs that belong to this character (from ingestion_status)
+  // This scopes the traversal to data extracted from THIS character's RPs only,
+  // preventing cross-contamination via shared user personas like "REDACTED"
+  const { rows: chats } = await p.query(
+    `SELECT chat_file FROM ingestion_status WHERE character_name = $1 AND status = 'done'`,
+    [characterName],
+  );
+  const chatIds = chats.map((c) => c.chat_file.replace(".jsonl", ""));
+
+  // Build session_id pattern for filtering. If no chats ingested yet, return empty
+  if (chatIds.length === 0) {
+    return { nodes: [], edges: [] };
+  }
+
+  // Recursive CTE: walk through edges scoped to this character's chats
   const { rows } = await p.query(`
     WITH RECURSIVE
-    -- Unified edges view: all graph edges as (from, from_type, to, to_type) tuples
+    -- Only edges from this character's ingested chats
     all_edges AS (
-      SELECT from_char as src, 'character'::text as src_type, to_char as dst, 'character'::text as dst_type FROM feels_about
+      SELECT from_char as src, 'character'::text as src_type, to_char as dst, 'character'::text as dst_type
+      FROM feels_about WHERE session_id = ANY($3)
       UNION ALL
-      SELECT to_char, 'character', from_char, 'character' FROM feels_about
+      SELECT to_char, 'character', from_char, 'character'
+      FROM feels_about WHERE session_id = ANY($3)
       UNION ALL
-      SELECT character_id, 'character', fact_id, 'fact' FROM knows
+      SELECT k.character_id, 'character', k.fact_id, 'fact'
+      FROM knows k
       UNION ALL
-      SELECT character_id, 'character', event_id, 'event' FROM participated_in
+      SELECT pi.character_id, 'character', pi.event_id, 'event'
+      FROM participated_in pi
+      JOIN events e ON e.id = pi.event_id WHERE e.chat_id = ANY($3)
       UNION ALL
-      SELECT event_id, 'event', character_id, 'character' FROM participated_in
-      UNION ALL
-      SELECT character_id, 'character', location_id, 'location' FROM present_at WHERE is_current = TRUE
+      SELECT pi.event_id, 'event', pi.character_id, 'character'
+      FROM participated_in pi
+      JOIN events e ON e.id = pi.event_id WHERE e.chat_id = ANY($3)
     ),
     graph_walk AS (
       SELECT $1::text as node_id, 'character'::text as node_type, 0 as hop
@@ -351,7 +369,7 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
     FROM graph_walk
     GROUP BY node_id, node_type
     ORDER BY hop, node_type
-  `, [startId, depth]);
+  `, [startId, depth, chatIds]);
 
   // Hydrate the node IDs into full objects
   const nodes = [];
@@ -377,15 +395,15 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
     for (const l of ls) nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
   }
 
-  // Get edges between discovered nodes
+  // Get edges between discovered nodes — scoped to this character's chats
   const edges = [];
-  const allNodeIds = [...charIds, ...factIds, ...eventIds, ...locIds];
 
   if (charIds.length > 0) {
     const { rows: rels } = await p.query(
       `SELECT from_char as source, to_char as target, sentiment, intensity, description
-       FROM feels_about WHERE from_char = ANY($1) AND to_char = ANY($1)`,
-      [charIds],
+       FROM feels_about
+       WHERE from_char = ANY($1) AND to_char = ANY($1) AND session_id = ANY($2)`,
+      [charIds, chatIds],
     );
     for (const r of rels) {
       edges.push({ id: `fa-${r.source}-${r.target}`, source: r.source, target: r.target,
@@ -407,8 +425,11 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
 
   if (charIds.length > 0 && eventIds.length > 0) {
     const { rows: pi } = await p.query(
-      `SELECT character_id, event_id, role FROM participated_in WHERE character_id = ANY($1) AND event_id = ANY($2)`,
-      [charIds, eventIds],
+      `SELECT pi.character_id, pi.event_id, pi.role
+       FROM participated_in pi
+       JOIN events e ON e.id = pi.event_id
+       WHERE pi.character_id = ANY($1) AND pi.event_id = ANY($2) AND e.chat_id = ANY($3)`,
+      [charIds, eventIds, chatIds],
     );
     for (const p of pi) {
       edges.push({ id: `pi-${p.character_id}-${p.event_id}`, source: p.character_id, target: p.event_id,

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChronicleDB — Mind Map</title>
+  <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header id="toolbar">
+      <h1>ChronicleDB</h1>
+      <div id="controls">
+        <div class="control-group">
+          <label for="scope-select">View:</label>
+          <select id="scope-select">
+            <option value="global">All RPs (Global)</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label for="edge-filter">Show:</label>
+          <select id="edge-filter" multiple>
+            <option value="FEELS_ABOUT" selected>Relationships</option>
+            <option value="KNOWS" selected>Knowledge</option>
+            <option value="LOCATED_AT" selected>Locations</option>
+            <option value="PARTICIPATED_IN">Event Links</option>
+            <option value="WITNESSED">Witnesses</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <input type="text" id="search-input" placeholder="Search characters, locations...">
+        </div>
+        <div class="control-group">
+          <button id="btn-fit">Fit</button>
+          <button id="btn-export">Export PNG</button>
+          <button id="btn-layout">Re-layout</button>
+        </div>
+      </div>
+    </header>
+
+    <div id="main">
+      <div id="cy"></div>
+
+      <aside id="detail-panel" class="hidden">
+        <button id="btn-close-panel">&times;</button>
+        <div id="detail-content">
+          <!-- Populated dynamically -->
+        </div>
+      </aside>
+    </div>
+
+    <footer id="timeline-bar">
+      <label for="time-slider">Timeline:</label>
+      <input type="range" id="time-slider" min="0" max="100" value="100">
+      <span id="time-label">All time</span>
+    </footer>
+  </div>
+
+  <script src="mindmap.js"></script>
+</body>
+</html>

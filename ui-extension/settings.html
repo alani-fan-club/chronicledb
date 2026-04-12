@@ -1,0 +1,131 @@
+<div class="chronicle-db-settings">
+  <div class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+      <b>ChronicleDB</b>
+      <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+
+      <!-- Enable toggle -->
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enabled">
+          <input type="checkbox" id="chronicle_enabled">
+          <span>Enable ChronicleDB</span>
+        </label>
+      </div>
+
+      <hr>
+
+      <!-- Session mode -->
+      <div class="chronicle-setting">
+        <label for="chronicle_sessionMode">Session Mode:</label>
+        <select id="chronicle_sessionMode" class="text_pole">
+          <option value="persistent">Persistent — memories carry across chats</option>
+          <option value="isolated">Isolated — fresh session, no prior memories</option>
+          <option value="readonly">Read-only — reads memories but won't write new ones</option>
+        </select>
+      </div>
+
+      <hr>
+
+      <!-- Database settings -->
+      <h4>PostgreSQL Connection</h4>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_pgHost">Host:</label>
+          <input type="text" id="chronicle_pgHost" class="text_pole" placeholder="localhost">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_pgPort">Port:</label>
+          <input type="number" id="chronicle_pgPort" class="text_pole" placeholder="5432">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_pgDatabase">Database:</label>
+        <input type="text" id="chronicle_pgDatabase" class="text_pole" placeholder="chronicledb">
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_pgUser">User:</label>
+          <input type="text" id="chronicle_pgUser" class="text_pole" placeholder="chronicledb">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_pgPassword">Password:</label>
+          <input type="password" id="chronicle_pgPassword" class="text_pole" placeholder="">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <input type="button" id="chronicle_initDb" class="menu_button" value="Initialize Database Schema">
+      </div>
+
+      <hr>
+
+      <!-- LLM settings -->
+      <h4>Extraction LLM</h4>
+      <div class="chronicle-setting">
+        <label for="chronicle_ollamaEndpoint">Ollama Endpoint:</label>
+        <input type="text" id="chronicle_ollamaEndpoint" class="text_pole" placeholder="http://localhost:11434/v1">
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_extractionModel">Extraction Model:</label>
+          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="qwen3:8b">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingModel">Embedding Model:</label>
+          <input type="text" id="chronicle_embeddingModel" class="text_pole" placeholder="nomic-embed-text">
+        </div>
+      </div>
+
+      <hr>
+
+      <!-- Extraction settings -->
+      <h4>Behavior</h4>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_extractEveryN">Extract every N messages:</label>
+          <input type="number" id="chronicle_extractEveryN" class="text_pole" min="1" max="20" placeholder="1">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_maxInjectionTokens">Max injection tokens:</label>
+          <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="4000" placeholder="1500">
+        </div>
+      </div>
+
+      <!-- Memory type toggles -->
+      <h4>Memory Types</h4>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableRelationships">
+          <input type="checkbox" id="chronicle_enableRelationships">
+          <span>Relationships</span>
+        </label>
+      </div>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableEvents">
+          <input type="checkbox" id="chronicle_enableEvents">
+          <span>Events &amp; Timeline</span>
+        </label>
+      </div>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableKnowledge">
+          <input type="checkbox" id="chronicle_enableKnowledge">
+          <span>Character Knowledge Boundaries</span>
+        </label>
+      </div>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableWorldState">
+          <input type="checkbox" id="chronicle_enableWorldState">
+          <span>World State</span>
+        </label>
+      </div>
+
+      <hr>
+
+      <!-- Actions -->
+      <div class="chronicle-setting">
+        <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open Mind Map">
+      </div>
+
+    </div>
+  </div>
+</div>

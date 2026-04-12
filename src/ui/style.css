@@ -1,0 +1,227 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* ── Toolbar ────────────────────────────────────────── */
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 16px;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  flex-shrink: 0;
+}
+
+#toolbar h1 {
+  font-size: 16px;
+  font-weight: 600;
+  color: #58a6ff;
+  white-space: nowrap;
+}
+
+#controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  flex: 1;
+}
+
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.control-group label {
+  font-size: 12px;
+  color: #8b949e;
+  white-space: nowrap;
+}
+
+select, input[type="text"] {
+  background: #0d1117;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+select:focus, input:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+
+select[multiple] {
+  height: 28px;
+  min-width: 120px;
+}
+
+#search-input {
+  min-width: 180px;
+}
+
+button {
+  background: #21262d;
+  color: #e6edf3;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+button:hover {
+  background: #30363d;
+}
+
+/* ── Main area ──────────────────────────────────────── */
+
+#main {
+  flex: 1;
+  display: flex;
+  position: relative;
+  overflow: hidden;
+}
+
+#cy {
+  flex: 1;
+  background: #0d1117;
+}
+
+/* ── Detail panel (slides in from right) ────────────── */
+
+#detail-panel {
+  width: 320px;
+  background: #161b22;
+  border-left: 1px solid #30363d;
+  padding: 16px;
+  overflow-y: auto;
+  transition: transform 0.25s ease;
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  z-index: 10;
+}
+
+#detail-panel.hidden {
+  transform: translateX(100%);
+}
+
+#btn-close-panel {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: none;
+  border: none;
+  color: #8b949e;
+  font-size: 20px;
+  cursor: pointer;
+}
+
+#detail-content h2 {
+  font-size: 18px;
+  margin-bottom: 12px;
+  color: #58a6ff;
+}
+
+#detail-content h3 {
+  font-size: 14px;
+  margin-top: 16px;
+  margin-bottom: 8px;
+  color: #8b949e;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+#detail-content p, #detail-content li {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #c9d1d9;
+}
+
+#detail-content ul {
+  padding-left: 16px;
+}
+
+#detail-content li {
+  margin-bottom: 4px;
+}
+
+.sentiment-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.sentiment-positive { background: #1a4731; color: #3fb950; }
+.sentiment-neutral  { background: #272c33; color: #8b949e; }
+.sentiment-negative { background: #4a1d1d; color: #f85149; }
+
+/* ── Timeline bar ───────────────────────────────────── */
+
+#timeline-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #161b22;
+  border-top: 1px solid #30363d;
+  flex-shrink: 0;
+}
+
+#timeline-bar label {
+  font-size: 12px;
+  color: #8b949e;
+}
+
+#time-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  height: 4px;
+  background: #30363d;
+  border-radius: 2px;
+  outline: none;
+}
+
+#time-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  background: #58a6ff;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+#time-label {
+  font-size: 12px;
+  color: #8b949e;
+  min-width: 80px;
+  text-align: right;
+}
+
+/* ── Node type colors (used by Cytoscape) ───────────── */
+/* These are applied via Cytoscape stylesheet, not CSS */

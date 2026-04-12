@@ -1,0 +1,32 @@
+.chronicle-db-settings h4 {
+  margin-top: 8px;
+  margin-bottom: 4px;
+  font-size: 13px;
+  color: var(--SmartThemeQuoteColor, #888);
+}
+
+.chronicle-setting {
+  margin-bottom: 6px;
+}
+
+.chronicle-setting label:not(.checkbox_label) {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 2px;
+  color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.chronicle-setting-row {
+  display: flex;
+  gap: 8px;
+}
+
+.chronicle-setting-row .chronicle-setting {
+  flex: 1;
+}
+
+.chronicle-db-settings hr {
+  border: none;
+  border-top: 1px solid var(--SmartThemeBorderColor, #333);
+  margin: 8px 0;
+}

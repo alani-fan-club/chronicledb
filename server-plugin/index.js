@@ -407,7 +407,7 @@ async function init(router) {
 
       // Process in batches with parallel extraction
       const batchSize = 10;
-      const concurrency = 3; // parallel LLM calls (Gemini free tier is rate-limited)
+      const concurrency = 1; // serial — Gemini free tier chokes at higher concurrency
       let extracted = 0;
       const totalBatches = Math.ceil(messages.length / batchSize);
 

@@ -363,8 +363,11 @@ async function getKnowledgeBoundaries(settings, characters) {
       [charId],
     );
     const { rows: unknown } = await p.query(
+      // 'lore' is intentionally excluded: lorebook ingestion uses
+      // 'worldbuilding'/'setting'/'background', so the only domains here are
+      // actual per-character secrets/backstory.
       `SELECT f.content FROM facts f
-       WHERE f.domain IN ('secret', 'lore', 'backstory')
+       WHERE f.domain IN ('secret', 'backstory')
        AND f.id NOT IN (SELECT fact_id FROM knows WHERE character_id = $1)`,
       [charId],
     );

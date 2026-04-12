@@ -81,13 +81,16 @@ async function init(router) {
           firstSeen: new Date().toISOString(),
         });
 
-        // Store character facts
+        // Store character "new_facts" as traits (innate properties).
+        // Matches /ingest-chat semantics — traits is the canonical home
+        // for character personality/background, not the facts table.
+        const charId = db.slugify(char.name);
         for (const fact of (char.new_facts || [])) {
-          await db.upsertFact(settings, {
+          await db.upsertTrait(settings, {
+            characterId: charId,
+            category: "personality",
             content: fact,
-            domain: "character",
-            confidence: 0.8,
-            characterScope: [char.name],
+            sourceChat: chatId || "",
           });
         }
       }
@@ -202,6 +205,28 @@ async function init(router) {
           emotionalTone: snap.emotional_tone || "",
           worldStateSnapshot: wsSnapshot,
         });
+
+        // Mark these characters as currently present at this location.
+        // retriever.js::getLocations reads present_at to populate the
+        // "Current Scene" section, so without these writes that section
+        // is always empty.
+        if (snap.location && snap.present_characters?.length > 0) {
+          const locationId = await db.upsertLocation(settings, snap.location, "");
+          const p = db.getPool(settings);
+          const charIds = snap.present_characters.map((n) => db.slugify(n));
+          await p.query(
+            `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
+            [charIds],
+          ).catch(() => {});
+          for (const charName of snap.present_characters) {
+            const charId = db.slugify(charName);
+            await db.upsertCharacter(settings, { name: charName });
+            await p.query(
+              `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
+              [charId, locationId],
+            ).catch(() => {});
+          }
+        }
       }
 
       // 4. Ingest plot threads
@@ -560,6 +585,28 @@ async function init(router) {
             const wsSnap = {};
             for (const ws of (extraction.world_state || [])) wsSnap[ws.key] = ws.value;
             await db.insertContextSnapshot(settings, { chatId, messageIndex: i, summary: snap.summary||"", locationName: snap.location||null, presentChars: snap.present_characters||[], emotionalTone: snap.emotional_tone||"", worldStateSnapshot: wsSnap });
+
+            // Mark these characters as currently present at this location.
+            // retriever.js::getLocations reads present_at to populate the
+            // "Current Scene" section, so without these writes that section
+            // is always empty.
+            if (snap.location && snap.present_characters?.length > 0) {
+              const locationId = await db.upsertLocation(settings, snap.location, "");
+              const p = db.getPool(settings);
+              const charIds = snap.present_characters.map((n) => db.slugify(n));
+              await p.query(
+                `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
+                [charIds],
+              ).catch(() => {});
+              for (const charName of snap.present_characters) {
+                const charId = db.slugify(charName);
+                await db.upsertCharacter(settings, { name: charName });
+                await p.query(
+                  `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
+                  [charId, locationId],
+                ).catch(() => {});
+              }
+            }
           }
 
           // Plot threads

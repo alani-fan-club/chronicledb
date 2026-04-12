@@ -1,7 +1,11 @@
 // ChronicleDB Mind Map — Cytoscape.js interactive visualization
 // Runs in browser, fetches data from ChronicleDB API
 
-const API_BASE = window.location.origin;
+// Detect if running inside ST plugin or standalone
+const IS_ST_PLUGIN = window.location.pathname.includes("/api/plugins/chronicle-db");
+const API_BASE = IS_ST_PLUGIN
+  ? `${window.location.origin}/api/plugins/chronicle-db`
+  : window.location.origin;
 
 // ── Colors by node type ─────────────────────────────────────────
 const NODE_COLORS = {

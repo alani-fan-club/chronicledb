@@ -28,6 +28,16 @@ const info = {
 async function init(router) {
   console.log("[ChronicleDB] Initializing server plugin...");
 
+  // ── Serve mind map UI ────────────────────────────────────────
+  const { resolve, dirname } = require("path");
+  const { realpathSync } = require("fs");
+  const express = require("express");
+  // Resolve through symlink to find the actual project root
+  const pluginRealDir = realpathSync(__dirname);
+  const mapPath = resolve(pluginRealDir, "..", "src", "ui");
+  console.log("[ChronicleDB] Mind map path:", mapPath);
+  router.use("/map", express.static(mapPath));
+
   // ── Settings endpoint (UI extension saves/loads settings here) ──
 
   router.post("/settings", (req, res) => {
@@ -311,12 +321,20 @@ async function init(router) {
         .map((f) => {
           const stat = statSync(join(dirPath, f));
           const dateMatch = f.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
+          // Count actual message lines (subtract 1 for metadata header)
+          let messageCount;
+          try {
+            const content = require("fs").readFileSync(join(dirPath, f), "utf-8");
+            messageCount = content.split("\n").filter((l) => l.trim()).length - 1;
+          } catch {
+            messageCount = Math.max(1, Math.floor(stat.size / 2000));
+          }
           return {
             filename: f,
             chatId: f.replace(".jsonl", ""),
             date: dateMatch ? dateMatch[1] : "",
             size: stat.size,
-            messageEstimate: Math.max(1, Math.floor(stat.size / 2000)),
+            messageEstimate: Math.max(0, messageCount),
           };
         });
 
@@ -363,7 +381,8 @@ async function init(router) {
       for (let i = 1; i < lines.length; i++) {
         try {
           const msg = JSON.parse(lines[i]);
-          if (msg.mes !== undefined) messages.push(msg);
+          // Skip system messages and empty messages
+          if (msg.mes !== undefined && !msg.is_system) messages.push(msg);
         } catch { /* skip malformed */ }
       }
 
@@ -505,6 +524,18 @@ async function init(router) {
       res.json(data);
     } catch (err) {
       console.error("[ChronicleDB] Graph query error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Characters list (for mind map dropdown) ──────────────────
+
+  router.get("/characters", async (req, res) => {
+    try {
+      const p = db.getPool(settings);
+      const { rows } = await p.query(`SELECT name FROM characters ORDER BY name`);
+      res.json(rows.map((r) => r.name));
+    } catch (err) {
       res.status(500).json({ error: err.message });
     }
   });

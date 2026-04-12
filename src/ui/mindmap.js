@@ -82,20 +82,19 @@ function initCytoscape() {
       {
         selector: "node",
         style: {
-          "background-color": COLORS.tier4,
+          "background-color": COLORS.fact,
           "background-opacity": 0.85,
           width: "data(size)",
           height: "data(size)",
           label: "data(label)",
           "text-valign": "bottom",
           "text-halign": "center",
-          "text-margin-y": 7,
+          "text-margin-y": 4,
           "font-size": "0px",
-          "font-family": "JetBrains Mono, Inter, monospace",
-          "font-weight": "500",
-          color: COLORS.text,
-          "text-transform": "uppercase",
-          "text-outline-width": 3,
+          "font-family": "Inter",
+          "font-weight": "400",
+          color: COLORS.textDim,
+          "text-outline-width": 2,
           "text-outline-color": COLORS.bg,
           "text-outline-opacity": 1,
           "border-width": 0,
@@ -287,7 +286,7 @@ function initCytoscape() {
           "border-width": 2,
           "border-color": COLORS.accent,
           "background-opacity": 1,
-          "font-size": "10px",
+          "font-size": "7px",
         },
       },
       {
@@ -296,7 +295,7 @@ function initCytoscape() {
           "border-width": 1,
           "border-color": COLORS.accent,
           "background-opacity": 1,
-          "font-size": "9px",
+          "font-size": "6px",
         },
       },
       {
@@ -317,7 +316,7 @@ function initCytoscape() {
           "border-width": 2,
           "border-color": COLORS.accent,
           "background-opacity": 1,
-          "font-size": "11px",
+          "font-size": "8px",
         },
       },
     ],
@@ -347,17 +346,21 @@ function initCytoscape() {
   cy.on("zoom", () => {
     const zoom = cy.zoom();
     const s = cy.style();
-    if (zoom > 2.0) {
-      // Far zoom: show all labels
-      s.selector("node").style({ "font-size": "9px" }).update();
-    } else if (zoom > 1.1) {
-      // Medium zoom: characters, arcs, major events only
+    if (zoom > 3.0) {
+      // Deep zoom: show all labels (tiny)
+      s.selector("node").style({ "font-size": "6px" }).update();
+    } else if (zoom > 1.8) {
+      // Medium-close: characters + arcs + major events
       s.selector("node").style({ "font-size": "0px" }).update();
-      s.selector("node[type='character']").style({ "font-size": "10px" }).update();
-      s.selector("node[type='story_arc']").style({ "font-size": "10px" }).update();
-      s.selector("node[type='event'][significance >= 4]").style({ "font-size": "9px" }).update();
+      s.selector("node[type='character']").style({ "font-size": "6px" }).update();
+      s.selector("node[type='story_arc']").style({ "font-size": "7px" }).update();
+      s.selector("node[type='event'][significance >= 4]").style({ "font-size": "5px" }).update();
+    } else if (zoom > 1.0) {
+      // Medium: only arcs and major characters
+      s.selector("node").style({ "font-size": "0px" }).update();
+      s.selector("node[type='story_arc']").style({ "font-size": "6px" }).update();
     } else {
-      // Zoomed out: hide all labels (let topology breathe)
+      // Zoomed out: hide all labels
       s.selector("node").style({ "font-size": "0px" }).update();
     }
   });
@@ -508,7 +511,12 @@ function runLayout() {
         padding: 60,
       };
 
-  cy.layout(layoutConfig).run();
+  const layout = cy.layout(layoutConfig);
+  layout.on("layoutstop", () => {
+    // Force initial label state based on current zoom
+    cy.emit("zoom");
+  });
+  layout.run();
 }
 
 function showLoading(visible) {

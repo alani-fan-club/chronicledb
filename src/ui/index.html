@@ -5,56 +5,128 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ChronicleDB — Mind Map</title>
   <script src="https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <div id="app">
-    <header id="toolbar">
-      <h1>ChronicleDB</h1>
-      <div id="controls">
-        <div class="control-group">
-          <label for="scope-select">View:</label>
-          <select id="scope-select">
-            <option value="global">All RPs (Global)</option>
-          </select>
-        </div>
-        <div class="control-group">
-          <label for="edge-filter">Show:</label>
-          <select id="edge-filter" multiple>
-            <option value="FEELS_ABOUT" selected>Relationships</option>
-            <option value="KNOWS" selected>Knowledge</option>
-            <option value="LOCATED_AT" selected>Locations</option>
-            <option value="PARTICIPATED_IN">Event Links</option>
-            <option value="WITNESSED">Witnesses</option>
-          </select>
-        </div>
-        <div class="control-group">
-          <input type="text" id="search-input" placeholder="Search characters, locations...">
-        </div>
-        <div class="control-group">
-          <button id="btn-fit">Fit</button>
-          <button id="btn-export">Export PNG</button>
-          <button id="btn-layout">Re-layout</button>
-        </div>
+
+    <!-- ── Left sidebar: Character Picker ────────────────── -->
+    <aside id="character-sidebar">
+      <div class="sidebar-header">
+        <span class="sidebar-title">Characters</span>
       </div>
-    </header>
+      <button id="btn-show-all" class="show-all-btn active" title="Show all characters">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="2" y1="12" x2="22" y2="12"/>
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+        </svg>
+        <span>Show All</span>
+      </button>
+      <div id="character-list" class="character-list">
+        <!-- Populated dynamically -->
+      </div>
+    </aside>
 
-    <div id="main">
-      <div id="cy"></div>
+    <!-- ── Center column ─────────────────────────────────── -->
+    <div id="center-column">
 
-      <aside id="detail-panel" class="hidden">
-        <button id="btn-close-panel">&times;</button>
-        <div id="detail-content">
-          <!-- Populated dynamically -->
+      <!-- ── Top bar ───────────────────────────────────── -->
+      <header id="topbar">
+        <div class="topbar-left">
+          <div class="brand">
+            <svg class="brand-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="url(#brand-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <defs>
+                <linearGradient id="brand-grad" x1="0" y1="0" x2="24" y2="24">
+                  <stop offset="0%" stop-color="#7c6af5"/>
+                  <stop offset="100%" stop-color="#58a6ff"/>
+                </linearGradient>
+              </defs>
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M8 12l2 2 4-4"/>
+            </svg>
+            <span class="brand-name">ChronicleDB</span>
+          </div>
         </div>
-      </aside>
-    </div>
 
-    <footer id="timeline-bar">
-      <label for="time-slider">Timeline:</label>
-      <input type="range" id="time-slider" min="0" max="100" value="100">
-      <span id="time-label">All time</span>
-    </footer>
+        <div class="topbar-center">
+          <div class="search-wrapper">
+            <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="8"/>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input type="text" id="search-input" placeholder="Search characters, locations...">
+          </div>
+        </div>
+
+        <div class="topbar-right">
+          <div id="edge-chips" class="edge-chips">
+            <button class="chip active" data-edge="FEELS_ABOUT">
+              <span class="chip-dot" style="background:#e06bff"></span>Relationships
+            </button>
+            <button class="chip active" data-edge="KNOWS">
+              <span class="chip-dot" style="background:#58a6ff"></span>Knowledge
+            </button>
+            <button class="chip active" data-edge="LOCATED_AT">
+              <span class="chip-dot" style="background:#3fb950"></span>Locations
+            </button>
+            <button class="chip" data-edge="PARTICIPATED_IN">
+              <span class="chip-dot" style="background:#f0883e"></span>Events
+            </button>
+            <button class="chip" data-edge="WITNESSED">
+              <span class="chip-dot" style="background:#8b949e"></span>Witnesses
+            </button>
+          </div>
+
+          <div class="topbar-actions">
+            <button id="btn-fit" class="icon-btn" title="Fit to view">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M15 3h6v6"/><path d="M9 21H3v-6"/><path d="M21 3l-7 7"/><path d="M3 21l7-7"/>
+              </svg>
+            </button>
+            <button id="btn-layout" class="icon-btn" title="Re-layout graph">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+              </svg>
+            </button>
+            <button id="btn-export" class="icon-btn" title="Export as PNG">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <!-- ── Cytoscape canvas ──────────────────────────── -->
+      <div id="main">
+        <div id="cy"></div>
+
+        <!-- ── Right detail panel ────────────────────── -->
+        <aside id="detail-panel" class="hidden">
+          <button id="btn-close-panel" title="Close panel">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+          <div id="detail-content">
+            <!-- Populated dynamically -->
+          </div>
+        </aside>
+      </div>
+
+      <!-- ── Bottom timeline ───────────────────────────── -->
+      <footer id="timeline-bar">
+        <svg class="timeline-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+        </svg>
+        <input type="range" id="time-slider" min="0" max="100" value="100">
+        <span id="time-label">All time</span>
+      </footer>
+    </div>
   </div>
 
   <script src="mindmap.js"></script>

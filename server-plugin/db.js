@@ -420,18 +420,37 @@ async function getGraphData(settings, { scope, character }) {
     nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
   }
 
+  // Events with participants
+  const { rows: evts } = await p.query(`SELECT * FROM events ORDER BY timestamp DESC LIMIT 200`);
+  for (const e of evts) {
+    nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
+  }
+
+  // Relationships — use from_char/to_char directly (already slugified IDs matching node.id)
   const { rows: rels } = await p.query(
-    `SELECT c1.name as source, c2.name as target, fa.sentiment, fa.intensity, fa.description
-     FROM feels_about fa
-     JOIN characters c1 ON fa.from_char = c1.id
-     JOIN characters c2 ON fa.to_char = c2.id`,
+    `SELECT fa.from_char, fa.to_char, fa.sentiment, fa.intensity, fa.description
+     FROM feels_about fa`,
   );
   for (const r of rels) {
     edges.push({
-      id: `${r.source}-${r.target}`,
-      source: slugify(r.source), target: slugify(r.target),
+      id: `fa-${r.from_char}-${r.to_char}`,
+      source: r.from_char, target: r.to_char,
       type: "FEELS_ABOUT", label: r.description,
-      sentiment: r.sentiment, intensity: r.intensity,
+      sentiment: parseFloat(r.sentiment) || 0,
+      intensity: parseFloat(r.intensity) || 0.5,
+    });
+  }
+
+  // Participation edges (character → event)
+  const { rows: parts } = await p.query(
+    `SELECT character_id, event_id, role FROM participated_in`,
+  );
+  for (const pi of parts) {
+    edges.push({
+      id: `pi-${pi.character_id}-${pi.event_id}`,
+      source: pi.character_id, target: pi.event_id,
+      type: "PARTICIPATED_IN", label: pi.role || "participated",
+      sentiment: 0, intensity: 0.5,
     });
   }
 

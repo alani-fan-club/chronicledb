@@ -7,6 +7,107 @@
 const db = require("./db");
 const { embed } = require("./extractor");
 
+// HyDE query rewriting and Gemini cross-encoder reranking live in the eval
+// client only — keeping ST-facing retrieval latency low matters more than the
+// extra recall here.
+
+const LEXICAL_STOP = new Set([
+  "the", "and", "but", "for", "with", "this", "that", "these", "those",
+  "what", "who", "when", "where", "why", "how", "which", "whose",
+  "does", "did", "is", "are", "was", "were", "be", "been", "being",
+  "him", "her", "his", "she", "they", "them", "their", "you", "your",
+  "from", "into", "about", "over", "after", "before", "between",
+  "say", "said", "says", "saying", "tell", "told", "telling",
+  "one", "two", "three", "some", "any", "all", "more", "most",
+]);
+
+function buildOrTsquery(query) {
+  if (!query) return null;
+  const terms = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length > 2 && !LEXICAL_STOP.has(t));
+  if (terms.length === 0) return null;
+  return [...new Set(terms)].join(" | ");
+}
+
+async function eventLexicalSearch(settings, chatIds, query, limit) {
+  if (!chatIds || chatIds.length === 0) return [];
+  const tsquery = buildOrTsquery(query);
+  if (!tsquery) return [];
+  const p = db.getPool(settings);
+  const { rows } = await p.query(
+    `SELECT e.id, e.source_text, e.message_index, e.timestamp,
+            ts_rank(to_tsvector('english', e.source_text), to_tsquery('english', $1)) as rank
+     FROM events e
+     WHERE e.chat_id = ANY($2::text[])
+       AND e.source_text IS NOT NULL
+       AND to_tsvector('english', e.source_text) @@ to_tsquery('english', $1)
+     ORDER BY rank DESC
+     LIMIT $3`,
+    [tsquery, chatIds, limit || 8],
+  );
+  return rows;
+}
+
+async function getMaxMessageIndex(settings, chatIds) {
+  if (!chatIds || chatIds.length === 0) return 0;
+  const p = db.getPool(settings);
+  const { rows } = await p.query(
+    `SELECT GREATEST(
+       COALESCE((SELECT max(message_index) FROM memory_embeddings WHERE chat_id = ANY($1::text[])), 0),
+       COALESCE((SELECT max(message_index) FROM events WHERE chat_id = ANY($1::text[])), 0)
+     ) AS m`,
+    [chatIds],
+  );
+  return Number(rows[0]?.m || 0);
+}
+
+async function dialogueQuoteSearch(settings, chatIds, query, limit) {
+  if (!chatIds || chatIds.length === 0) return [];
+  const tsquery = buildOrTsquery(query);
+  if (!tsquery) return [];
+  const p = db.getPool(settings);
+  const k = 60;
+  const fetchSize = (limit || 8) * 3;
+  const [tsRes, trgmRes] = await Promise.all([
+    p.query(
+      `SELECT id, speaker, quote, message_index,
+              ts_rank(to_tsvector('english', quote), to_tsquery('english', $1)) as rank
+       FROM dialogue_quotes
+       WHERE chat_id = ANY($2::text[])
+         AND to_tsvector('english', quote) @@ to_tsquery('english', $1)
+       ORDER BY rank DESC
+       LIMIT $3`,
+      [tsquery, chatIds, fetchSize],
+    ),
+    p.query(
+      `SELECT id, speaker, quote, message_index,
+              similarity(quote, $1) as rank
+       FROM dialogue_quotes
+       WHERE chat_id = ANY($2::text[])
+         AND quote % $1
+       ORDER BY rank DESC
+       LIMIT $3`,
+      [query, chatIds, fetchSize],
+    ),
+  ]);
+  const scores = new Map();
+  tsRes.rows.forEach((r, i) => {
+    scores.set(r.id, { score: 1 / (k + i + 1), item: r });
+  });
+  trgmRes.rows.forEach((r, i) => {
+    const s = 1 / (k + i + 1);
+    if (scores.has(r.id)) scores.get(r.id).score += s;
+    else scores.set(r.id, { score: s, item: r });
+  });
+  return [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit || 8)
+    .map((x) => x.item);
+}
+
 async function retrieve(settings, { chatId, activeCharacters, recentText, sessionMode, sessionId, selectedChats }) {
   // Compute the chat-id scope once and thread it through every helper.
   // - explicit selectedChats wins (per-character preference from the chat picker UI)
@@ -19,7 +120,7 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
   const chatScope = chatIds; // vector search uses the same scope
 
   // Run all queries in parallel
-  const [relationships, events, knowledge, worldState, vectorResults, locations, snapshots, plotThreads] = await Promise.all([
+  const [relationships, events, knowledge, worldState, vectorResults, locations, snapshots, plotThreads, eventHits, dialogueHits, maxMsgIdx] = await Promise.all([
     db.getRelationships(settings, activeCharacters, chatIds),
     db.getRecentEvents(settings, chatId, 5, chatIds),
     db.getKnowledgeBoundaries(settings, activeCharacters, chatIds),
@@ -28,7 +129,34 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     getLocations(settings, activeCharacters),
     db.getRecentSnapshots(settings, chatId, 2),
     db.getActivePlotThreads(settings, chatId),
+    recentText ? eventLexicalSearch(settings, chatScope, recentText, 6) : [],
+    recentText ? dialogueQuoteSearch(settings, chatScope, recentText, 6) : [],
+    getMaxMessageIndex(settings, chatScope),
   ]);
+
+  if (vectorResults && vectorResults.length > 0) {
+    for (const v of vectorResults) {
+      if (v.headline) v.raw_text = v.headline;
+    }
+  }
+
+  // Recency reorder: newer events and dialogue quotes surface first when rank ties.
+  // Same RECENCY_ALPHA as eval cdb-client so behavior is consistent across callers.
+  const RECENCY_ALPHA = 0.008;
+  const applyRecency = (rows) => {
+    if (!rows || rows.length === 0 || maxMsgIdx <= 0) return rows;
+    return rows
+      .map((r) => {
+        const recency = typeof r.message_index === "number"
+          ? RECENCY_ALPHA * (r.message_index / maxMsgIdx)
+          : 0;
+        const base = typeof r.rank === "number" ? r.rank : 0;
+        return { ...r, _recency_score: base + recency };
+      })
+      .sort((a, b) => b._recency_score - a._recency_score);
+  };
+  const rescoredEventHits = applyRecency(eventHits);
+  const rescoredDialogueHits = applyRecency(dialogueHits);
 
   return {
     relationships,
@@ -39,15 +167,22 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     locations,
     snapshots,
     plotThreads,
+    eventHits: rescoredEventHits,
+    dialogueHits: rescoredDialogueHits,
   };
 }
 
 async function semanticSearchScoped(settings, text, chatIds) {
+  // Hybrid retrieval: vector search for semantic similarity + lexical
+  // full-text search for exact phrases/quotes, fused via RRF.
+  // We still need the embedding (for vector) AND the raw query (for lexical).
   const embedding = await embed(settings, text);
-  if (chatIds && chatIds.length > 0) {
-    return db.vectorSearchScoped(settings, { embedding, chatIds, limit: 5 });
-  }
-  return db.vectorSearch(settings, { embedding, limit: 5 });
+  return db.hybridSearch(settings, {
+    embedding,
+    query: text,
+    chatIds: (chatIds && chatIds.length > 0) ? chatIds : null,
+    limit: 8,
+  });
 }
 
 async function getLocations(settings, characters) {
@@ -85,9 +220,15 @@ function formatMemoryBlock(result, maxTokens = 1500) {
   }
 
   if (result.events && result.events.length > 0) {
-    const lines = result.events.map((e, i) =>
-      `${i + 1}. ${e.summary} (significance: ${e.significance || "?"})`
-    ).join("\n");
+    const lines = result.events.map((e, i) => {
+      let line = `${i + 1}. [sig ${e.significance || "?"}/5] ${e.summary}`;
+      if (e.source_text && e.source_text.trim().length > 0) {
+        // Trim and indent the quote
+        const quote = e.source_text.replace(/\s+/g, " ").slice(0, 200).trim();
+        line += `\n   > "${quote}"`;
+      }
+      return line;
+    }).join("\n");
     sections.push(`## Recent Events\n${lines}`);
   }
 
@@ -112,9 +253,39 @@ function formatMemoryBlock(result, maxTokens = 1500) {
 
   if (result.vectorResults && result.vectorResults.length > 0) {
     const lines = result.vectorResults
-      .map((v) => `- (${(v.similarity * 100).toFixed(0)}%) ${v.content.slice(0, 200)}`)
+      .slice(0, 3)
+      .map((v) => {
+        const text = v.raw_text || v.content || "";
+        const prefix = typeof v.similarity === "number"
+          ? `(${(v.similarity * 100).toFixed(0)}%) `
+          : "";
+        const ctx = v.context_prefix ? `${v.context_prefix}\n\n` : "";
+        return `- ${prefix}${ctx}${text.slice(0, 2500)}`;
+      })
       .join("\n");
     sections.push(`## Relevant Past Context\n${lines}`);
+  }
+
+  if (result.eventHits && result.eventHits.length > 0) {
+    const lines = result.eventHits
+      .slice(0, 4)
+      .map((e) => {
+        const turn = typeof e.message_index === "number" ? `[turn ${e.message_index}] ` : "";
+        return `- ${turn}${(e.source_text || "").replace(/\s+/g, " ").slice(0, 2500)}`;
+      })
+      .join("\n");
+    sections.push(`## Matched Event Passages\n${lines}`);
+  }
+
+  if (result.dialogueHits && result.dialogueHits.length > 0) {
+    const lines = result.dialogueHits
+      .slice(0, 4)
+      .map((d) => {
+        const turn = typeof d.message_index === "number" ? `[turn ${d.message_index}] ` : "";
+        return `- ${turn}${d.speaker}: "${(d.quote || "").slice(0, 600)}"`;
+      })
+      .join("\n");
+    sections.push(`## Matched Dialogue Quotes\n${lines}`);
   }
 
   // Context snapshots (recent scene state)

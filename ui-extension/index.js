@@ -274,6 +274,52 @@ function bindSettings(settings) {
   $("#chronicle_openMindMap").on("click", () => {
     window.open("/api/plugins/chronicle-db/map", "_blank");
   });
+
+  // Lorebook ingestion
+  loadLorebookList();
+
+  $("#chronicle_ingestLorebook").on("click", async () => {
+    const filename = $("#chronicle_lorebookSelect").val();
+    if (!filename) {
+      toastr.warning("Select a lorebook first.");
+      return;
+    }
+
+    const status = $("#chronicle_lorebookStatus");
+    status.text("Ingesting... this may take a moment.");
+
+    try {
+      const res = await fetch(`${PLUGIN_BASE}/lorebooks/ingest`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        status.text(`Done: ${data.ingested} entries ingested, ${data.skipped} skipped (of ${data.total} total).`);
+        toastr.success(`Ingested ${data.ingested} entries from ${data.lorebook}.`);
+      } else {
+        status.text(`Error: ${data.error}`);
+        toastr.error(`Ingestion failed: ${data.error}`);
+      }
+    } catch (err) {
+      status.text(`Error: ${err.message}`);
+      toastr.error(`Ingestion error: ${err.message}`);
+    }
+  });
+}
+
+async function loadLorebookList() {
+  try {
+    const res = await fetch(`${PLUGIN_BASE}/lorebooks`);
+    const books = await res.json();
+    const select = $("#chronicle_lorebookSelect");
+    for (const book of books) {
+      select.append(`<option value="${book.filename}">${book.name}</option>`);
+    }
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to load lorebook list:", err);
+  }
 }
 
 function saveAndSync(settings) {

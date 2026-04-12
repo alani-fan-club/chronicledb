@@ -8,6 +8,7 @@
 const db = require("./db");
 const { extract, embed } = require("./extractor");
 const { retrieve, formatMemoryBlock } = require("./retriever");
+const { ingestLorebook, listLorebooks } = require("./lorebook");
 
 let settings = {};
 
@@ -246,6 +247,28 @@ async function init(router) {
 
       res.json(chatFiles);
     } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ── Lorebook ingestion ───────────────────────────────────────
+
+  router.get("/lorebooks", async (_req, res) => {
+    try {
+      const books = listLorebooks(settings);
+      res.json(books);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post("/lorebooks/ingest", async (req, res) => {
+    try {
+      const { filename } = req.body;
+      const result = await ingestLorebook(settings, filename, embed);
+      res.json(result);
+    } catch (err) {
+      console.error("[ChronicleDB] Lorebook ingest error:", err);
       res.status(500).json({ error: err.message });
     }
   });

@@ -144,6 +144,23 @@
 
       <hr>
 
+      <!-- Lorebook ingestion -->
+      <h4>Lorebook Ingestion</h4>
+      <p class="chronicle-hint">Import lorebook/World Info entries into the memory graph as Fact, Character, and Location nodes.</p>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting" style="flex: 2;">
+          <select id="chronicle_lorebookSelect" class="text_pole">
+            <option value="">-- Select lorebook --</option>
+          </select>
+        </div>
+        <div class="chronicle-setting">
+          <input type="button" id="chronicle_ingestLorebook" class="menu_button" value="Ingest">
+        </div>
+      </div>
+      <div id="chronicle_lorebookStatus" class="chronicle-hint"></div>
+
+      <hr>
+
       <!-- Actions -->
       <div class="chronicle-setting">
         <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open Mind Map">

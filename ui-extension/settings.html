@@ -62,7 +62,7 @@
 
       <!-- Extraction LLM -->
       <h4>Extraction LLM</h4>
-      <p class="chronicle-hint">The model that reads RP messages and extracts memories. Any OpenAI-compatible or Gemini endpoint.</p>
+      <p class="chronicle-hint">Reads RP messages and extracts structured memories (characters, events, relationships, plot threads). Any OpenAI-compatible or Gemini endpoint.</p>
       <div class="chronicle-setting">
         <label for="chronicle_extractionApiUrl">API URL:</label>
         <input type="text" id="chronicle_extractionApiUrl" class="text_pole" placeholder="https://generativelanguage.googleapis.com/v1beta">
@@ -85,36 +85,28 @@
         </select>
       </div>
 
+      <!-- Context / situating blurb LLM -->
+      <h4>Context LLM</h4>
+      <p class="chronicle-hint">Cheap model that writes a 1-2 sentence "situating blurb" for each ingested message — who, where, what's happening — prepended to the text before embedding so search hits carry scene context. Shares the Extraction API URL, key and type. Leave blank to reuse the extraction model.</p>
+      <div class="chronicle-setting">
+        <label for="chronicle_contextModel">Model:</label>
+        <input type="text" id="chronicle_contextModel" class="text_pole" placeholder="gemini-2.5-flash-lite">
+      </div>
+
       <!-- Embedding model -->
       <h4>Embedding Model</h4>
-      <p class="chronicle-hint">Generates vector embeddings for semantic search. Can be a different provider than extraction.</p>
-      <div class="chronicle-setting">
-        <label for="chronicle_embeddingApiUrl">API URL:</label>
-        <input type="text" id="chronicle_embeddingApiUrl" class="text_pole" placeholder="https://generativelanguage.googleapis.com/v1beta">
-      </div>
+      <p class="chronicle-hint">Generates vector embeddings for semantic search. Currently Gemini-only (server plugin calls the Gemini embed endpoint directly).</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_embeddingApiKey">API Key:</label>
-          <input type="password" id="chronicle_embeddingApiKey" class="text_pole" placeholder="">
+          <label for="chronicle_geminiEmbeddingModel">Model:</label>
+          <input type="text" id="chronicle_geminiEmbeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview">
         </div>
         <div class="chronicle-setting">
-          <label for="chronicle_embeddingModel">Model:</label>
-          <input type="text" id="chronicle_embeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview">
+          <label for="chronicle_geminiEmbeddingDimension">Dimension:</label>
+          <input type="number" id="chronicle_geminiEmbeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
         </div>
       </div>
-      <div class="chronicle-setting-row">
-        <div class="chronicle-setting">
-          <label for="chronicle_embeddingApiType">API Type:</label>
-          <select id="chronicle_embeddingApiType" class="text_pole">
-            <option value="gemini">Gemini</option>
-            <option value="openai">OpenAI-compatible</option>
-          </select>
-        </div>
-        <div class="chronicle-setting">
-          <label for="chronicle_embeddingDimension">Dimension:</label>
-          <input type="number" id="chronicle_embeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
-        </div>
-      </div>
+      <p class="chronicle-hint">The embedder reuses the Extraction API key (or the legacy Gemini API key if set). 768 matches the current <code>memory_embeddings.embedding</code> column width — changing dimension requires a schema migration.</p>
 
       <hr>
 
@@ -122,17 +114,19 @@
       <h4>Behavior</h4>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_extractEveryN">Extract every N messages:</label>
+          <label for="chronicle_extractEveryN" title="Run the extraction LLM after every Nth AI response. Higher = cheaper but memories take longer to land.">Extract every N messages:</label>
           <input type="number" id="chronicle_extractEveryN" class="text_pole" min="1" max="20" placeholder="1">
         </div>
         <div class="chronicle-setting">
-          <label for="chronicle_maxInjectionTokens">Max injection tokens:</label>
-          <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="4000" placeholder="1500">
+          <label for="chronicle_maxInjectionTokens" title="Rough character budget (/4 ≈ tokens) for the injected ChronicleDB memory block.">Memory budget (tokens):</label>
+          <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="8000" placeholder="3000">
         </div>
       </div>
+      <p class="chronicle-hint">Retrieval is hybrid: vector similarity + full-text matched events + matched dialogue quotes + recent snapshots + plot threads, all scored together and truncated to the budget above.</p>
 
       <!-- Memory type toggles -->
       <h4>Memory Types</h4>
+      <p class="chronicle-hint">Which categories the memory block surfaces. Extraction still writes all types — these toggles only affect retrieval display.</p>
       <div class="chronicle-setting">
         <label class="checkbox_label" for="chronicle_enableRelationships">
           <input type="checkbox" id="chronicle_enableRelationships">

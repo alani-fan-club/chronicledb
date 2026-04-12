@@ -29,20 +29,19 @@ const DEFAULT_SETTINGS = {
   pgUser: "samantha",
   pgPassword: "",
   stDataRoot: "/Users/REDACTED/SillyTavern-Launcher/SillyTavern/data/default-user",
-  extractionModel: "gemini-2.5-flash-lite",
-  geminiApiKey: "",
-  geminiEmbeddingModel: "gemini-embedding-2-preview",
-  geminiEmbeddingDimension: 768,
   extractionApiUrl: "https://generativelanguage.googleapis.com/v1beta",
   extractionApiKey: "",
   extractionApiType: "gemini",
-  embeddingApiUrl: "https://generativelanguage.googleapis.com/v1beta",
-  embeddingApiKey: "",
-  embeddingApiType: "gemini",
-  embeddingModel: "gemini-embedding-2-preview",
-  embeddingDimension: 768,
-  extractEveryN: 1,          // extract after every N messages
-  maxInjectionTokens: 1500,
+  extractionModel: "gemini-2.5-flash-lite",
+  // Used for contextual-retrieval situating blurbs at ingest time.
+  // Separate from extractionModel so users can route blurbs to an even cheaper
+  // model if they want; falls back to extractionModel if left blank.
+  contextModel: "gemini-2.5-flash-lite",
+  geminiApiKey: "",
+  geminiEmbeddingModel: "gemini-embedding-2-preview",
+  geminiEmbeddingDimension: 768,
+  extractEveryN: 1,
+  maxInjectionTokens: 3000,
   enableRelationships: true,
   enableEvents: true,
   enableKnowledge: true,
@@ -229,17 +228,16 @@ function bindSettings(settings) {
     });
   }
 
-  // LLM settings
+  // LLM text fields. Note: these keys must match what server-plugin/extractor.js
+  // actually reads — adding a key here that the server doesn't read creates
+  // dead UI; removing a key the server does read breaks config.
   for (const field of [
-    "ollamaEndpoint",
-    "extractionModel",
-    "geminiApiKey",
-    "geminiEmbeddingModel",
     "extractionApiUrl",
     "extractionApiKey",
-    "embeddingApiUrl",
-    "embeddingApiKey",
-    "embeddingModel",
+    "extractionModel",
+    "contextModel",
+    "geminiApiKey",
+    "geminiEmbeddingModel",
   ]) {
     $(`#chronicle_${field}`).val(settings[field]).on("input", function () {
       settings[field] = $(this).val();
@@ -247,23 +245,15 @@ function bindSettings(settings) {
     });
   }
 
-  // Provider type selects
-  for (const field of ["extractionApiType", "embeddingApiType"]) {
-    $(`#chronicle_${field}`).val(settings[field]).on("change", function () {
-      settings[field] = $(this).val();
-      saveAndSync(settings);
-    });
-  }
-
-  // Gemini dimension (numeric, legacy field)
-  $("#chronicle_geminiEmbeddingDimension").val(settings.geminiEmbeddingDimension).on("input", function () {
-    settings.geminiEmbeddingDimension = parseInt($(this).val()) || 768;
+  // Provider type select
+  $("#chronicle_extractionApiType").val(settings.extractionApiType).on("change", function () {
+    settings.extractionApiType = $(this).val();
     saveAndSync(settings);
   });
 
   // Embedding dimension (numeric)
-  $("#chronicle_embeddingDimension").val(settings.embeddingDimension).on("input", function () {
-    settings.embeddingDimension = parseInt($(this).val()) || 768;
+  $("#chronicle_geminiEmbeddingDimension").val(settings.geminiEmbeddingDimension).on("input", function () {
+    settings.geminiEmbeddingDimension = parseInt($(this).val()) || 768;
     saveAndSync(settings);
   });
 
@@ -274,7 +264,7 @@ function bindSettings(settings) {
   });
 
   $("#chronicle_maxInjectionTokens").val(settings.maxInjectionTokens).on("input", function () {
-    settings.maxInjectionTokens = parseInt($(this).val()) || 1500;
+    settings.maxInjectionTokens = parseInt($(this).val()) || 3000;
     saveAndSync(settings);
   });
 

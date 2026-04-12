@@ -441,9 +441,50 @@ async function init(router) {
             await db.upsertRelationship(settings, { from: rel.from, to: rel.to, sentiment: parseFloat(rel.sentiment) || 0, intensity: parseFloat(rel.intensity) || 0.5, description: rel.description || "", sessionId: chatId });
           }
 
-          // Events
+          // Events — track event_key → event_id mapping for arcs/chains
+          const eventKeyToId = new Map();
           for (const event of (extraction.events || [])) {
-            await db.insertEvent(settings, { summary: event.summary, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
+            const eventId = await db.insertEvent(settings, { summary: event.summary, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
+            if (event.event_key) eventKeyToId.set(event.event_key, eventId);
+          }
+
+          // Event chains (causal links between events)
+          for (const chain of (extraction.event_chains || [])) {
+            const fromId = eventKeyToId.get(chain.from);
+            const toId = eventKeyToId.get(chain.to);
+            if (fromId && toId) {
+              await db.createEventChain(settings, {
+                fromEventId: fromId,
+                toEventId: toId,
+                chainType: chain.chain_type || "caused",
+                description: chain.description || "",
+              });
+            }
+          }
+
+          // Story arcs — group events into narrative arcs
+          for (const arc of (extraction.story_arcs || [])) {
+            const spineId = arc.spine_event_key ? eventKeyToId.get(arc.spine_event_key) : null;
+            const arcId = await db.upsertStoryArc(settings, {
+              chatId,
+              title: arc.title,
+              description: arc.description || "",
+              arcType: arc.arc_type || "main",
+              status: arc.status || "active",
+              importance: arc.importance || 3,
+              startMsgIdx: i,
+              endMsgIdx: i + batch.length,
+              spineEventId: spineId,
+            });
+            // Link all events in this arc
+            let pos = 0;
+            for (const key of (arc.event_keys || [])) {
+              const eventId = eventKeyToId.get(key);
+              if (eventId) {
+                const isAnchor = eventId === spineId;
+                await db.linkEventToArc(settings, { arcId, eventId, position: pos++, isAnchor });
+              }
+            }
           }
 
           // World state

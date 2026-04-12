@@ -18,14 +18,17 @@ const COLORS = {
   location: "#6b8e7a",      // muted sage
   item: "#b08968",          // warm tan
   event: "#d4a574",         // warm amber
+  eventMajor: "#f0883e",    // brighter amber for anchor events
   fact: "#555",             // dim grey
   scene: "#444",
   plot_thread: "#c77d5c",   // dusty orange
+  story_arc: "#E8503A",     // coral for arcs (the star)
   positive: "#4ade80",
   negative: "#ef4444",
   neutral: "#94a3b8",
   edge: "#3a3a3a",
   edgeBright: "#555",
+  edgeCausal: "#E8503A",    // coral for causal chains
   text: "#f0f0f0",
   textDim: "#666",
 };
@@ -99,7 +102,28 @@ function initCytoscape() {
       },
       {
         selector: "node[type='event']",
-        style: { "background-color": COLORS.event },
+        style: {
+          "background-color": COLORS.event,
+          shape: "round-rectangle",
+        },
+      },
+      {
+        selector: "node[type='event'][significance >= 4]",
+        style: {
+          "background-color": COLORS.eventMajor,
+          "border-width": 2,
+          "border-color": COLORS.accent,
+        },
+      },
+      {
+        selector: "node[type='story_arc']",
+        style: {
+          "background-color": COLORS.story_arc,
+          shape: "round-rectangle",
+          "font-weight": "bold",
+          "border-width": 2,
+          "border-color": COLORS.accentHover,
+        },
       },
       {
         selector: "node[type='fact']",
@@ -123,6 +147,38 @@ function initCytoscape() {
           opacity: 0.6,
           "transition-property": "opacity, line-color, width",
           "transition-duration": "0.2s",
+        },
+      },
+      // CAUSED edges — directional coral arrows for causal chains
+      {
+        selector: "edge[type='CAUSED']",
+        style: {
+          "line-color": COLORS.edgeCausal,
+          "target-arrow-color": COLORS.edgeCausal,
+          "target-arrow-shape": "triangle",
+          "arrow-scale": 1.2,
+          width: 2,
+          opacity: 0.8,
+          "curve-style": "bezier",
+        },
+      },
+      // CONTAINS_EVENT — arc → event (dashed)
+      {
+        selector: "edge[type='CONTAINS_EVENT']",
+        style: {
+          "line-color": COLORS.accent,
+          opacity: 0.4,
+          width: 1,
+          "line-style": "dashed",
+        },
+      },
+      {
+        selector: "edge[type='CONTAINS_EVENT'][?isAnchor]",
+        style: {
+          "line-color": COLORS.accentHover,
+          opacity: 0.9,
+          width: 2.5,
+          "line-style": "solid",
         },
       },
       // FEELS_ABOUT edges colored by sentiment
@@ -262,13 +318,34 @@ function renderGraph(data) {
   const elements = [];
   for (const node of data.nodes) {
     const degree = connectionCount.get(node.id) || 0;
-    // Base size 8, scale up with log of connections (caps at ~40)
-    const size = Math.min(40, 8 + Math.log(degree + 1) * 8);
     const isCharacter = node.type === "character";
+    const isEvent = node.type === "event";
+    const isArc = node.type === "story_arc";
+    const significance = node.metadata?.significance || node.metadata?.importance || 3;
 
-    // Keep full label in data for detail panel, but show short label on canvas
+    // Size calculation varies by node type:
+    // - Characters: log(connections)
+    // - Events: scale by significance (1-5 → 10-35)
+    // - Story arcs: scale by importance + anchored events (20-60)
+    // - Everything else: small dots
+    let size;
+    if (isArc) {
+      size = Math.min(60, 25 + (significance - 3) * 8 + Math.log(degree + 1) * 4);
+    } else if (isEvent) {
+      size = Math.min(36, 10 + significance * 5);
+    } else if (isCharacter) {
+      size = Math.min(48, 12 + Math.log(degree + 1) * 8);
+    } else {
+      size = Math.min(30, 8 + Math.log(degree + 1) * 6);
+    }
+
+    // Labels: characters and story arcs always visible; events visible for significance >= 4
     const fullLabel = node.label || "";
-    const canvasLabel = isCharacter ? fullLabel : ""; // only characters show labels on canvas
+    let canvasLabel = "";
+    if (isCharacter) canvasLabel = fullLabel;
+    else if (isArc) canvasLabel = fullLabel;
+    else if (isEvent && significance >= 4) canvasLabel = (fullLabel || "").slice(0, 30);
+
     elements.push({
       group: "nodes",
       data: {
@@ -278,6 +355,7 @@ function renderGraph(data) {
         type: node.type,
         size,
         degree,
+        significance,
         isPC: node.metadata?.is_player_character ?? false,
         avatarUrl: isCharacter && fullLabel
           ? `${API_BASE}/character-image/${encodeURIComponent(fullLabel)}.png`

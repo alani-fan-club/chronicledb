@@ -10,11 +10,18 @@ Each message has a speaker and content. Some are from the user (player), others 
 Extract:
 1. **Characters** — named characters present or mentioned
 2. **Relationships** — how characters feel about each other (sentiment -1.0 to 1.0, intensity 0-1, evidence)
-3. **Events** — significant things that happened (significance 1-5)
-4. **World state** — environmental/setting changes (key-value)
-5. **Knowledge updates** — what each character learned AND what they explicitly do not know
-6. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
-7. **Plot threads** — any foreshadowing, pending events, unresolved tensions, promises, threats, or open questions. Mark if a prior thread got resolved.
+3. **Events** — things that happened, with significance:
+   - 5 = defining moment (major plot beat, character revelation, death, transformation)
+   - 4 = important development (confrontation, decision, significant reveal)
+   - 3 = meaningful action (argument, bonding moment, notable action)
+   - 2 = minor beat (small gesture, casual dialogue with impact)
+   - 1 = flavor detail (background action, mundane interaction)
+4. **Event chains** — when one event directly causes, triggers, or leads to another. Think causally: "X caused Y", "Because of A, B happened". Only chain events that have a clear causal link.
+5. **Story arcs** — identify narrative arcs like in manga/anime. An arc is a set of connected events that form a coherent story beat. Examples: "The Betrayal Arc", "First Meeting Arc", "Confession Arc", "Training Arc". Each arc has a defining "spine" event (the most important one) and flavor events around it.
+6. **World state** — environmental/setting changes (key-value)
+7. **Knowledge updates** — what each character learned AND what they explicitly do not know
+8. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
+9. **Plot threads** — foreshadowing, pending events, unresolved tensions, promises, threats. Mark if a prior thread got resolved.
 
 RULES:
 - Only attribute knowledge to characters who were PRESENT and could perceive it
@@ -26,7 +33,17 @@ Return ONLY valid JSON:
 {
   "characters": [{ "name": "", "new_facts": [], "role": "protagonist/antagonist/ally/npc/mentor/etc", "status": "active/injured/missing/dead/etc", "significance": 3 }],
   "relationships": [{ "from": "", "to": "", "sentiment": -1.0, "intensity": 0.5, "description": "Rich 2-3 sentence description of the relationship dynamics, emotional undercurrents, and recent developments" }],
-  "events": [{ "summary": "", "participants": [], "location": "", "significance": 3 }],
+  "events": [{ "event_key": "unique_short_key_like_first_meeting", "summary": "", "participants": [], "location": "", "significance": 3 }],
+  "event_chains": [{ "from": "event_key", "to": "event_key", "chain_type": "caused | triggered | led_to | followed_by", "description": "" }],
+  "story_arcs": [{
+    "title": "",
+    "description": "",
+    "arc_type": "main | subplot | character_arc | world_arc",
+    "status": "active | resolved | ongoing",
+    "importance": 3,
+    "spine_event_key": "the defining event_key",
+    "event_keys": ["list", "of", "event_keys", "in", "this", "arc"]
+  }],
   "world_state": [{ "key": "", "value": "", "reason": "" }],
   "knowledge_updates": [
     { "character": "", "learned": "", "source": "" },

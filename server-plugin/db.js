@@ -149,6 +149,50 @@ async function upsertWorldState(settings, { key, value, reason }) {
   );
 }
 
+// ── Story arcs and event chains ────────────────────────────────
+
+async function upsertStoryArc(settings, { chatId, title, description, arcType, status, importance, startMsgIdx, endMsgIdx, spineEventId }) {
+  const p = getPool(settings);
+  const { rows: existing } = await p.query(
+    `SELECT id FROM story_arcs WHERE chat_id = $1 AND title = $2`,
+    [chatId, title],
+  );
+  let arcId;
+  if (existing.length > 0) {
+    arcId = existing[0].id;
+    await p.query(
+      `UPDATE story_arcs SET description = $2, arc_type = $3, status = $4, importance = $5, end_msg_idx = $6, spine_event_id = COALESCE($7, spine_event_id), updated_at = NOW() WHERE id = $1`,
+      [arcId, description || "", arcType || "main", status || "active", importance || 3, endMsgIdx, spineEventId],
+    );
+  } else {
+    arcId = `arc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    await p.query(
+      `INSERT INTO story_arcs (id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [arcId, chatId, title, description || "", arcType || "main", status || "active", importance || 3, startMsgIdx, endMsgIdx, spineEventId],
+    );
+  }
+  return arcId;
+}
+
+async function linkEventToArc(settings, { arcId, eventId, position, isAnchor }) {
+  const p = getPool(settings);
+  await p.query(
+    `INSERT INTO arc_events (arc_id, event_id, position, is_anchor) VALUES ($1, $2, $3, $4)
+     ON CONFLICT DO NOTHING`,
+    [arcId, eventId, position || 0, isAnchor || false],
+  ).catch(() => {});
+}
+
+async function createEventChain(settings, { fromEventId, toEventId, chainType, description }) {
+  const p = getPool(settings);
+  await p.query(
+    `INSERT INTO event_chains (from_event_id, to_event_id, chain_type, description) VALUES ($1, $2, $3, $4)
+     ON CONFLICT DO NOTHING`,
+    [fromEventId, toEventId, chainType || "caused", description || ""],
+  ).catch(() => {});
+}
+
 // ── Context snapshots ──────────────────────────────────────────
 
 async function insertContextSnapshot(settings, { chatId, messageIndex, summary, locationName, presentChars, emotionalTone, worldStateSnapshot }) {
@@ -558,6 +602,39 @@ async function getGraphData(settings, { scope, character }) {
     });
   }
 
+  // Story arcs: linked to their member events
+  const { rows: arcEvents } = await p.query(
+    `SELECT ae.arc_id, ae.event_id, ae.is_anchor FROM arc_events ae`,
+  );
+  for (const ae of arcEvents) {
+    connectedIds.add(ae.arc_id);
+    connectedIds.add(ae.event_id);
+    edges.push({
+      id: `ae-${ae.arc_id}-${ae.event_id}`,
+      source: ae.arc_id, target: ae.event_id,
+      type: "CONTAINS_EVENT",
+      label: ae.is_anchor ? "anchor event" : "contains",
+      sentiment: 0, intensity: ae.is_anchor ? 0.9 : 0.5,
+      isAnchor: ae.is_anchor,
+    });
+  }
+
+  // Event chains: causal links between events
+  const { rows: chains } = await p.query(
+    `SELECT from_event_id, to_event_id, chain_type, description FROM event_chains`,
+  );
+  for (const c of chains) {
+    connectedIds.add(c.from_event_id);
+    connectedIds.add(c.to_event_id);
+    edges.push({
+      id: `ch-${c.from_event_id}-${c.to_event_id}`,
+      source: c.from_event_id, target: c.to_event_id,
+      type: "CAUSED", label: c.chain_type || "caused",
+      description: c.description,
+      sentiment: 0, intensity: 0.7,
+    });
+  }
+
   // Hydrate all nodes
   if (connectedIds.size > 0) {
     const idArray = [...connectedIds];
@@ -576,6 +653,9 @@ async function getGraphData(settings, { scope, character }) {
 
     const { rows: pts } = await p.query(`SELECT * FROM plot_threads WHERE id = ANY($1)`, [idArray]);
     for (const pt of pts) nodes.push({ id: pt.id, label: pt.title, type: "plot_thread", metadata: pt });
+
+    const { rows: arcs } = await p.query(`SELECT * FROM story_arcs WHERE id = ANY($1)`, [idArray]);
+    for (const arc of arcs) nodes.push({ id: arc.id, label: arc.title, type: "story_arc", metadata: arc });
   }
 
   return { nodes, edges };
@@ -612,6 +692,7 @@ module.exports = {
   upsertCharacter, upsertLocation, upsertRelationship, insertEvent, upsertFact, upsertWorldState,
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads,
+  upsertStoryArc, linkEventToArc, createEventChain,
   storeEmbedding, vectorSearch, vectorSearchScoped,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
   getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig, closePool,

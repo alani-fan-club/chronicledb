@@ -139,6 +139,46 @@ CREATE TABLE IF NOT EXISTS plot_threads (
 CREATE INDEX IF NOT EXISTS idx_plot_active
     ON plot_threads (chat_id) WHERE resolved_at IS NULL;
 
+-- ── Story arcs (manga-style narrative containers) ─────────────
+
+CREATE TABLE IF NOT EXISTS story_arcs (
+    id              TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    arc_type        TEXT DEFAULT 'main',   -- main | subplot | character_arc | world_arc
+    status          TEXT DEFAULT 'active', -- active | resolved | ongoing | abandoned
+    importance      INT DEFAULT 3,          -- 1-5
+    start_msg_idx   INT,
+    end_msg_idx     INT,
+    spine_event_id  TEXT,                   -- the defining event
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Arc membership: events can belong to multiple arcs
+CREATE TABLE IF NOT EXISTS arc_events (
+    arc_id      TEXT NOT NULL REFERENCES story_arcs(id) ON DELETE CASCADE,
+    event_id    TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    position    INT DEFAULT 0,
+    is_anchor   BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (arc_id, event_id)
+);
+
+-- Causal chains: event → event
+CREATE TABLE IF NOT EXISTS event_chains (
+    id              SERIAL PRIMARY KEY,
+    from_event_id   TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    to_event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    chain_type      TEXT DEFAULT 'caused',  -- caused | followed_by | triggered | led_to
+    description     TEXT DEFAULT '',
+    UNIQUE(from_event_id, to_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_arc_events_arc ON arc_events (arc_id);
+CREATE INDEX IF NOT EXISTS idx_event_chains_from ON event_chains (from_event_id);
+CREATE INDEX IF NOT EXISTS idx_event_chains_to ON event_chains (to_event_id);
+
 -- ── Items (key objects with owners, powers, significance) ──────
 
 CREATE TABLE IF NOT EXISTS items (

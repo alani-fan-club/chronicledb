@@ -188,7 +188,7 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
 
   // Recency reorder: newer events and dialogue quotes surface first when rank ties.
   // Same RECENCY_ALPHA as eval cdb-client so behavior is consistent across callers.
-  const RECENCY_ALPHA = 0.008;
+  const RECENCY_ALPHA = 0.003;
   const applyRecency = (rows) => {
     if (!rows || rows.length === 0 || maxMsgIdx <= 0) return rows;
     return rows

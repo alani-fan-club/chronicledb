@@ -410,48 +410,82 @@ async function getGraphData(settings, { scope, character }) {
   const nodes = [];
   const edges = [];
 
-  const { rows: chars } = await p.query(`SELECT * FROM characters`);
-  for (const c of chars) {
-    nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
-  }
-
-  const { rows: locs } = await p.query(`SELECT * FROM locations`);
-  for (const l of locs) {
-    nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
-  }
-
-  // Events with participants
-  const { rows: evts } = await p.query(`SELECT * FROM events ORDER BY timestamp DESC LIMIT 200`);
-  for (const e of evts) {
-    nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
-  }
-
-  // Relationships — use from_char/to_char directly (already slugified IDs matching node.id)
+  // Get all edges first so we know which nodes are connected
   const { rows: rels } = await p.query(
     `SELECT fa.from_char, fa.to_char, fa.sentiment, fa.intensity, fa.description
      FROM feels_about fa`,
   );
+  const { rows: parts } = await p.query(
+    `SELECT character_id, event_id, role FROM participated_in`,
+  );
+  const { rows: knowledgeEdges } = await p.query(
+    `SELECT character_id, fact_id FROM knows LIMIT 500`,
+  );
+
+  // Collect IDs of all connected nodes
+  const connectedIds = new Set();
   for (const r of rels) {
+    connectedIds.add(r.from_char);
+    connectedIds.add(r.to_char);
     edges.push({
       id: `fa-${r.from_char}-${r.to_char}`,
       source: r.from_char, target: r.to_char,
-      type: "FEELS_ABOUT", label: r.description,
+      type: "FEELS_ABOUT", label: (r.description || "").slice(0, 60),
       sentiment: parseFloat(r.sentiment) || 0,
       intensity: parseFloat(r.intensity) || 0.5,
     });
   }
-
-  // Participation edges (character → event)
-  const { rows: parts } = await p.query(
-    `SELECT character_id, event_id, role FROM participated_in`,
-  );
   for (const pi of parts) {
+    connectedIds.add(pi.character_id);
+    connectedIds.add(pi.event_id);
     edges.push({
       id: `pi-${pi.character_id}-${pi.event_id}`,
       source: pi.character_id, target: pi.event_id,
       type: "PARTICIPATED_IN", label: pi.role || "participated",
       sentiment: 0, intensity: 0.5,
     });
+  }
+  for (const k of knowledgeEdges) {
+    connectedIds.add(k.character_id);
+    connectedIds.add(k.fact_id);
+    edges.push({
+      id: `kn-${k.character_id}-${k.fact_id}`,
+      source: k.character_id, target: k.fact_id,
+      type: "KNOWS", label: "knows",
+      sentiment: 0, intensity: 0.3,
+    });
+  }
+
+  // Only include nodes that have at least one edge
+  if (connectedIds.size > 0) {
+    const idArray = [...connectedIds];
+    const { rows: chars } = await p.query(
+      `SELECT * FROM characters WHERE id = ANY($1)`, [idArray],
+    );
+    for (const c of chars) {
+      nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
+    }
+
+    const { rows: evts } = await p.query(
+      `SELECT * FROM events WHERE id = ANY($1)`, [idArray],
+    );
+    for (const e of evts) {
+      nodes.push({ id: e.id, label: (e.summary || "").slice(0, 40), type: "event", metadata: e });
+    }
+
+    const { rows: fcts } = await p.query(
+      `SELECT * FROM facts WHERE id = ANY($1) LIMIT 100`, [idArray],
+    );
+    for (const f of fcts) {
+      nodes.push({ id: f.id, label: (f.content || "").slice(0, 40), type: "fact", metadata: f });
+    }
+
+    const { rows: locs } = await p.query(
+      `SELECT * FROM locations WHERE id = ANY($1)`, [idArray],
+    );
+    for (const l of locs) {
+      nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
+    }
   }
 
   return { nodes, edges };

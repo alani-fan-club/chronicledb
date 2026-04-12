@@ -153,6 +153,18 @@ CREATE TABLE IF NOT EXISTS items (
     created_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- ── Ingestion status tracking ──────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ingestion_status (
+    chat_file      TEXT PRIMARY KEY,
+    character_name TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    messages_total INT DEFAULT 0,
+    batches_done   INT DEFAULT 0,
+    ingested_at    TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- ── Vector table ───────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS memory_embeddings (

@@ -338,6 +338,25 @@ async function init(router) {
           };
         });
 
+      // Enrich with ingestion status
+      try {
+        const p = db.getPool(settings);
+        const { rows: statuses } = await p.query(
+          `SELECT chat_file, status, batches_done, ingested_at FROM ingestion_status WHERE character_name = $1`,
+          [charName],
+        );
+        const statusMap = new Map(statuses.map((s) => [s.chat_file, s]));
+        for (const chat of chatFiles) {
+          const s = statusMap.get(chat.filename);
+          if (s) {
+            chat.ingested = s.status === "done";
+            chat.ingestStatus = s.status;
+            chat.ingestedAt = s.ingested_at;
+            chat.batchesDone = s.batches_done;
+          }
+        }
+      } catch { /* status table might not exist yet */ }
+
       res.json(chatFiles);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -470,6 +489,15 @@ async function init(router) {
           console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message);
         }
       }
+
+      // Record ingestion status
+      const p = db.getPool(settings);
+      await p.query(
+        `INSERT INTO ingestion_status (chat_file, character_name, status, messages_total, batches_done, ingested_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         ON CONFLICT (chat_file) DO UPDATE SET status = $3, messages_total = $4, batches_done = $5, ingested_at = NOW(), updated_at = NOW()`,
+        [filename, charName, extracted > 0 ? "done" : "failed", messages.length, extracted],
+      );
 
       res.json({
         ok: true,

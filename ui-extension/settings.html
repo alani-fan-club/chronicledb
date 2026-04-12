@@ -60,26 +60,59 @@
 
       <hr>
 
-      <!-- LLM settings -->
-      <h4>Gemini API</h4>
+      <!-- Extraction LLM -->
+      <h4>Extraction LLM</h4>
+      <p class="chronicle-hint">The model that reads RP messages and extracts memories. Any OpenAI-compatible or Gemini endpoint.</p>
       <div class="chronicle-setting">
-        <label for="chronicle_extractionModel">Extraction Model:</label>
-        <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="gemini-2.5-flash-lite">
-      </div>
-
-      <h4>Embeddings</h4>
-      <div class="chronicle-setting">
-        <label for="chronicle_geminiApiKey">Gemini API Key:</label>
-        <input type="password" id="chronicle_geminiApiKey" class="text_pole" placeholder="">
+        <label for="chronicle_extractionApiUrl">API URL:</label>
+        <input type="text" id="chronicle_extractionApiUrl" class="text_pole" placeholder="https://generativelanguage.googleapis.com/v1beta">
       </div>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_geminiEmbeddingModel">Embedding Model:</label>
-          <input type="text" id="chronicle_geminiEmbeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview">
+          <label for="chronicle_extractionApiKey">API Key:</label>
+          <input type="password" id="chronicle_extractionApiKey" class="text_pole" placeholder="">
         </div>
         <div class="chronicle-setting">
-          <label for="chronicle_geminiEmbeddingDimension">Dimension:</label>
-          <input type="number" id="chronicle_geminiEmbeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
+          <label for="chronicle_extractionModel">Model:</label>
+          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="gemini-2.5-flash-lite">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_extractionApiType">API Type:</label>
+        <select id="chronicle_extractionApiType" class="text_pole">
+          <option value="gemini">Gemini</option>
+          <option value="openai">OpenAI-compatible</option>
+        </select>
+      </div>
+
+      <!-- Embedding model -->
+      <h4>Embedding Model</h4>
+      <p class="chronicle-hint">Generates vector embeddings for semantic search. Can be a different provider than extraction.</p>
+      <div class="chronicle-setting">
+        <label for="chronicle_embeddingApiUrl">API URL:</label>
+        <input type="text" id="chronicle_embeddingApiUrl" class="text_pole" placeholder="https://generativelanguage.googleapis.com/v1beta">
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingApiKey">API Key:</label>
+          <input type="password" id="chronicle_embeddingApiKey" class="text_pole" placeholder="">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingModel">Model:</label>
+          <input type="text" id="chronicle_embeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview">
+        </div>
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingApiType">API Type:</label>
+          <select id="chronicle_embeddingApiType" class="text_pole">
+            <option value="gemini">Gemini</option>
+            <option value="openai">OpenAI-compatible</option>
+          </select>
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingDimension">Dimension:</label>
+          <input type="number" id="chronicle_embeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
         </div>
       </div>
 

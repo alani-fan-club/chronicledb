@@ -138,3 +138,14 @@
   color: #f85149;
   font-size: 11px;
 }
+
+.chronicle-ingested-badge {
+  flex-shrink: 0;
+  padding: 1px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  color: #3fb950;
+  border: 1px solid rgba(63, 185, 80, 0.3);
+  border-radius: 10px;
+  background: rgba(63, 185, 80, 0.08);
+}

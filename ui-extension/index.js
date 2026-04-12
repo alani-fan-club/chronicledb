@@ -397,9 +397,12 @@ async function loadChatSelector() {
           <span class="chronicle-chat-name" title="${chat.chatId}">${displayName}</span>
           <span class="chronicle-chat-msgs">~${chat.messageEstimate} msgs</span>
           <span class="chronicle-chat-date">${dateLabel}</span>
-          <button class="chronicle-ingest-btn menu_button menu_button_small"
-                  data-filename="${chat.filename}" data-character="${characterName}"
-                  data-msgs="${chat.messageEstimate}">Ingest</button>
+          ${chat.ingested
+            ? `<span class="chronicle-ingested-badge" title="Ingested ${chat.batchesDone || ''} batches">Ingested</span>`
+            : `<button class="chronicle-ingest-btn menu_button menu_button_small"
+                    data-filename="${chat.filename}" data-character="${characterName}"
+                    data-msgs="${chat.messageEstimate}">Ingest</button>`
+          }
         </div>`;
     }
 

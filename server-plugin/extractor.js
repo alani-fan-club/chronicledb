@@ -68,33 +68,54 @@ ${msgBlock}
 
 JSON:`;
 
-  const apiKey = (settings.geminiApiKey || "").trim();
+  const apiType = (settings.extractionApiType || "gemini").trim();
+  const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
   const model = (settings.extractionModel || "gemini-2.5-flash-lite").trim();
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
 
-  const res = await fetch(geminiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 4096,
-        responseMimeType: "application/json",
+  let content;
+
+  if (apiType === "openai") {
+    // OpenAI-compatible API (OpenRouter, local, etc.)
+    const res = await fetch(`${apiUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
       },
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.1,
+        max_tokens: 4096,
+      }),
+    });
+    if (!res.ok) throw new Error(`Extraction LLM error: ${res.status} ${await res.text()}`);
+    const data = await res.json();
+    content = data.choices?.[0]?.message?.content;
+  } else {
+    // Gemini API
+    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 4096,
+          responseMimeType: "application/json",
+        },
+      }),
+    });
+    if (!res.ok) throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
+    const data = await res.json();
+    content = data.candidates?.[0]?.content?.parts?.[0]?.text;
   }
 
-  const data = await res.json();
-  const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!content) throw new Error("Gemini returned empty response");
+  if (!content) throw new Error("LLM returned empty response");
 
   return parseResponse(content);
 }

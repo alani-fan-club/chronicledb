@@ -51,6 +51,52 @@ async function eventLexicalSearch(settings, chatIds, query, limit) {
   return rows;
 }
 
+async function fetchArcExpansion(settings, eventIds) {
+  const result = new Map();
+  if (!eventIds || eventIds.length === 0) return result;
+  const p = db.getPool(settings);
+  const { rows } = await p.query(
+    `SELECT
+       ae_hit.event_id,
+       sa.title AS arc_title,
+       sa.description AS arc_description,
+       sa.status AS arc_status,
+       sa.importance AS arc_importance,
+       ae_hit.position AS hit_position,
+       ae_neighbor.position AS neighbor_position,
+       e_neighbor.summary AS neighbor_summary,
+       e_neighbor.source_text AS neighbor_source_text
+     FROM arc_events ae_hit
+     JOIN story_arcs sa ON sa.id = ae_hit.arc_id
+     LEFT JOIN arc_events ae_neighbor
+       ON ae_neighbor.arc_id = ae_hit.arc_id
+       AND ae_neighbor.position IN (ae_hit.position - 1, ae_hit.position + 1)
+     LEFT JOIN events e_neighbor ON e_neighbor.id = ae_neighbor.event_id
+     WHERE ae_hit.event_id = ANY($1::text[])
+     ORDER BY ae_hit.event_id, sa.importance DESC NULLS LAST, ae_neighbor.position`,
+    [eventIds],
+  );
+  for (const r of rows) {
+    let exp = result.get(r.event_id);
+    if (!exp) {
+      exp = {
+        arcTitle: r.arc_title,
+        arcDescription: r.arc_description || "",
+        arcStatus: r.arc_status || "active",
+        hitPosition: r.hit_position,
+      };
+      result.set(r.event_id, exp);
+    }
+    if (exp.arcTitle !== r.arc_title) continue;
+    if (r.neighbor_position === r.hit_position - 1 && r.neighbor_summary) {
+      exp.prev = { summary: r.neighbor_summary, sourceText: r.neighbor_source_text || "", position: r.neighbor_position };
+    } else if (r.neighbor_position === r.hit_position + 1 && r.neighbor_summary) {
+      exp.next = { summary: r.neighbor_summary, sourceText: r.neighbor_source_text || "", position: r.neighbor_position };
+    }
+  }
+  return result;
+}
+
 async function getMaxMessageIndex(settings, chatIds) {
   if (!chatIds || chatIds.length === 0) return 0;
   const p = db.getPool(settings);
@@ -158,6 +204,9 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
   const rescoredEventHits = applyRecency(eventHits);
   const rescoredDialogueHits = applyRecency(dialogueHits);
 
+  const arcEventIds = (rescoredEventHits || []).slice(0, 4).map((e) => e.id).filter(Boolean);
+  const arcExpansion = await fetchArcExpansion(settings, arcEventIds);
+
   return {
     relationships,
     events,
@@ -169,6 +218,7 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     plotThreads,
     eventHits: rescoredEventHits,
     dialogueHits: rescoredDialogueHits,
+    arcExpansion,
   };
 }
 
@@ -247,7 +297,15 @@ function formatMemoryBlock(result, maxTokens = 1500) {
       .slice(0, 4)
       .map((e) => {
         const turn = typeof e.message_index === "number" ? `[turn ${e.message_index}] ` : "";
-        return `- ${turn}${(e.source_text || "").replace(/\s+/g, " ").slice(0, 2500)}`;
+        let out = `- ${turn}${(e.source_text || "").replace(/\s+/g, " ").slice(0, 2000)}`;
+        const arc = result.arcExpansion && result.arcExpansion.get(e.id);
+        if (arc) {
+          const desc = arc.arcDescription ? ` — ${arc.arcDescription.slice(0, 200)}` : "";
+          out += `\n  [arc: ${arc.arcTitle} (${arc.arcStatus})${desc}]`;
+          if (arc.prev) out += `\n  [arc prev pos ${arc.prev.position}] ${arc.prev.summary.slice(0, 300)}`;
+          if (arc.next) out += `\n  [arc next pos ${arc.next.position}] ${arc.next.summary.slice(0, 300)}`;
+        }
+        return out;
       })
       .join("\n");
     sections.push(`## Matched Event Passages\n${lines}`);

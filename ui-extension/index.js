@@ -4,15 +4,17 @@
  */
 
 import {
-  getContext,
-  extension_settings,
-  saveSettingsDebounced,
-} from "../../../extensions.js";
-
-import {
   eventSource,
   event_types,
+  getRequestHeaders,
+  saveSettingsDebounced,
 } from "../../../../script.js";
+
+import {
+  getContext,
+  extension_settings,
+  renderExtensionTemplateAsync,
+} from "../../../extensions.js";
 
 const PLUGIN_BASE = "/api/plugins/chronicle-db";
 const EXT_NAME = "chronicle-db";
@@ -45,27 +47,19 @@ let isExtracting = false;
 
 // ── Initialization ─────────────────────────────────────────────
 
-jQuery(async () => {
+(async function init() {
   // Load settings
   if (!extension_settings[EXT_NAME]) {
     extension_settings[EXT_NAME] = { ...DEFAULT_SETTINGS };
   }
   const settings = extension_settings[EXT_NAME];
 
-  // Load settings panel HTML — inline to avoid fetch issues
-  try {
-    const response = await fetch(`/scripts/extensions/third-party/${EXT_NAME}/settings.html`);
-    if (response.ok) {
-      const settingsHtml = await response.text();
-      $("#extensions_settings2").append(settingsHtml);
-    } else {
-      console.error(`[ChronicleDB] Failed to load settings HTML: ${response.status}`);
-      return;
-    }
-  } catch (err) {
-    console.error("[ChronicleDB] Failed to load settings HTML:", err);
-    return;
-  }
+  // Load settings panel HTML via ST's template loader
+  const settingsHtml = await renderExtensionTemplateAsync(
+    `third-party/${EXT_NAME}`,
+    'settings',
+  );
+  $('#extensions_settings2').append(settingsHtml);
 
   // Bind settings inputs
   bindSettings(settings);
@@ -104,7 +98,7 @@ jQuery(async () => {
   });
 
   console.log("[ChronicleDB] UI extension loaded.");
-});
+})();
 
 // ── Extraction ─────────────────────────────────────────────────
 
@@ -134,7 +128,7 @@ async function triggerExtraction() {
     // Fire and forget — don't block the UI
     fetch(`${PLUGIN_BASE}/extract`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getRequestHeaders(),
       body: JSON.stringify({
         characterName,
         userName,
@@ -180,7 +174,7 @@ async function injectMemoryContext() {
 
     const res = await fetch(`${PLUGIN_BASE}/retrieve`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getRequestHeaders(),
       body: JSON.stringify({
         chatId: String(chatId),
         characterName,
@@ -270,7 +264,7 @@ function bindSettings(settings) {
   // Init DB button
   $("#chronicle_initDb").on("click", async () => {
     try {
-      const res = await fetch(`${PLUGIN_BASE}/init-db`, { method: "POST" });
+      const res = await fetch(`${PLUGIN_BASE}/init-db`, { method: "POST", headers: getRequestHeaders() });
       if (res.ok) {
         toastr.success("Database schema initialized.");
       } else {
@@ -302,7 +296,7 @@ function bindSettings(settings) {
     try {
       const res = await fetch(`${PLUGIN_BASE}/lorebooks/ingest`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: getRequestHeaders(),
         body: JSON.stringify({ filename }),
       });
       const data = await res.json();
@@ -322,7 +316,7 @@ function bindSettings(settings) {
 
 async function loadLorebookList() {
   try {
-    const res = await fetch(`${PLUGIN_BASE}/lorebooks`);
+    const res = await fetch(`${PLUGIN_BASE}/lorebooks`, { headers: getRequestHeaders() });
     const books = await res.json();
     const select = $("#chronicle_lorebookSelect");
     for (const book of books) {
@@ -338,20 +332,17 @@ function saveAndSync(settings) {
   syncSettings(settings);
 }
 
-async function fetchWithCsrf(url, options = {}) {
-  const csrfRes = await fetch("/csrf-token");
-  const { token } = await csrfRes.json();
-  options.headers = { ...options.headers, "X-CSRF-Token": token };
-  return fetch(url, options);
+function pluginFetch(endpoint, body) {
+  return fetch(`${PLUGIN_BASE}${endpoint}`, {
+    method: "POST",
+    headers: getRequestHeaders(),
+    body: JSON.stringify(body),
+  });
 }
 
 async function syncSettings(settings) {
   try {
-    await fetch(`${PLUGIN_BASE}/settings`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(settings),
-    });
+    await pluginFetch("/settings", settings);
   } catch (err) {
     console.warn("[ChronicleDB] Failed to sync settings:", err);
   }
@@ -374,8 +365,8 @@ async function loadChatSelector() {
   try {
     // Load the character's memory config and available chats in parallel
     const [configRes, chatsRes] = await Promise.all([
-      fetch(`${PLUGIN_BASE}/character-config/${encodeURIComponent(characterName)}`),
-      fetch(`${PLUGIN_BASE}/chats/${encodeURIComponent(characterName)}`),
+      fetch(`${PLUGIN_BASE}/character-config/${encodeURIComponent(characterName)}`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/chats/${encodeURIComponent(characterName)}`, { headers: getRequestHeaders() }),
     ]);
 
     const charConfig = await configRes.json();
@@ -428,9 +419,9 @@ async function loadChatSelector() {
 
       btn.prop("disabled", true).val("Ingesting...");
       try {
-        const res = await fetchWithCsrf(`${PLUGIN_BASE}/ingest-chat`, {
+        const res = await fetch(`${PLUGIN_BASE}/ingest-chat`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: getRequestHeaders(),
           body: JSON.stringify({ characterName: charName, filename }),
         });
         const data = await res.json();
@@ -498,7 +489,7 @@ async function saveCharacterChatSelection(characterName) {
   try {
     await fetch(`${PLUGIN_BASE}/character-config/${encodeURIComponent(characterName)}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getRequestHeaders(),
       body: JSON.stringify({ sessionMode, selectedChats }),
     });
   } catch (err) {

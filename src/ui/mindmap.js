@@ -539,7 +539,7 @@ function showLoading(visible) {
 
 // ── Detail panel ────────────────────────────────────────────────
 
-function showDetailPanel(data) {
+async function showDetailPanel(data) {
   const panel = document.getElementById("detail-panel");
   const content = document.getElementById("detail-content");
   const title = data.fullLabel || data.label || data.id;
@@ -589,8 +589,15 @@ function showDetailPanel(data) {
           type: otherData.type,
           sentiment: ed.sentiment,
           edgeLabel: ed.label,
+          significance: otherData.significance || 0,
+          neighborId: otherId,
         });
       });
+
+      // Sort PARTICIPATED_IN events by significance (descending) — major events first
+      if (groups.has("PARTICIPATED_IN")) {
+        groups.get("PARTICIPATED_IN").sort((a, b) => (b.significance || 0) - (a.significance || 0));
+      }
 
       const typeDisplayNames = {
         FEELS_ABOUT: "Relationships",
@@ -617,13 +624,94 @@ function showDetailPanel(data) {
             it.type === "plot_thread" ? COLORS.tier3 :
             it.type === "fact"        ? COLORS.tier4 :
             COLORS.tier3;
-          html += `<li class="${sentClass}"><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(it.label)}</span></li>`;
+          // Mark high-significance events as "major" — coral left border
+          const isMajor = edgeType === "PARTICIPATED_IN" && (it.significance || 0) >= 4;
+          const liClass = `${sentClass}${isMajor ? " major-event" : ""}`;
+          html += `<li class="${liClass}"><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(it.label)}</span></li>`;
         }
         if (items.length > 15) {
           html += `<li class="detail-more">+ ${items.length - 15} more</li>`;
         }
         html += `</ul>`;
       }
+    }
+
+    // ── Story Arcs section (character nodes) ─────────────────────
+    // Find arcs in the graph that contain any of this character's events
+    if (data.type === "character") {
+      const charEventIds = new Set();
+      node.connectedEdges().forEach((e) => {
+        if (e.data("type") === "PARTICIPATED_IN") {
+          const otherId = e.source().id() === data.id ? e.target().id() : e.source().id();
+          const other = cy.getElementById(otherId);
+          if (other.length && other.data("type") === "event") charEventIds.add(otherId);
+        }
+      });
+
+      const arcs = [];
+      const seenArcs = new Set();
+      cy.nodes().forEach((n) => {
+        if (n.data("type") !== "story_arc" || seenArcs.has(n.id())) return;
+        // Does this arc contain any of the character's events?
+        const containsCharEvent = n.connectedEdges().some((e) => {
+          if (e.data("type") !== "CONTAINS_EVENT") return false;
+          const evId = e.source().id() === n.id() ? e.target().id() : e.source().id();
+          return charEventIds.has(evId);
+        });
+        if (containsCharEvent) {
+          seenArcs.add(n.id());
+          const ad = n.data();
+          arcs.push({
+            title: ad.fullLabel || ad.label || ad.title || n.id(),
+            importance: ad.importance || 3,
+          });
+        }
+      });
+
+      if (arcs.length > 0) {
+        arcs.sort((a, b) => (b.importance || 0) - (a.importance || 0));
+        html += `<h3>Story Arcs <span class="detail-count">${arcs.length}</span></h3>`;
+        html += `<ul class="detail-list">`;
+        for (const arc of arcs) {
+          html += `<li><span class="detail-dot" style="background:${COLORS.accent}"></span><span class="detail-item-label">${escapeHtml(arc.title)} <span class="detail-meta">★${arc.importance}</span></span></li>`;
+        }
+        html += `</ul>`;
+      }
+    }
+  }
+
+  // ── Traits section (character nodes only) ──────────────────────
+  if (data.type === "character") {
+    try {
+      const res = await fetch(`${API_BASE}/character/${encodeURIComponent(title)}/traits`, fetchOpts);
+      if (res.ok) {
+        const traits = await res.json();
+        if (traits.length > 0) {
+          // Group by category (preserve insertion order from server's ORDER BY)
+          const byCategory = {};
+          for (const t of traits) {
+            if (!byCategory[t.category]) byCategory[t.category] = [];
+            byCategory[t.category].push(t.content);
+          }
+          html += `<h3>Traits <span class="detail-count">${traits.length}</span></h3>`;
+          html += `<ul class="detail-list">`;
+          for (const [cat, items] of Object.entries(byCategory)) {
+            for (const traitContent of items) {
+              const dotColor = {
+                personality: "#c77d5c",
+                skill: "#7d9a82",
+                background: "#a88b6a",
+                physical: "#b8b8b8",
+                faction: "#FF5841",
+              }[cat] || "#6a6a6a";
+              html += `<li><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(traitContent)} <span class="detail-meta">${cat}</span></span></li>`;
+            }
+          }
+          html += `</ul>`;
+        }
+      }
+    } catch (err) {
+      console.warn("[mindmap] Failed to load traits:", err);
     }
   }
 

@@ -814,6 +814,20 @@ html, body {
   font-style: normal !important;
 }
 
+.detail-list li.major-event {
+  border-left: 2px solid var(--accent);
+  padding-left: 8px;
+}
+
+.detail-meta {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-left: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .detail-more::before {
   content: "+ ";
   color: var(--accent);

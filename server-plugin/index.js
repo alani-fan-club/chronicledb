@@ -714,6 +714,20 @@ async function init(router) {
     }
   });
 
+  router.get("/character/:name/traits", async (req, res) => {
+    try {
+      const p = db.getPool(settings);
+      const charId = db.slugify(req.params.name);
+      const { rows } = await p.query(
+        `SELECT category, content FROM traits WHERE character_id = $1 ORDER BY category, content`,
+        [charId],
+      );
+      res.json(rows);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Character cards (all ST character PNGs) ──────────────────
 
   router.get("/character-cards", async (req, res) => {

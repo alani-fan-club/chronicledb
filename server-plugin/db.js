@@ -331,7 +331,7 @@ async function upsertPlotThread(settings, { chatId, title, description, threadTy
 
 async function getActivePlotThreads(settings, chatId) {
   const p = getPool(settings);
-  const { rows } = await p.query(`SELECT * FROM plot_threads WHERE chat_id = $1 AND resolved_at IS NULL ORDER BY importance DESC`, [chatId]);
+  const { rows } = await p.query(`SELECT * FROM plot_threads WHERE chat_id = $1 AND resolved_at IS NULL ORDER BY importance DESC LIMIT 20`, [chatId]);
   return rows;
 }
 

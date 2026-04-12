@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_chat ON events (chat_id);
-CREATE INDEX IF NOT EXISTS idx_events_major ON events (chat_id) WHERE is_major = true;
 
 ALTER TABLE events ADD COLUMN IF NOT EXISTS source_text TEXT DEFAULT '';
 ALTER TABLE events ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'recent';
@@ -308,19 +307,8 @@ CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_tsv
     ON dialogue_quotes USING GIN (to_tsvector('english', quote));
 CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_trgm
     ON dialogue_quotes USING GIN (quote gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_chat_speaker
-    ON dialogue_quotes (chat_id, speaker);
 
 -- ── Session & config tables ────────────────────────────────────
-
-CREATE TABLE IF NOT EXISTS chronicle_sessions (
-    id             TEXT PRIMARY KEY,
-    character_name TEXT NOT NULL,
-    chat_id        TEXT NOT NULL,
-    mode           TEXT NOT NULL DEFAULT 'persistent',
-    created_at     TIMESTAMPTZ DEFAULT NOW(),
-    updated_at     TIMESTAMPTZ DEFAULT NOW()
-);
 
 CREATE TABLE IF NOT EXISTS character_memory_config (
     character_name TEXT PRIMARY KEY,

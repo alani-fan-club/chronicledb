@@ -852,6 +852,84 @@ async function init(router) {
     }
   });
 
+  // ── Character memory panel ───────────────────────────────────
+  // Feeds the per-character "Memory Management" section in the ST
+  // character card sidebar (separate from the global settings panel).
+
+  router.get("/character-stats", async (req, res) => {
+    try {
+      const name = req.query.name;
+      if (!name) return res.status(400).json({ error: "name required" });
+      const stats = await db.getCharacterPanelStats(settings, name);
+      res.json(stats);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get("/character-recent-events", async (req, res) => {
+    try {
+      const name = req.query.name;
+      if (!name) return res.status(400).json({ error: "name required" });
+      const limit = parseInt(req.query.limit, 10) || 5;
+      const events = await db.getCharacterRecentEvents(settings, name, limit);
+      res.json(events);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get("/character-relationships", async (req, res) => {
+    try {
+      const name = req.query.name;
+      if (!name) return res.status(400).json({ error: "name required" });
+      const rels = await db.getCharacterOutboundRelationships(settings, name);
+      res.json(rels);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get("/character-memory-config", async (req, res) => {
+    try {
+      const name = req.query.name;
+      if (!name) return res.status(400).json({ error: "name required" });
+      const config = await db.getCharacterMemoryConfig(settings, name);
+      res.json({ sessionMode: config.sessionMode || "persistent" });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post("/character-memory-config", async (req, res) => {
+    try {
+      const { name, sessionMode } = req.body || {};
+      if (!name) return res.status(400).json({ error: "name required" });
+      // Preserve the user's chat picker selection — saveCharacterMemoryConfig
+      // rewrites the whole row, so we have to read-modify-write.
+      const existing = await db.getCharacterMemoryConfig(settings, name);
+      await db.saveCharacterMemoryConfig(settings, {
+        characterName: name,
+        sessionMode: sessionMode || existing.sessionMode || "persistent",
+        selectedChats: existing.selectedChats || [],
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.post("/character-clear-memories", async (req, res) => {
+    try {
+      const { name } = req.body || {};
+      if (!name) return res.status(400).json({ error: "name required" });
+      const cleared = await db.clearCharacterMemories(settings, name);
+      res.json({ ok: true, cleared });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Character cards (all ST character PNGs) ──────────────────
 
   router.get("/character-cards", async (req, res) => {

@@ -1047,6 +1047,102 @@ async function saveCharacterMemoryConfig(settings, { characterName, sessionMode,
   );
 }
 
+// ── Character panel queries ────────────────────────────────────
+
+async function getCharacterPanelStats(settings, characterName) {
+  const p = getPool(settings);
+  const charId = slugify(characterName);
+  const { rows } = await p.query(
+    `SELECT
+       (SELECT COUNT(*) FROM participated_in WHERE character_id = $1)::int AS events,
+       (SELECT COUNT(*) FROM traits WHERE character_id = $1)::int AS traits,
+       (SELECT COUNT(*) FROM feels_about WHERE from_char = $1 OR to_char = $1)::int AS relationships,
+       (SELECT MAX(e.message_index) FROM events e
+          JOIN participated_in pi ON pi.event_id = e.id
+          WHERE pi.character_id = $1) AS last_seen_turn`,
+    [charId],
+  );
+  const r = rows[0] || {};
+  return {
+    events: r.events || 0,
+    traits: r.traits || 0,
+    relationships: r.relationships || 0,
+    lastSeenTurn: r.last_seen_turn == null ? null : Number(r.last_seen_turn),
+  };
+}
+
+async function getCharacterRecentEvents(settings, characterName, limit) {
+  const p = getPool(settings);
+  const charId = slugify(characterName);
+  const lim = Math.max(1, Math.min(20, parseInt(limit, 10) || 5));
+  const { rows } = await p.query(
+    `SELECT e.id, e.summary, e.source_text, e.message_index, e.significance, e.chat_id
+     FROM events e
+     JOIN participated_in pi ON pi.event_id = e.id
+     WHERE pi.character_id = $1
+     ORDER BY e.message_index DESC NULLS LAST, e.timestamp DESC
+     LIMIT $2`,
+    [charId, lim],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    summary: r.summary,
+    sourceText: r.source_text || "",
+    messageIndex: r.message_index,
+    significance: r.significance,
+    chatId: r.chat_id,
+  }));
+}
+
+async function getCharacterOutboundRelationships(settings, characterName) {
+  const p = getPool(settings);
+  const charId = slugify(characterName);
+  // Collapses per-session rows into a single "latest" sentiment per target
+  // so the panel stays compact even for characters with many chats.
+  const { rows } = await p.query(
+    `SELECT DISTINCT ON (f.to_char)
+            c.name AS to_name, f.sentiment, f.intensity, f.description, f.updated_at
+     FROM feels_about f
+     JOIN characters c ON c.id = f.to_char
+     WHERE f.from_char = $1
+     ORDER BY f.to_char, f.updated_at DESC`,
+    [charId],
+  );
+  return rows.map((r) => ({
+    toName: r.to_name,
+    sentiment: Number(r.sentiment) || 0,
+    intensity: Number(r.intensity) || 0,
+    description: r.description || "",
+  }));
+}
+
+async function clearCharacterMemories(settings, characterName) {
+  const p = getPool(settings);
+  const charId = slugify(characterName);
+  const cleared = { traits: 0, feels_about: 0, participated_in: 0, present_at: 0, knows: 0 };
+  const client = await p.connect();
+  try {
+    await client.query("BEGIN");
+    const t = await client.query(`DELETE FROM traits WHERE character_id = $1`, [charId]);
+    cleared.traits = t.rowCount || 0;
+    const f = await client.query(`DELETE FROM feels_about WHERE from_char = $1 OR to_char = $1`, [charId]);
+    cleared.feels_about = f.rowCount || 0;
+    const pi = await client.query(`DELETE FROM participated_in WHERE character_id = $1`, [charId]);
+    cleared.participated_in = pi.rowCount || 0;
+    const pa = await client.query(`DELETE FROM present_at WHERE character_id = $1`, [charId]);
+    cleared.present_at = pa.rowCount || 0;
+    const k = await client.query(`DELETE FROM knows WHERE character_id = $1`, [charId]);
+    cleared.knows = k.rowCount || 0;
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  return cleared;
+}
+
 async function closePool() {
   if (pool) { await pool.end(); pool = null; }
 }
@@ -1060,5 +1156,7 @@ module.exports = {
   upsertStoryArc, linkEventToArc, createEventChain,
   storeEmbedding, upsertMemoryEmbedding, upsertDialogueQuote, vectorSearch, vectorSearchScoped, lexicalSearch, hybridSearch,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
-  getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig, closePool,
+  getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig,
+  getCharacterPanelStats, getCharacterRecentEvents, getCharacterOutboundRelationships, clearCharacterMemories,
+  closePool,
 };

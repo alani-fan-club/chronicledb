@@ -79,6 +79,14 @@ let isExtracting = false;
   // Bind settings inputs
   bindSettings(settings);
 
+  // Mount the per-character memory panel into the ST character card sidebar.
+  // Failure here must not break the rest of init, so isolate in try/catch.
+  try {
+    await mountCharacterPanel();
+  } catch (err) {
+    console.warn("[ChronicleDB] Character panel mount failed:", err);
+  }
+
   // Push settings to server plugin
   await syncSettings(settings);
 
@@ -98,6 +106,9 @@ let isExtracting = false;
   eventSource.on(event_types.CHAT_CHANGED, async () => {
     if (!settings.enabled) return;
     await loadChatSelector();
+    refreshCharacterPanel().catch((err) => {
+      console.warn("[ChronicleDB] Character panel refresh failed:", err);
+    });
     // Visible confirmation that memory building is live for the new chat.
     // One-shot toast so it's not spammy.
     if (settings.autoIngest && settings.sessionMode !== "readonly" && typeof toastr !== "undefined") {
@@ -105,8 +116,22 @@ let isExtracting = false;
     }
   });
 
+  // Character-card-level refresh: fires when the user opens/edits a card
+  // without necessarily switching the active chat.
+  if (event_types.CHARACTER_EDITED) {
+    eventSource.on(event_types.CHARACTER_EDITED, () => {
+      refreshCharacterPanel().catch(() => {});
+    });
+  }
+  if (event_types.CHARACTER_PAGE_LOADED) {
+    eventSource.on(event_types.CHARACTER_PAGE_LOADED, () => {
+      refreshCharacterPanel().catch(() => {});
+    });
+  }
+
   // Load on init too if a chat is already open
   await loadChatSelector();
+  refreshCharacterPanel().catch(() => {});
 
   // ── Event hooks ────────────────────────────────────────────
 
@@ -623,5 +648,212 @@ async function saveCharacterChatSelection(characterName) {
     });
   } catch (err) {
     console.warn("[ChronicleDB] Failed to save character config:", err);
+  }
+}
+
+// ── Character memory panel (mounted in ST character card sidebar) ─
+
+async function mountCharacterPanel() {
+  // Rendered once at init; refreshCharacterPanel() repopulates it as the
+  // user switches characters.
+  if ($("#chronicle_char_panel_wrap").length > 0) return;
+
+  const html = await renderExtensionTemplateAsync(
+    `third-party/${EXT_NAME}`,
+    'character-panel',
+  );
+  const wrapped = $(html).attr("id", "chronicle_char_panel_wrap");
+
+  // Mount as a sibling *after* #form_create but still inside the character
+  // sidebar container (#rm_ch_create_block). Keeping it outside the form
+  // avoids polluting ST's character-save payload with our controls.
+  const form = document.getElementById("form_create");
+  const sidebar = document.getElementById("rm_ch_create_block");
+
+  if (form && form.parentElement) {
+    form.parentElement.insertBefore(wrapped[0], form.nextSibling);
+  } else if (sidebar) {
+    sidebar.appendChild(wrapped[0]);
+  } else {
+    // Fallback: mount under the global settings panel so users still
+    // get the panel even if ST's DOM shape changes.
+    $('#extensions_settings2').append(wrapped);
+    console.warn("[ChronicleDB] Character card DOM target not found, using fallback mount.");
+  }
+
+  $("#chronicle_char_panel_mode").on("change", async function () {
+    const name = getSelectedCharacterName();
+    if (!name) return;
+    const mode = $(this).val();
+    try {
+      await fetch(`${PLUGIN_BASE}/character-memory-config`, {
+        method: "POST",
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name, sessionMode: mode }),
+      });
+      if (typeof toastr !== "undefined") toastr.success(`Memory mode: ${mode}`);
+    } catch (err) {
+      if (typeof toastr !== "undefined") toastr.error(`Failed to save memory mode: ${err.message}`);
+    }
+  });
+
+  $("#chronicle_char_panel_clear").on("click", async () => {
+    const name = getSelectedCharacterName();
+    if (!name) {
+      if (typeof toastr !== "undefined") toastr.warning("No character selected.");
+      return;
+    }
+    const ok = window.confirm(`Clear ChronicleDB memories for "${name}"? Traits, relationships, and presence for this character will be deleted. Events themselves are kept.`);
+    if (!ok) return;
+    try {
+      const res = await fetch(`${PLUGIN_BASE}/character-clear-memories`, {
+        method: "POST",
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        const c = data.cleared || {};
+        const total = (c.traits || 0) + (c.feels_about || 0) + (c.participated_in || 0) + (c.present_at || 0) + (c.knows || 0);
+        if (typeof toastr !== "undefined") toastr.success(`Cleared ${total} rows for ${name}.`);
+        await refreshCharacterPanel();
+      } else {
+        if (typeof toastr !== "undefined") toastr.error(`Clear failed: ${data.error || res.status}`);
+      }
+    } catch (err) {
+      if (typeof toastr !== "undefined") toastr.error(`Clear failed: ${err.message}`);
+    }
+  });
+
+  $(document).on("click", "#chronicle_char_panel_events .chronicle-char-event-summary", function () {
+    $(this).closest(".chronicle-char-event").toggleClass("expanded");
+  });
+}
+
+function getSelectedCharacterName() {
+  try {
+    const ctx = getContext();
+    return ctx?.name2 || "";
+  } catch {
+    return "";
+  }
+}
+
+function sentimentLabel(sentiment) {
+  const s = Number(sentiment) || 0;
+  if (s >= 0.6) return { text: "very positive", klass: "chronicle-sentiment-positive" };
+  if (s >= 0.2) return { text: "positive", klass: "chronicle-sentiment-positive" };
+  if (s > -0.2) return { text: "neutral", klass: "chronicle-sentiment-neutral" };
+  if (s > -0.6) return { text: "negative", klass: "chronicle-sentiment-negative" };
+  return { text: "very negative", klass: "chronicle-sentiment-negative" };
+}
+
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function refreshCharacterPanel() {
+  if ($("#chronicle_char_panel_wrap").length === 0) return;
+
+  const name = getSelectedCharacterName();
+  const nameEl = $("#chronicle_char_panel_name");
+  const statsEl = $("#chronicle_char_panel_stats");
+  const eventsEl = $("#chronicle_char_panel_events");
+  const relsEl = $("#chronicle_char_panel_rels");
+  const modeEl = $("#chronicle_char_panel_mode");
+
+  if (!name) {
+    nameEl.text("no character selected");
+    statsEl.html('<span class="chronicle-hint">Select a character to see their memory.</span>');
+    eventsEl.html('<span class="chronicle-hint">—</span>');
+    relsEl.html('<span class="chronicle-hint">—</span>');
+    return;
+  }
+
+  nameEl.text(name);
+  statsEl.html('<span class="chronicle-hint">Loading…</span>');
+  eventsEl.html('<span class="chronicle-hint">Loading…</span>');
+  relsEl.html('<span class="chronicle-hint">Loading…</span>');
+
+  const encodedName = encodeURIComponent(name);
+  try {
+    const [statsRes, eventsRes, relsRes, configRes] = await Promise.all([
+      fetch(`${PLUGIN_BASE}/character-stats?name=${encodedName}`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/character-recent-events?name=${encodedName}&limit=5`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/character-relationships?name=${encodedName}`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/character-memory-config?name=${encodedName}`, { headers: getRequestHeaders() }),
+    ]);
+
+    if (statsRes.ok) {
+      const s = await statsRes.json();
+      const lastSeen = s.lastSeenTurn == null ? "never" : `turn ${s.lastSeenTurn}`;
+      statsEl.html(
+        `<b>${s.events}</b> events &middot; <b>${s.traits}</b> traits &middot; <b>${s.relationships}</b> relationships &middot; last seen ${lastSeen}`,
+      );
+    } else {
+      statsEl.html('<span class="chronicle-hint">Could not load stats.</span>');
+    }
+
+    if (configRes.ok) {
+      const cfg = await configRes.json();
+      modeEl.val(cfg.sessionMode || "persistent");
+    }
+
+    if (eventsRes.ok) {
+      const events = await eventsRes.json();
+      if (events.length === 0) {
+        eventsEl.html('<span class="chronicle-hint">No memories yet for this character.</span>');
+      } else {
+        let html = "";
+        for (const ev of events) {
+          const turn = ev.messageIndex == null ? "?" : ev.messageIndex;
+          const quote = ev.sourceText ? escapeHtml(ev.sourceText) : "";
+          const hasQuote = quote.length > 0;
+          html += `
+            <div class="chronicle-char-event">
+              <div class="chronicle-char-event-summary" ${hasQuote ? 'title="Click to show source"' : ''}>
+                <span class="chronicle-char-turn">[turn ${escapeHtml(turn)}]</span>
+                ${escapeHtml(ev.summary)}
+              </div>
+              ${hasQuote ? `<div class="chronicle-char-event-quote">${quote}</div>` : ""}
+            </div>`;
+        }
+        eventsEl.html(html);
+      }
+    } else {
+      eventsEl.html('<span class="chronicle-hint">Could not load memories.</span>');
+    }
+
+    if (relsRes.ok) {
+      const rels = await relsRes.json();
+      if (rels.length === 0) {
+        relsEl.html('<span class="chronicle-hint">No relationships yet.</span>');
+      } else {
+        let html = "";
+        for (const r of rels) {
+          const lbl = sentimentLabel(r.sentiment);
+          const pct = Math.round(Math.abs(Number(r.intensity) || 0) * 100);
+          const desc = r.description ? ` &mdash; ${escapeHtml(r.description)}` : "";
+          html += `
+            <div class="chronicle-char-rel">
+              ${escapeHtml(name)} &rarr; <span class="chronicle-char-rel-target">${escapeHtml(r.toName)}</span>:
+              <span class="${lbl.klass}">${lbl.text}</span> (${pct}%)${desc}
+            </div>`;
+        }
+        relsEl.html(html);
+      }
+    } else {
+      relsEl.html('<span class="chronicle-hint">Could not load relationships.</span>');
+    }
+  } catch (err) {
+    console.warn("[ChronicleDB] Character panel fetch error:", err);
+    statsEl.html('<span class="chronicle-hint">Error loading memory.</span>');
+    eventsEl.html('');
+    relsEl.html('');
   }
 }

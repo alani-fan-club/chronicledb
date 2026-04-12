@@ -111,7 +111,14 @@
 
       <!-- Behavior -->
       <h4>Behavior</h4>
-      <p class="chronicle-hint">How much story history to include, and how often to update memory.</p>
+      <p class="chronicle-hint">How memory gets built while you chat.</p>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_autoIngest">
+          <input type="checkbox" id="chronicle_autoIngest">
+          <span>Auto-build memory on new chats</span>
+        </label>
+        <p class="chronicle-hint">When on, every reply automatically updates memory for the current chat — no manual ingest needed. Turn off if you only want memory from chats you explicitly ingest.</p>
+      </div>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
           <label for="chronicle_extractEveryN">Update memory every N replies:</label>

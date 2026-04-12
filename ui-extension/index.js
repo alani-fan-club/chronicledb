@@ -37,6 +37,10 @@ const DEFAULT_SETTINGS = {
   geminiEmbeddingModel: "",
   geminiEmbeddingDimension: 768,
   extractEveryN: 1,
+  // When true, extraction fires automatically after every generation so
+  // memory builds live as you chat. When false, only the manual "Ingest"
+  // buttons in the chat selector write to memory.
+  autoIngest: true,
   maxInjectionTokens: 3000,
   enableRelationships: true,
   enableEvents: true,
@@ -94,6 +98,11 @@ let isExtracting = false;
   eventSource.on(event_types.CHAT_CHANGED, async () => {
     if (!settings.enabled) return;
     await loadChatSelector();
+    // Visible confirmation that memory building is live for the new chat.
+    // One-shot toast so it's not spammy.
+    if (settings.autoIngest && settings.sessionMode !== "readonly" && typeof toastr !== "undefined") {
+      toastr.info("ChronicleDB: building memory as you chat", "", { timeOut: 2500 });
+    }
   });
 
   // Load on init too if a chat is already open
@@ -104,6 +113,7 @@ let isExtracting = false;
   // After AI generates a response → extract memories (async)
   eventSource.on(event_types.GENERATION_ENDED, async () => {
     if (!settings.enabled) return;
+    if (!settings.autoIngest) return;
     if (settings.sessionMode === "readonly") return;
 
     messageCounter++;
@@ -266,6 +276,12 @@ function bindSettings(settings) {
   // Embedding dimension (numeric)
   $("#chronicle_geminiEmbeddingDimension").val(settings.geminiEmbeddingDimension).on("input", function () {
     settings.geminiEmbeddingDimension = parseInt($(this).val()) || 768;
+    saveAndSync(settings);
+  });
+
+  // Auto-ingest toggle — gates the GENERATION_ENDED extract hook
+  $("#chronicle_autoIngest").prop("checked", settings.autoIngest).on("change", function () {
+    settings.autoIngest = $(this).prop("checked");
     saveAndSync(settings);
   });
 

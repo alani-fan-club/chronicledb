@@ -448,16 +448,38 @@ async function init(router) {
 
           try {
 
-          // Ingest characters
+          // Ingest characters + traits
           for (const char of (extraction.characters || [])) {
-            await db.upsertCharacter(settings, { name: char.name, aliases: [], description: (char.new_facts || []).join("; "), firstSeen: chatId });
+            const description = (char.traits || []).map((t) => t.content).join("; ");
+            await db.upsertCharacter(settings, { name: char.name, aliases: [], description, firstSeen: chatId });
+            const charId = db.slugify(char.name);
+
             if (char.role || char.status || char.significance) {
               const p = db.getPool(settings);
               await p.query(`UPDATE characters SET role = COALESCE(NULLIF($2,''),role), status = COALESCE(NULLIF($3,''),status), significance = GREATEST(significance,$4) WHERE id = $1`,
-                [db.slugify(char.name), char.role || "", char.status || "", char.significance || 3]);
+                [charId, char.role || "", char.status || "", char.significance || 3]);
             }
+
+            // Traits: innate properties (personality, skills, background, etc.)
+            for (const trait of (char.traits || [])) {
+              if (trait.content) {
+                await db.upsertTrait(settings, {
+                  characterId: charId,
+                  category: trait.category || "personality",
+                  content: trait.content,
+                  sourceChat: chatId,
+                });
+              }
+            }
+
+            // Legacy: handle old-style new_facts field if present (fallback)
             for (const fact of (char.new_facts || [])) {
-              await db.upsertFact(settings, { content: fact, domain: "character", confidence: 0.8, characterScope: [char.name] });
+              await db.upsertTrait(settings, {
+                characterId: charId,
+                category: "personality",
+                content: fact,
+                sourceChat: chatId,
+              });
             }
           }
 

@@ -149,6 +149,34 @@ async function upsertWorldState(settings, { key, value, reason }) {
   );
 }
 
+// ── Character traits ───────────────────────────────────────────
+
+async function upsertTrait(settings, { characterId, category, content, sourceChat }) {
+  const p = getPool(settings);
+  // Dedupe: check if same content exists for same character+category
+  const { rows: existing } = await p.query(
+    `SELECT id FROM traits WHERE character_id = $1 AND category = $2 AND content = $3`,
+    [characterId, category, content],
+  );
+  if (existing.length > 0) return existing[0].id;
+
+  const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  await p.query(
+    `INSERT INTO traits (id, character_id, category, content, source_chat) VALUES ($1, $2, $3, $4, $5)`,
+    [id, characterId, category || "personality", content, sourceChat || ""],
+  );
+  return id;
+}
+
+async function getTraitsForCharacter(settings, characterId) {
+  const p = getPool(settings);
+  const { rows } = await p.query(
+    `SELECT category, content FROM traits WHERE character_id = $1 ORDER BY category`,
+    [characterId],
+  );
+  return rows;
+}
+
 // ── Story arcs and event chains ────────────────────────────────
 
 async function upsertStoryArc(settings, { chatId, title, description, arcType, status, importance, startMsgIdx, endMsgIdx, spineEventId }) {
@@ -802,6 +830,7 @@ async function closePool() {
 module.exports = {
   getPool, initSchema, slugify,
   upsertCharacter, upsertLocation, upsertRelationship, insertEvent, upsertFact, upsertWorldState,
+  upsertTrait, getTraitsForCharacter,
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads,
   upsertStoryArc, linkEventToArc, createEventChain,

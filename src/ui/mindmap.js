@@ -15,27 +15,21 @@ const fetchOpts = { credentials: "include" };
 const COLORS = {
   bg: "#181818",
 
-  // Signal
-  accent:      "#FF5841",   // shift5 coral — PC, arcs, causal
+  // Signal — coral reserved for arcs and causal chains
+  accent:      "#FF5841",
   accentHover: "#ff7057",
   accentDim:   "rgba(255, 88, 65, 0.2)",
 
-  // 4-tier neutral scale — replaces the 7-color hue system
-  tier1: "#f0f0f0",         // primary:   characters, major events
-  tier2: "#b8b8b8",         // secondary: events, locations
-  tier3: "#6a6a6a",         // tertiary:  items, plot threads
-  tier4: "#3a3a3a",         // muted:     facts, scenes
-
-  // Legacy keys (kept as aliases so any old code paths still resolve)
-  character:  "#f0f0f0",
-  location:   "#8a8a8a",
-  item:       "#6a6a6a",
-  event:      "#b8b8b8",
-  eventMajor: "#FF5841",
-  fact:       "#3a3a3a",
-  scene:      "#3a3a3a",
-  plot_thread:"#6a6a6a",
-  story_arc:  "#FF5841",
+  // Color-coded types — muted but distinguishable
+  character:  "#e8e8e8",   // bright white — characters are the stars
+  event:      "#d4a574",   // warm amber — narrative beats
+  eventMajor: "#FF5841",   // coral — major beats
+  location:   "#7d9a82",   // muted sage — places
+  item:       "#a88b6a",   // muted tan — objects
+  plot_thread:"#c77d5c",   // dusty terracotta — unresolved threads
+  story_arc:  "#FF5841",   // coral — narrative containers
+  fact:       "#555",      // dim grey — facts
+  trait:      "#7a8aa5",   // dusty blue — traits (innate)
 
   // Status
   positive: "#6ac47a",
@@ -56,7 +50,17 @@ const COLORS = {
 let cy = null;
 let allData = { nodes: [], edges: [] };
 let activeCharacter = null;
-let activeEdgeTypes = new Set(["FEELS_ABOUT", "KNOWS", "LOCATED_AT"]);
+let activeEdgeTypes = new Set([
+  "FEELS_ABOUT",
+  "KNOWS",
+  "PARTICIPATED_IN",
+  "OCCURRED_AT",
+  "OWNS",
+  "LOCATED_AT",
+  "INVOLVED_IN",
+  "CONTAINS_EVENT",
+  "CAUSED",
+]);
 
 // Register fCoSE layout if available
 if (typeof cytoscape !== "undefined" && typeof cytoscapeFcose !== "undefined") {
@@ -102,68 +106,73 @@ function initCytoscape() {
         },
       },
 
-      // ──────────────────────────────────────────────────────
-      // TIER 4 (deepest dim) — facts
-      // ──────────────────────────────────────────────────────
+      // ── Facts (tiny grey dots) ─────────────────────────────
       {
         selector: "node[type='fact']",
         style: {
-          "background-color": COLORS.tier4,
-          "background-opacity": 0.7,
-          shape: "rectangle",
+          "background-color": COLORS.fact,
+          "background-opacity": 0.6,
+          shape: "ellipse",
         },
       },
 
-      // ──────────────────────────────────────────────────────
-      // TIER 3 (tertiary) — items, plot threads, scenes
-      // Differentiated by SHAPE, not color
-      // ──────────────────────────────────────────────────────
+      // ── Items (tan hexagons) ───────────────────────────────
       {
         selector: "node[type='item']",
         style: {
-          "background-color": COLORS.tier3,
-          "background-opacity": 0.85,
+          "background-color": COLORS.item,
+          "background-opacity": 0.9,
           shape: "hexagon",
         },
       },
+
+      // ── Plot threads (terracotta diamonds) ─────────────────
       {
         selector: "node[type='plot_thread']",
         style: {
-          "background-color": COLORS.tier3,
-          "background-opacity": 0.85,
+          "background-color": COLORS.plot_thread,
+          "background-opacity": 0.9,
           shape: "diamond",
         },
       },
 
-      // ──────────────────────────────────────────────────────
-      // TIER 2 (secondary) — locations, standard events
-      // ──────────────────────────────────────────────────────
+      // ── Locations (sage round rects) ───────────────────────
       {
         selector: "node[type='location']",
         style: {
-          "background-color": COLORS.tier2,
+          "background-color": COLORS.location,
           "background-opacity": 0.9,
           shape: "round-rectangle",
         },
       },
+
+      // ── Events (amber rectangles) — minor by default ─────
       {
         selector: "node[type='event']",
         style: {
-          "background-color": COLORS.tier2,
-          "background-opacity": 0.9,
-          shape: "rectangle",
-          "border-width": 1,
-          "border-color": COLORS.edgeBright,
+          "background-color": COLORS.event,
+          "background-opacity": 0.85,
+          shape: "round-rectangle",
         },
       },
 
-      // ──────────────────────────────────────────────────────
-      // TIER 1 (primary) — characters
-      // ──────────────────────────────────────────────────────
+      // ── MAJOR events (coral, highlighted) ──────────────────
+      {
+        selector: "node[type='event'][significance >= 4]",
+        style: {
+          "background-color": COLORS.eventMajor,
+          "background-opacity": 1,
+          shape: "round-rectangle",
+          "border-width": 1,
+          "border-color": COLORS.accentHover,
+        },
+      },
+
+      // ── Characters (white ellipses with avatars) ───────────
       {
         selector: "node[type='character']",
         style: {
-          "background-color": COLORS.tier1,
+          "background-color": COLORS.character,
           "background-opacity": 1,
           "background-image": "data(avatarUrl)",
           "background-fit": "cover",
@@ -174,20 +183,7 @@ function initCytoscape() {
         },
       },
 
-      // ──────────────────────────────────────────────────────
-      // ACCENT — major events, story arcs, PCs
-      // Coral reserved for the things that matter most
-      // ──────────────────────────────────────────────────────
-      {
-        selector: "node[type='event'][significance >= 4]",
-        style: {
-          "background-color": COLORS.tier1,
-          "background-opacity": 1,
-          "border-width": 2,
-          "border-color": COLORS.accent,
-          shape: "rectangle",
-        },
-      },
+      // ── Story arcs (coral outlined rectangles) ─────────────
       {
         selector: "node[type='story_arc']",
         style: {
@@ -200,6 +196,8 @@ function initCytoscape() {
           "text-outline-color": COLORS.bg,
         },
       },
+
+      // ── Player character (coral ring) ──────────────────────
       {
         selector: "node[?isPC]",
         style: {
@@ -412,20 +410,25 @@ function renderGraph(data) {
     const isArc = node.type === "story_arc";
     const significance = node.metadata?.significance || node.metadata?.importance || 3;
 
-    // Size calculation varies by node type:
-    // - Characters: log(connections)
-    // - Events: scale by significance (1-5 → 10-35)
-    // - Story arcs: scale by importance + anchored events (20-60)
-    // - Everything else: small dots
+    // Obsidian-style compact sizing — most nodes are small dots
     let size;
     if (isArc) {
-      size = Math.min(60, 25 + (significance - 3) * 8 + Math.log(degree + 1) * 4);
+      // Arcs: the hero nodes. 20-32.
+      size = Math.min(32, 18 + (significance - 3) * 3 + Math.log(degree + 1) * 2);
     } else if (isEvent) {
-      size = Math.min(36, 10 + significance * 5);
+      if (significance >= 4) {
+        // Major events: noticeably larger. 14-20.
+        size = 14 + (significance - 4) * 6;
+      } else {
+        // Minor events: small dots. 5-9.
+        size = 5 + significance * 1;
+      }
     } else if (isCharacter) {
-      size = Math.min(48, 12 + Math.log(degree + 1) * 8);
+      // Characters scale gently with connection count. 14-24.
+      size = Math.min(24, 14 + Math.log(degree + 1) * 2);
     } else {
-      size = Math.min(30, 8 + Math.log(degree + 1) * 6);
+      // Everything else: tiny dots. 4-8.
+      size = Math.min(8, 4 + Math.log(degree + 1) * 1.2);
     }
 
     // Labels: characters and story arcs always visible; events visible for significance >= 4
@@ -707,12 +710,14 @@ function applyCharacterFilter() {
 function initEdgeChips() {
   document.querySelectorAll(".chip[data-edge]").forEach((chip) => {
     chip.addEventListener("click", () => {
-      const type = chip.dataset.edge;
-      if (activeEdgeTypes.has(type)) {
-        activeEdgeTypes.delete(type);
+      // data-edge can be comma-separated (e.g., "PARTICIPATED_IN,OCCURRED_AT")
+      const types = chip.dataset.edge.split(",").map((t) => t.trim());
+      const isActive = chip.classList.contains("active");
+      if (isActive) {
+        types.forEach((t) => activeEdgeTypes.delete(t));
         chip.classList.remove("active");
       } else {
-        activeEdgeTypes.add(type);
+        types.forEach((t) => activeEdgeTypes.add(t));
         chip.classList.add("active");
       }
       applyEdgeFilter();

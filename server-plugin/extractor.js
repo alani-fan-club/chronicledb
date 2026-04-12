@@ -8,14 +8,17 @@ const EXTRACTION_PROMPT = `You are a narrative analyst for a roleplay memory sys
 Each message has a speaker and content. Some are from the user (player), others from AI characters or narrators.
 
 Extract:
-1. **Characters** — named characters present or mentioned
+1. **Characters** — named characters present or mentioned. For each character, also extract:
+   - **Traits** — innate properties (distinct from knowledge). Categories: personality ("cynical", "protective"), skill ("trained fighter", "speaks French"), background ("born in Tokyo", "grew up poor"), physical ("6ft tall", "scar on cheek"), faction ("Faction Family member")
+   - Traits are who the character IS. Knowledge is what they LEARNED during the RP.
 2. **Relationships** — how characters feel about each other (sentiment -1.0 to 1.0, intensity 0-1, evidence)
-3. **Events** — things that happened, with significance:
-   - 5 = defining moment (major plot beat, character revelation, death, transformation)
-   - 4 = important development (confrontation, decision, significant reveal)
-   - 3 = meaningful action (argument, bonding moment, notable action)
-   - 2 = minor beat (small gesture, casual dialogue with impact)
-   - 1 = flavor detail (background action, mundane interaction)
+3. **Events** — things that happened, with significance. CRITICAL: major events (4-5) are the load-bearing plot beats — only mark something major if it would appear in a summary of the whole chapter:
+   - 5 = defining moment (major plot beat, character revelation, death, transformation, confession, betrayal)
+   - 4 = important development (confrontation, decision, significant reveal, first meeting, turning point)
+   - 3 = meaningful action (argument, bonding moment, notable action with consequences)
+   - 2 = minor beat (small gesture, casual dialogue with some weight)
+   - 1 = flavor detail (background action, mundane interaction, transitional scene)
+   Be strict about 4-5. In a typical batch you'll have 1-3 major events at most, many minor ones.
 4. **Event chains** — when one event directly causes, triggers, or leads to another. Think causally: "X caused Y", "Because of A, B happened". Only chain events that have a clear causal link.
 5. **Story arcs** — identify narrative arcs like in manga/anime. An arc is a set of connected events that form a coherent story beat. Examples: "The Betrayal Arc", "First Meeting Arc", "Confession Arc", "Training Arc". Each arc has a defining "spine" event (the most important one) and flavor events around it.
 6. **World state** — environmental/setting changes (key-value)
@@ -31,7 +34,15 @@ RULES:
 
 Return ONLY valid JSON:
 {
-  "characters": [{ "name": "", "new_facts": [], "role": "protagonist/antagonist/ally/npc/mentor/etc", "status": "active/injured/missing/dead/etc", "significance": 3 }],
+  "characters": [{
+    "name": "",
+    "traits": [
+      { "category": "personality | skill | background | physical | faction", "content": "" }
+    ],
+    "role": "protagonist/antagonist/ally/npc/mentor/etc",
+    "status": "active/injured/missing/dead/etc",
+    "significance": 3
+  }],
   "relationships": [{ "from": "", "to": "", "sentiment": -1.0, "intensity": 0.5, "description": "Rich 2-3 sentence description of the relationship dynamics, emotional undercurrents, and recent developments" }],
   "events": [{ "event_key": "unique_short_key_like_first_meeting", "summary": "", "participants": [], "location": "", "significance": 3 }],
   "event_chains": [{ "from": "event_key", "to": "event_key", "chain_type": "caused | triggered | led_to | followed_by", "description": "" }],

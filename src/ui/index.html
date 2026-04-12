@@ -61,20 +61,26 @@
 
         <div class="topbar-right">
           <div id="edge-chips" class="edge-chips">
-            <button class="chip active" data-edge="FEELS_ABOUT">
+            <button class="chip active" data-edge="FEELS_ABOUT" title="Character relationships">
               <span class="chip-dot" style="background:#FF5841"></span>Relations
             </button>
-            <button class="chip active" data-edge="KNOWS">
-              <span class="chip-dot" style="background:#b8b8b8"></span>Knowledge
+            <button class="chip active" data-edge="KNOWS" title="Character knowledge of facts">
+              <span class="chip-dot" style="background:#555"></span>Knowledge
             </button>
-            <button class="chip active" data-edge="LOCATED_AT">
-              <span class="chip-dot" style="background:#6ac47a"></span>Locations
+            <button class="chip active" data-edge="PARTICIPATED_IN,OCCURRED_AT" title="Events and where they happened">
+              <span class="chip-dot" style="background:#d4a574"></span>Events
             </button>
-            <button class="chip" data-edge="PARTICIPATED_IN">
-              <span class="chip-dot" style="background:#f5f5f5"></span>Events
+            <button class="chip active" data-edge="OWNS,LOCATED_AT" title="Items and their owners/locations">
+              <span class="chip-dot" style="background:#a88b6a"></span>Items
             </button>
-            <button class="chip" data-edge="WITNESSED">
-              <span class="chip-dot" style="background:#6a6a6a"></span>Witnesses
+            <button class="chip active" data-edge="INVOLVED_IN" title="Plot threads (foreshadowing, pending)">
+              <span class="chip-dot" style="background:#c77d5c"></span>Plots
+            </button>
+            <button class="chip active" data-edge="CONTAINS_EVENT" title="Story arcs containing events">
+              <span class="chip-dot" style="background:#FF5841"></span>Arcs
+            </button>
+            <button class="chip active" data-edge="CAUSED" title="Causal chains between events">
+              <span class="chip-dot" style="background:#ff7057"></span>Chains
             </button>
           </div>
 

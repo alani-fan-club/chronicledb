@@ -179,6 +179,21 @@ CREATE INDEX IF NOT EXISTS idx_arc_events_arc ON arc_events (arc_id);
 CREATE INDEX IF NOT EXISTS idx_event_chains_from ON event_chains (from_event_id);
 CREATE INDEX IF NOT EXISTS idx_event_chains_to ON event_chains (to_event_id);
 
+-- ── Character traits (innate properties, distinct from knows) ─
+
+CREATE TABLE IF NOT EXISTS traits (
+    id           TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    category     TEXT DEFAULT 'personality',
+    content      TEXT NOT NULL,
+    confidence   REAL DEFAULT 0.8,
+    source_chat  TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
+CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);
+
 -- ── Items (key objects with owners, powers, significance) ──────
 
 CREATE TABLE IF NOT EXISTS items (

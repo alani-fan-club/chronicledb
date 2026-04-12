@@ -53,7 +53,7 @@ jQuery(async () => {
   const settings = extension_settings[EXT_NAME];
 
   // Load settings panel HTML
-  const settingsHtml = await $.get(`${EXT_NAME}/settings.html`);
+  const settingsHtml = await $.get(`scripts/extensions/third-party/${EXT_NAME}/settings.html`);
   $("#extensions_settings2").append(settingsHtml);
 
   // Bind settings inputs

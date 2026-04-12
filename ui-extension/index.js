@@ -28,7 +28,9 @@ const DEFAULT_SETTINGS = {
   pgPassword: "",
   ollamaEndpoint: "http://localhost:11434/v1",
   extractionModel: "qwen3:8b",
-  embeddingModel: "nomic-embed-text",
+  geminiApiKey: "",
+  geminiEmbeddingModel: "gemini-embedding-2-preview",
+  geminiEmbeddingDimension: 768,
   extractEveryN: 1,          // extract after every N messages
   maxInjectionTokens: 1500,
   enableRelationships: true,
@@ -205,12 +207,18 @@ function bindSettings(settings) {
   }
 
   // LLM settings
-  for (const field of ["ollamaEndpoint", "extractionModel", "embeddingModel"]) {
+  for (const field of ["ollamaEndpoint", "extractionModel", "geminiApiKey", "geminiEmbeddingModel"]) {
     $(`#chronicle_${field}`).val(settings[field]).on("input", function () {
       settings[field] = $(this).val();
       saveAndSync(settings);
     });
   }
+
+  // Gemini dimension (numeric)
+  $("#chronicle_geminiEmbeddingDimension").val(settings.geminiEmbeddingDimension).on("input", function () {
+    settings.geminiEmbeddingDimension = parseInt($(this).val()) || 768;
+    saveAndSync(settings);
+  });
 
   // Numeric settings
   $("#chronicle_extractEveryN").val(settings.extractEveryN).on("input", function () {

@@ -18,9 +18,15 @@ export interface ChronicleConfig {
   extraction: {
     endpoint: string;
     model: string;
-    embeddingModel: string;
     batchSize: number;
     debounceMs: number;
+  };
+  embedding: {
+    provider: "gemini";
+    apiKey: string;
+    model: string;
+    dimension: number;
+    taskType?: string;
   };
   sessions: {
     defaultMode: SessionMode;

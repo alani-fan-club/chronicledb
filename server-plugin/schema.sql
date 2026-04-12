@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     node_type       TEXT NOT NULL,
     node_id         TEXT NOT NULL,
     content         TEXT NOT NULL,
-    embedding       vector(384) NOT NULL,
+    embedding       vector(768) NOT NULL,  -- gemini-embedding-2-preview @ dim=768
     character_scope TEXT[] DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     message_index   INT

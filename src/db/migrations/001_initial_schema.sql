@@ -41,7 +41,7 @@ SELECT create_elabel('chronicle', 'RELATES_TO');
 CREATE TABLE IF NOT EXISTS narrative_chunks (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     text          TEXT NOT NULL,
-    embedding     vector(768),  -- nomic-embed-text dimension
+    embedding     vector(768),  -- gemini-embedding-2-preview @ outputDimensionality=768
     scene_id      TEXT NOT NULL,
     character_ids TEXT[] NOT NULL DEFAULT '{}',
     character_scope TEXT[] NOT NULL DEFAULT '{}', -- which characters "know" this chunk

@@ -66,14 +66,24 @@
         <label for="chronicle_ollamaEndpoint">Ollama Endpoint:</label>
         <input type="text" id="chronicle_ollamaEndpoint" class="text_pole" placeholder="http://localhost:11434/v1">
       </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_extractionModel">Extraction Model (Ollama):</label>
+        <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="qwen3:8b">
+      </div>
+
+      <h4>Gemini Embeddings</h4>
+      <div class="chronicle-setting">
+        <label for="chronicle_geminiApiKey">Gemini API Key:</label>
+        <input type="password" id="chronicle_geminiApiKey" class="text_pole" placeholder="">
+      </div>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_extractionModel">Extraction Model:</label>
-          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="qwen3:8b">
+          <label for="chronicle_geminiEmbeddingModel">Embedding Model:</label>
+          <input type="text" id="chronicle_geminiEmbeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview">
         </div>
         <div class="chronicle-setting">
-          <label for="chronicle_embeddingModel">Embedding Model:</label>
-          <input type="text" id="chronicle_embeddingModel" class="text_pole" placeholder="nomic-embed-text">
+          <label for="chronicle_geminiEmbeddingDimension">Dimension:</label>
+          <input type="number" id="chronicle_geminiEmbeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
         </div>
       </div>
 

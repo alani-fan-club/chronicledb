@@ -7,7 +7,6 @@ import { parseExtractionResponse, type ExtractionOutput } from "./parser.js";
 import { getActiveMessageText } from "../backfill/chat-parser.js";
 
 let llmClient: OpenAI | null = null;
-let embeddingClient: OpenAI | null = null;
 
 function getLLMClient(config: ChronicleConfig): OpenAI {
   if (!llmClient) {
@@ -19,16 +18,7 @@ function getLLMClient(config: ChronicleConfig): OpenAI {
   return llmClient;
 }
 
-function getEmbeddingClient(config: ChronicleConfig): OpenAI {
-  if (!embeddingClient) {
-    // Ollama serves embeddings on the same endpoint
-    embeddingClient = new OpenAI({
-      baseURL: config.extraction.endpoint,
-      apiKey: "not-needed",
-    });
-  }
-  return embeddingClient;
-}
+const GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /**
  * Extract structured memory data from a batch of RP messages.
@@ -84,20 +74,35 @@ export async function extractFromMessages(
 }
 
 /**
- * Generate an embedding vector for a text chunk.
+ * Generate an embedding vector via Gemini Embedding API.
  */
 export async function embed(
   config: ChronicleConfig,
   text: string,
 ): Promise<number[]> {
-  const client = getEmbeddingClient(config);
+  const emb = config.embedding;
+  const url = `${GEMINI_EMBED_URL}/${emb.model}:embedContent`;
 
-  const response = await client.embeddings.create({
-    model: config.extraction.embeddingModel,
-    input: text,
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": emb.apiKey,
+    },
+    body: JSON.stringify({
+      content: { parts: [{ text }] },
+      taskType: emb.taskType ?? "SEMANTIC_SIMILARITY",
+      outputDimensionality: emb.dimension ?? 768,
+    }),
   });
 
-  return response.data[0].embedding;
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Gemini embed error ${res.status}: ${body}`);
+  }
+
+  const data = await res.json();
+  return data.embedding.values;
 }
 
 /**

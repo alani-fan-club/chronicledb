@@ -89,19 +89,33 @@ function parseResponse(raw) {
   throw new Error("Could not parse extraction response");
 }
 
-async function embed(settings, text) {
-  const endpoint = settings.ollamaEndpoint || "http://localhost:11434/v1";
-  const model = settings.embeddingModel || "nomic-embed-text";
+const GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models";
 
-  const res = await fetch(`${endpoint}/embeddings`, {
+async function embed(settings, text) {
+  const model = settings.geminiEmbeddingModel || "gemini-embedding-2-preview";
+  const apiKey = settings.geminiApiKey || "";
+  const dimension = settings.geminiEmbeddingDimension || 768;
+
+  const res = await fetch(`${GEMINI_EMBED_URL}/${model}:embedContent`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, input: text }),
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+    body: JSON.stringify({
+      content: { parts: [{ text }] },
+      taskType: "SEMANTIC_SIMILARITY",
+      outputDimensionality: dimension,
+    }),
   });
 
-  if (!res.ok) throw new Error(`Embedding error: ${res.status}`);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Gemini embed error ${res.status}: ${body}`);
+  }
+
   const data = await res.json();
-  return data.data[0].embedding;
+  return data.embedding.values;
 }
 
 module.exports = { extract, embed };

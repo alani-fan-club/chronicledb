@@ -568,6 +568,45 @@ async function init(router) {
     }
   });
 
+  // ── Character cards (all ST character PNGs) ──────────────────
+
+  router.get("/character-cards", async (req, res) => {
+    try {
+      const { readdirSync } = require("fs");
+      const { resolve } = require("path");
+      const dataRoot = settings.stDataRoot || "";
+      const charsDir = resolve(dataRoot, "characters");
+      const files = readdirSync(charsDir)
+        .filter((f) => f.endsWith(".png"))
+        .sort()
+        .map((f) => ({
+          filename: f,
+          name: f.replace(".png", ""),
+          // Card PNG served by ST at this path
+          imagePath: `/characters/${encodeURIComponent(f)}`,
+        }));
+      res.json(files);
+    } catch (err) {
+      console.error("[ChronicleDB] Character cards error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Proxy character PNGs so the mind map page can access them
+  router.get("/character-image/:filename", async (req, res) => {
+    try {
+      const { resolve, join } = require("path");
+      const { createReadStream, existsSync } = require("fs");
+      const dataRoot = settings.stDataRoot || "";
+      const imgPath = join(resolve(dataRoot, "characters"), req.params.filename);
+      if (!existsSync(imgPath)) return res.status(404).send("Not found");
+      res.setHeader("Content-Type", "image/png");
+      createReadStream(imgPath).pipe(res);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Memory CRUD ──────────────────────────────────────────────
 
   router.get("/memories/:chatId", async (req, res) => {

@@ -69,6 +69,22 @@ let activeEdgeTypes = new Set([
   "CAUSED",
 ]);
 
+// Map of normalized character name -> actual ST avatar filename.
+// Populated from /character-cards; only names present here get an avatarUrl,
+// which eliminates 404 spam for DB characters with no matching ST card.
+let avatarFileByName = new Map();
+
+function normalizeCharName(s) {
+  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function avatarUrlFor(name) {
+  if (!name) return undefined;
+  const file = avatarFileByName.get(normalizeCharName(name));
+  if (!file) return undefined;
+  return `${API_BASE}/character-image/${encodeURIComponent(file)}`;
+}
+
 // Register fCoSE layout if available
 if (typeof cytoscape !== "undefined" && typeof cytoscapeFcose !== "undefined") {
   cytoscape.use(cytoscapeFcose);
@@ -180,12 +196,20 @@ function initCytoscape() {
         style: {
           "background-color": COLORS.character,
           "background-opacity": 1,
-          "background-image": "data(avatarUrl)",
           "background-fit": "cover",
           "background-clip": "node",
           shape: "ellipse",
           "border-width": 1,
           "border-color": COLORS.edgeBright,
+        },
+      },
+      // Only apply background-image when an avatarUrl actually exists;
+      // Cytoscape fetches the URL eagerly, so an undefined value would
+      // otherwise spam 404s for DB characters without matching ST cards.
+      {
+        selector: "node[type='character'][avatarUrl]",
+        style: {
+          "background-image": "data(avatarUrl)",
         },
       },
 
@@ -200,6 +224,37 @@ function initCytoscape() {
           "border-width": 2,
           "border-color": COLORS.accent,
           "text-outline-color": COLORS.bg,
+        },
+      },
+
+      // ── RP group (compound parent grouping nodes per chat_id) ─
+      // Visually subdued container that fCoSE uses to cluster an RP's
+      // characters, events, and arcs together so multi-RP graphs don't
+      // overlap.
+      {
+        selector: "node[type='rp_group']",
+        style: {
+          shape: "round-rectangle",
+          "background-color": "#222",
+          "background-opacity": 0.08,
+          "border-width": 1,
+          "border-color": COLORS.edgeBright,
+          "border-opacity": 0.5,
+          "border-style": "dashed",
+          label: "data(label)",
+          "text-valign": "top",
+          "text-halign": "center",
+          "text-margin-y": -4,
+          "font-size": "6px",
+          "font-weight": "500",
+          color: COLORS.textDim,
+          "text-outline-width": 2,
+          "text-outline-color": COLORS.bg,
+          padding: "18px",
+          "min-width": "40px",
+          "min-height": "40px",
+          "z-compound-depth": "bottom",
+          "events": "no",
         },
       },
 
@@ -293,7 +348,7 @@ function initCytoscape() {
           "border-width": 2,
           "border-color": COLORS.accent,
           "background-opacity": 1,
-          "font-size": "7px",
+          "font-size": "5px",
         },
       },
       {
@@ -302,7 +357,7 @@ function initCytoscape() {
           "border-width": 1,
           "border-color": COLORS.accent,
           "background-opacity": 1,
-          "font-size": "6px",
+          "font-size": "4px",
         },
       },
       {
@@ -323,7 +378,7 @@ function initCytoscape() {
           "border-width": 2,
           "border-color": COLORS.accent,
           "background-opacity": 1,
-          "font-size": "8px",
+          "font-size": "6px",
         },
       },
     ],
@@ -331,7 +386,11 @@ function initCytoscape() {
   });
 
   // Tap handlers
-  cy.on("tap", "node", (evt) => showDetailPanel(evt.target.data()));
+  cy.on("tap", "node", (evt) => {
+    const d = evt.target.data();
+    if (d.type === "rp_group") return;
+    showDetailPanel(d);
+  });
   cy.on("tap", "edge", (evt) => showEdgeDetail(evt.target.data()));
   cy.on("tap", (evt) => { if (evt.target === cy) hideDetailPanel(); });
 
@@ -349,26 +408,28 @@ function initCytoscape() {
     if (activeCharacter) applyCharacterFilter();
   });
 
-  // Progressive label reveal — important nodes first, then all
+  // Progressive label reveal — important nodes first, then all.
+  // Font sizes halved to track the smaller icons (Bug 3).
+  // RP group labels stay visible once zoomed in so an RP boundary is legible.
   cy.on("zoom", () => {
     const zoom = cy.zoom();
     const s = cy.style();
     if (zoom > 3.0) {
-      // Deep zoom: show all labels (tiny)
-      s.selector("node").style({ "font-size": "6px" }).update();
+      s.selector("node").style({ "font-size": "4px" }).update();
+      s.selector("node[type='rp_group']").style({ "font-size": "7px" }).update();
     } else if (zoom > 1.8) {
-      // Medium-close: characters + arcs + major events
       s.selector("node").style({ "font-size": "0px" }).update();
-      s.selector("node[type='character']").style({ "font-size": "6px" }).update();
-      s.selector("node[type='story_arc']").style({ "font-size": "7px" }).update();
-      s.selector("node[type='event'][significance >= 4]").style({ "font-size": "5px" }).update();
+      s.selector("node[type='character']").style({ "font-size": "4px" }).update();
+      s.selector("node[type='story_arc']").style({ "font-size": "5px" }).update();
+      s.selector("node[type='event'][significance >= 4]").style({ "font-size": "3px" }).update();
+      s.selector("node[type='rp_group']").style({ "font-size": "6px" }).update();
     } else if (zoom > 1.0) {
-      // Medium: only arcs and major characters
       s.selector("node").style({ "font-size": "0px" }).update();
-      s.selector("node[type='story_arc']").style({ "font-size": "6px" }).update();
+      s.selector("node[type='story_arc']").style({ "font-size": "4px" }).update();
+      s.selector("node[type='rp_group']").style({ "font-size": "6px" }).update();
     } else {
-      // Zoomed out: hide all labels
       s.selector("node").style({ "font-size": "0px" }).update();
+      s.selector("node[type='rp_group']").style({ "font-size": "5px" }).update();
     }
   });
 }
@@ -412,7 +473,68 @@ function renderGraph(data) {
     connectionCount.set(e.target, (connectionCount.get(e.target) || 0) + 1);
   }
 
+  // ── RP grouping ──────────────────────────────────────────────
+  // Characters have no chat_id of their own, so derive it from their
+  // connected events/arcs (which do). Events/arcs use their own chat_id.
+  // Compound parent nodes per chat_id let fCoSE cluster each RP together.
+  const nodeById = new Map(data.nodes.map((n) => [n.id, n]));
+  const charChatVotes = new Map(); // charId -> Map<chatId, count>
+
+  function voteChat(charId, chatId) {
+    if (!charId || !chatId) return;
+    if (!charChatVotes.has(charId)) charChatVotes.set(charId, new Map());
+    const tally = charChatVotes.get(charId);
+    tally.set(chatId, (tally.get(chatId) || 0) + 1);
+  }
+
+  for (const edge of validEdges) {
+    if (edge.type !== "PARTICIPATED_IN" && edge.type !== "INVOLVED_IN") continue;
+    const a = nodeById.get(edge.source);
+    const b = nodeById.get(edge.target);
+    if (!a || !b) continue;
+    if (a.type === "character") voteChat(a.id, b.metadata?.chat_id);
+    if (b.type === "character") voteChat(b.id, a.metadata?.chat_id);
+  }
+
+  const chatIdForChar = new Map();
+  for (const [cid, tally] of charChatVotes) {
+    let best = null;
+    let bestN = 0;
+    for (const [chat, n] of tally) {
+      if (n > bestN) { best = chat; bestN = n; }
+    }
+    if (best) chatIdForChar.set(cid, best);
+  }
+
+  function groupIdFor(node) {
+    if (node.type === "character") return chatIdForChar.get(node.id) || null;
+    if (node.type === "event" || node.type === "story_arc") {
+      return node.metadata?.chat_id || null;
+    }
+    return null;
+  }
+
+  const groupIdsUsed = new Set();
+  for (const n of data.nodes) {
+    const g = groupIdFor(n);
+    if (g) groupIdsUsed.add(g);
+  }
+
   const elements = [];
+
+  for (const gid of groupIdsUsed) {
+    const short = String(gid).split(/[\/\\ ]/).pop().slice(0, 48);
+    elements.push({
+      group: "nodes",
+      data: {
+        id: `rp:${gid}`,
+        label: short,
+        fullLabel: gid,
+        type: "rp_group",
+      },
+    });
+  }
+
   for (const node of data.nodes) {
     const degree = connectionCount.get(node.id) || 0;
     const isCharacter = node.type === "character";
@@ -420,25 +542,21 @@ function renderGraph(data) {
     const isArc = node.type === "story_arc";
     const significance = node.metadata?.significance || node.metadata?.importance || 3;
 
-    // Obsidian-style compact sizing — most nodes are small dots
+    // Compact sizing — roughly half of the pre-fix values to reduce
+    // the visual footprint of character icons (Bug 3).
     let size;
     if (isArc) {
-      // Arcs: the hero nodes. 20-32.
-      size = Math.min(32, 18 + (significance - 3) * 3 + Math.log(degree + 1) * 2);
+      size = Math.min(20, 12 + (significance - 3) * 2 + Math.log(degree + 1) * 1.2);
     } else if (isEvent) {
       if (significance >= 4) {
-        // Major events: noticeably larger. 14-20.
-        size = 14 + (significance - 4) * 6;
+        size = 9 + (significance - 4) * 4;
       } else {
-        // Minor events: small dots. 5-9.
-        size = 5 + significance * 1;
+        size = 4 + significance * 0.7;
       }
     } else if (isCharacter) {
-      // Characters scale gently with connection count. 14-24.
-      size = Math.min(24, 14 + Math.log(degree + 1) * 2);
+      size = Math.min(14, 8 + Math.log(degree + 1) * 1.2);
     } else {
-      // Everything else: tiny dots. 4-8.
-      size = Math.min(8, 4 + Math.log(degree + 1) * 1.2);
+      size = Math.min(6, 3 + Math.log(degree + 1) * 0.9);
     }
 
     // Labels: characters and story arcs always visible; events visible for significance >= 4
@@ -448,23 +566,23 @@ function renderGraph(data) {
     else if (isArc) canvasLabel = fullLabel;
     else if (isEvent && significance >= 4) canvasLabel = (fullLabel || "").slice(0, 30);
 
-    elements.push({
-      group: "nodes",
-      data: {
-        id: node.id,
-        label: canvasLabel,
-        fullLabel: fullLabel,
-        type: node.type,
-        size,
-        degree,
-        significance,
-        isPC: node.metadata?.is_player_character ?? false,
-        avatarUrl: isCharacter && fullLabel
-          ? `${API_BASE}/character-image/${encodeURIComponent(fullLabel)}.png`
-          : undefined,
-        ...node.metadata,
-      },
-    });
+    const gid = groupIdFor(node);
+
+    const nodeData = {
+      ...node.metadata,
+      id: node.id,
+      label: canvasLabel,
+      fullLabel: fullLabel,
+      type: node.type,
+      size,
+      degree,
+      significance,
+      isPC: node.metadata?.is_player_character ?? false,
+      avatarUrl: isCharacter ? avatarUrlFor(fullLabel) : undefined,
+    };
+    if (gid) nodeData.parent = `rp:${gid}`;
+
+    elements.push({ group: "nodes", data: nodeData });
   }
 
   for (const edge of validEdges) {
@@ -487,6 +605,8 @@ function renderGraph(data) {
 }
 
 function runLayout() {
+  // gravityCompound + gravityRangeCompound tuned so fCoSE pulls each
+  // rp_group's children tight and pushes different groups apart.
   const layoutConfig = cytoscape("layout", "fcose")
     ? {
         name: "fcose",
@@ -498,15 +618,15 @@ function runLayout() {
         idealEdgeLength: 80,
         edgeElasticity: 0.45,
         gravity: 0.35,
-        gravityRangeCompound: 1.5,
+        gravityCompound: 1.5,
+        gravityRangeCompound: 3.0,
         nestingFactor: 0.1,
         numIter: 2500,
         tile: true,
-        packComponents: true, // packs disconnected components neatly
+        packComponents: true,
         padding: 60,
       }
     : {
-        // Fallback to cose if fcose not loaded
         name: "cose",
         animate: true,
         animationDuration: 800,
@@ -546,8 +666,12 @@ async function showDetailPanel(data) {
 
   let html = "";
   if (data.type === "character") {
-    const avatarUrl = `${API_BASE}/character-image/${encodeURIComponent(title)}.png`;
-    html += `<div class="detail-avatar"><img src="${avatarUrl}" onerror="this.style.display='none'; this.parentElement.classList.add('no-img');"></div>`;
+    const avatarUrl = avatarUrlFor(title);
+    if (avatarUrl) {
+      html += `<div class="detail-avatar"><img src="${avatarUrl}" onerror="this.style.display='none'; this.parentElement.classList.add('no-img');"></div>`;
+    } else {
+      html += `<div class="detail-avatar no-img"></div>`;
+    }
   }
   html += `<h2>${escapeHtml(title)}</h2>`;
   html += `<div class="detail-type">${data.type || "node"}</div>`;
@@ -778,6 +902,12 @@ function renderCharacterSidebar(cards) {
   const container = document.getElementById("character-list");
   container.innerHTML = "";
 
+  // Rebuild the avatar filename lookup used by the graph and detail panel.
+  avatarFileByName = new Map();
+  for (const card of cards) {
+    avatarFileByName.set(normalizeCharName(card.name), card.filename);
+  }
+
   for (const card of cards) {
     const div = document.createElement("div");
     div.className = "char-card";
@@ -896,10 +1026,12 @@ function initToolbar() {
 
 // ── Init ────────────────────────────────────────────────────────
 
-(function bootstrap() {
+(async function bootstrap() {
   initCytoscape();
   initEdgeChips();
   initToolbar();
-  loadCharacterSidebar();
-  loadGraphData("global");
+  // Await sidebar load first so avatarFileByName is populated before the
+  // graph renders — otherwise the first layout fires off 404s.
+  await loadCharacterSidebar();
+  await loadGraphData("global");
 })();

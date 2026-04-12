@@ -398,7 +398,8 @@ async function loadChatSelector() {
           <span class="chronicle-chat-msgs">~${chat.messageEstimate} msgs</span>
           <span class="chronicle-chat-date">${dateLabel}</span>
           <button class="chronicle-ingest-btn menu_button menu_button_small"
-                  data-filename="${chat.filename}" data-character="${characterName}">Ingest</button>
+                  data-filename="${chat.filename}" data-character="${characterName}"
+                  data-msgs="${chat.messageEstimate}">Ingest</button>
         </div>`;
     }
 
@@ -416,8 +417,14 @@ async function loadChatSelector() {
       const btn = $(this);
       const filename = btn.data("filename");
       const charName = btn.data("character");
+      const estMsgs = btn.data("msgs") || "?";
+      const originalText = btn.text();
 
-      btn.prop("disabled", true).val("Ingesting...");
+      // Show progress in the status bar
+      const statusEl = $("#chronicle_ingestStatus");
+      btn.prop("disabled", true).text("Ingesting...").addClass("ingesting");
+      statusEl.html(`<span class="chronicle-ingesting-indicator">Ingesting <b>${filename}</b> (~${estMsgs} messages)... <span class="chronicle-spinner"></span></span>`);
+
       try {
         const res = await fetch(`${PLUGIN_BASE}/ingest-chat`, {
           method: "POST",
@@ -426,17 +433,22 @@ async function loadChatSelector() {
         });
         const data = await res.json();
         if (res.ok) {
-          btn.val("Done!").addClass("success");
+          btn.text("Done!").removeClass("ingesting").addClass("success");
+          statusEl.html(`<span class="chronicle-ingest-done">Ingested <b>${data.messagesTotal}</b> messages in <b>${data.batchesProcessed}</b> batches from <b>${charName}</b>.</span>`);
           toastr.success(`Ingested ${data.messagesTotal} messages (${data.batchesProcessed}/${data.batchesTotal} batches) from ${charName}.`);
         } else {
-          btn.val("Error");
+          btn.text("Error").removeClass("ingesting");
+          statusEl.html(`<span class="chronicle-ingest-error">Error: ${data.error}</span>`);
           toastr.error(`Ingest failed: ${data.error}`);
         }
       } catch (err) {
-        btn.val("Error");
+        btn.text("Error").removeClass("ingesting");
+        statusEl.html(`<span class="chronicle-ingest-error">Error: ${err.message}</span>`);
         toastr.error(`Ingest error: ${err.message}`);
       }
-      setTimeout(() => btn.prop("disabled", false).val("Ingest"), 3000);
+      setTimeout(() => {
+        btn.prop("disabled", false).text(originalText).removeClass("success ingesting");
+      }, 5000);
     });
   } catch (err) {
     console.warn("[ChronicleDB] Failed to load chat selector:", err);

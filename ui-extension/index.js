@@ -52,9 +52,20 @@ jQuery(async () => {
   }
   const settings = extension_settings[EXT_NAME];
 
-  // Load settings panel HTML
-  const settingsHtml = await $.get(`scripts/extensions/third-party/${EXT_NAME}/settings.html`);
-  $("#extensions_settings2").append(settingsHtml);
+  // Load settings panel HTML — inline to avoid fetch issues
+  try {
+    const response = await fetch(`/scripts/extensions/third-party/${EXT_NAME}/settings.html`);
+    if (response.ok) {
+      const settingsHtml = await response.text();
+      $("#extensions_settings2").append(settingsHtml);
+    } else {
+      console.error(`[ChronicleDB] Failed to load settings HTML: ${response.status}`);
+      return;
+    }
+  } catch (err) {
+    console.error("[ChronicleDB] Failed to load settings HTML:", err);
+    return;
+  }
 
   // Bind settings inputs
   bindSettings(settings);

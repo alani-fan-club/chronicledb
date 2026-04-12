@@ -558,13 +558,21 @@ function showDetailPanel(data) {
   if (node.length) {
     const edges = node.connectedEdges();
     if (edges.length > 0) {
-      // Group by edge type
+      // Group by edge type, dedupe by (type, neighbor_id)
+      // Prevents showing "Antagonist" twice when feels_about exists both directions
       const groups = new Map();
+      const seenByType = new Map(); // type -> Set<neighborId>
       edges.forEach((edge) => {
         const ed = edge.data();
         const otherId = edge.source().id() === data.id ? edge.target().id() : edge.source().id();
         const otherNode = cy.getElementById(otherId);
         if (!otherNode.length) return;
+
+        if (!seenByType.has(ed.type)) seenByType.set(ed.type, new Set());
+        const seenSet = seenByType.get(ed.type);
+        if (seenSet.has(otherId)) return; // already shown this neighbor for this edge type
+        seenSet.add(otherId);
+
         const otherData = otherNode.data();
         const otherLabel = otherData.fullLabel || otherData.label || otherData.content || otherData.summary || otherId;
 

@@ -47,18 +47,18 @@ async function semanticSearchScoped(settings, text, chatIds) {
 }
 
 async function getLocations(settings, characters) {
-  const results = [];
-  for (const name of characters) {
-    const rows = await db.cypher(settings, `
-      MATCH (c:Character {name: $name})-[r:PRESENT_AT]->(l:Location)
-      WHERE r.until IS NULL OR r.until = ''
-      RETURN c.name as entity, l.name as location
-    `, { name });
-    for (const r of rows) {
-      results.push({ entity: r.entity, location: r.location });
-    }
-  }
-  return results;
+  if (!characters || characters.length === 0) return [];
+  const p = db.getPool(settings);
+  const charIds = characters.map((n) => db.slugify(n));
+  const { rows } = await p.query(
+    `SELECT c.name as entity, l.name as location
+     FROM present_at pa
+     JOIN characters c ON c.id = pa.character_id
+     JOIN locations l ON l.id = pa.location_id
+     WHERE pa.character_id = ANY($1::text[]) AND pa.is_current = TRUE`,
+    [charIds],
+  );
+  return rows;
 }
 
 /**

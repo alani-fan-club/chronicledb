@@ -92,44 +92,56 @@ JSON:`;
 
   let content;
 
+  // Retry with exponential backoff for rate limit errors (429) and transient 5xx
+  const callWithRetry = async (fn, maxRetries = 4) => {
+    let delay = 1000;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        const msg = err.message || "";
+        const isRetriable = msg.includes("429") || msg.includes("503") || msg.includes("500") || msg.includes("RESOURCE_EXHAUSTED");
+        if (!isRetriable || attempt === maxRetries) throw err;
+        await new Promise((r) => setTimeout(r, delay));
+        delay *= 2; // 1s → 2s → 4s → 8s → 16s
+      }
+    }
+  };
+
   if (apiType === "openai") {
-    // OpenAI-compatible API (OpenRouter, local, etc.)
-    const res = await fetch(`${apiUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.1,
-        max_tokens: 4096,
-      }),
-    });
-    if (!res.ok) throw new Error(`Extraction LLM error: ${res.status} ${await res.text()}`);
-    const data = await res.json();
-    content = data.choices?.[0]?.message?.content;
-  } else {
-    // Gemini API
-    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
+    content = await callWithRetry(async () => {
+      const res = await fetch(`${apiUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: prompt }],
           temperature: 0.1,
-          maxOutputTokens: 4096,
-          responseMimeType: "application/json",
-        },
-      }),
+          max_tokens: 4096,
+        }),
+      });
+      if (!res.ok) throw new Error(`Extraction LLM error: ${res.status} ${await res.text()}`);
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content;
     });
-    if (!res.ok) throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
-    const data = await res.json();
-    content = data.candidates?.[0]?.content?.parts?.[0]?.text;
+  } else {
+    content = await callWithRetry(async () => {
+      const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 4096,
+            responseMimeType: "application/json",
+          },
+        }),
+      });
+      if (!res.ok) throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.[0]?.text;
+    });
   }
 
   if (!content) throw new Error("LLM returned empty response");

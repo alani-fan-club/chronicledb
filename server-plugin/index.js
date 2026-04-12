@@ -405,11 +405,14 @@ async function init(router) {
         } catch { /* skip malformed */ }
       }
 
-      // Process in batches
+      // Process in batches with parallel extraction
       const batchSize = 10;
+      const concurrency = 3; // parallel LLM calls (Gemini free tier is rate-limited)
       let extracted = 0;
       const totalBatches = Math.ceil(messages.length / batchSize);
 
+      // Build all batches upfront
+      const allBatches = [];
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize).map((m) => ({
           name: m.name,
@@ -418,10 +421,32 @@ async function init(router) {
           mes: m.swipe_id !== undefined && m.swipes?.[m.swipe_id] ? m.swipes[m.swipe_id] : m.mes,
           send_date: m.send_date,
         }));
+        allBatches.push({ batchIdx: i, batch });
+      }
 
-        try {
-          // Extract via Gemini
-          const extraction = await extract(settings, { characterName: charName, userName, messages: batch });
+      // Run extractions in parallel groups of `concurrency`
+      // Each group awaits all before starting DB writes
+      for (let g = 0; g < allBatches.length; g += concurrency) {
+        const group = allBatches.slice(g, g + concurrency);
+
+        // Parallel extraction calls
+        const extractionResults = await Promise.allSettled(
+          group.map(({ batch }) =>
+            extract(settings, { characterName: charName, userName, messages: batch })
+          ),
+        );
+
+        // Serial DB writes for this group (to avoid deadlocks on same entities)
+        for (let k = 0; k < group.length; k++) {
+          const { batchIdx: i, batch } = group[k];
+          const er = extractionResults[k];
+          if (er.status !== "fulfilled") {
+            console.warn(`[ChronicleDB] Batch ${i} extraction failed:`, er.reason?.message);
+            continue;
+          }
+          const extraction = er.value;
+
+          try {
 
           // Ingest characters
           for (const char of (extraction.characters || [])) {
@@ -526,10 +551,11 @@ async function init(router) {
           await db.storeEmbedding(settings, { chatId, nodeType: "conversation", nodeId: `ingest-${chatId}-${i}`, content: batchText.slice(0,2000), embedding: batchEmbed, characterScope: [charName, userName], messageIndex: i });
 
           extracted++;
-        } catch (err) {
-          console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message);
-        }
-      }
+          } catch (err) {
+            console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message);
+          }
+        } // end for k (serial DB writes for group)
+      } // end for g (parallel extraction groups)
 
       // Record ingestion status
       const p = db.getPool(settings);

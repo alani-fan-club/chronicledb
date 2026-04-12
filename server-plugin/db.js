@@ -408,17 +408,18 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   // Recursive CTE: walk through edges scoped to this character's chats
   const { rows } = await p.query(`
     WITH RECURSIVE
-    -- Only edges from this character's ingested chats
     all_edges AS (
+      -- Character relationships
       SELECT from_char as src, 'character'::text as src_type, to_char as dst, 'character'::text as dst_type
       FROM feels_about WHERE session_id = ANY($3)
       UNION ALL
       SELECT to_char, 'character', from_char, 'character'
       FROM feels_about WHERE session_id = ANY($3)
       UNION ALL
-      SELECT k.character_id, 'character', k.fact_id, 'fact'
-      FROM knows k
+      -- Character knows facts
+      SELECT k.character_id, 'character', k.fact_id, 'fact' FROM knows k
       UNION ALL
+      -- Character participated in events (from this char's chats)
       SELECT pi.character_id, 'character', pi.event_id, 'event'
       FROM participated_in pi
       JOIN events e ON e.id = pi.event_id WHERE e.chat_id = ANY($3)
@@ -426,6 +427,36 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
       SELECT pi.event_id, 'event', pi.character_id, 'character'
       FROM participated_in pi
       JOIN events e ON e.id = pi.event_id WHERE e.chat_id = ANY($3)
+      UNION ALL
+      -- Events at locations
+      SELECT e.id, 'event', e.location_id, 'location'
+      FROM events e WHERE e.chat_id = ANY($3) AND e.location_id IS NOT NULL
+      UNION ALL
+      -- Characters own items
+      SELECT i.owner_id, 'character', i.id, 'item' FROM items i WHERE i.owner_id IS NOT NULL
+      UNION ALL
+      -- Items at locations
+      SELECT i.id, 'item', i.location_id, 'location' FROM items i WHERE i.location_id IS NOT NULL
+      UNION ALL
+      -- Characters involved in plot threads
+      SELECT ptc.character_id, 'character', ptc.plot_id, 'plot_thread'
+      FROM plot_thread_characters ptc
+      JOIN plot_threads pt ON pt.id = ptc.plot_id WHERE pt.chat_id = ANY($3)
+      UNION ALL
+      -- Events in story arcs
+      SELECT ae.event_id, 'event', ae.arc_id, 'story_arc'
+      FROM arc_events ae
+      JOIN story_arcs sa ON sa.id = ae.arc_id WHERE sa.chat_id = ANY($3)
+      UNION ALL
+      SELECT ae.arc_id, 'story_arc', ae.event_id, 'event'
+      FROM arc_events ae
+      JOIN story_arcs sa ON sa.id = ae.arc_id WHERE sa.chat_id = ANY($3)
+      UNION ALL
+      -- Event causal chains
+      SELECT ec.from_event_id, 'event', ec.to_event_id, 'event'
+      FROM event_chains ec
+      JOIN events e1 ON e1.id = ec.from_event_id
+      WHERE e1.chat_id = ANY($3)
     ),
     graph_walk AS (
       SELECT $1::text as node_id, 'character'::text as node_type, 0 as hop
@@ -447,6 +478,9 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   const factIds = rows.filter((r) => r.node_type === "fact").map((r) => r.node_id);
   const eventIds = rows.filter((r) => r.node_type === "event").map((r) => r.node_id);
   const locIds = rows.filter((r) => r.node_type === "location").map((r) => r.node_id);
+  const itemIds = rows.filter((r) => r.node_type === "item").map((r) => r.node_id);
+  const plotIds = rows.filter((r) => r.node_type === "plot_thread").map((r) => r.node_id);
+  const arcIds = rows.filter((r) => r.node_type === "story_arc").map((r) => r.node_id);
 
   if (charIds.length > 0) {
     const { rows: chars } = await p.query(`SELECT * FROM characters WHERE id = ANY($1)`, [charIds]);
@@ -454,15 +488,27 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   }
   if (factIds.length > 0) {
     const { rows: fs } = await p.query(`SELECT * FROM facts WHERE id = ANY($1)`, [factIds]);
-    for (const f of fs) nodes.push({ id: f.id, label: f.content.slice(0, 60), type: "fact", metadata: f });
+    for (const f of fs) nodes.push({ id: f.id, label: (f.content || "").slice(0, 60), type: "fact", metadata: f });
   }
   if (eventIds.length > 0) {
     const { rows: es } = await p.query(`SELECT * FROM events WHERE id = ANY($1)`, [eventIds]);
-    for (const e of es) nodes.push({ id: e.id, label: e.summary.slice(0, 60), type: "event", metadata: e });
+    for (const e of es) nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
   }
   if (locIds.length > 0) {
     const { rows: ls } = await p.query(`SELECT * FROM locations WHERE id = ANY($1)`, [locIds]);
     for (const l of ls) nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
+  }
+  if (itemIds.length > 0) {
+    const { rows: its } = await p.query(`SELECT * FROM items WHERE id = ANY($1)`, [itemIds]);
+    for (const i of its) nodes.push({ id: i.id, label: i.name, type: "item", metadata: i });
+  }
+  if (plotIds.length > 0) {
+    const { rows: pts } = await p.query(`SELECT * FROM plot_threads WHERE id = ANY($1)`, [plotIds]);
+    for (const pt of pts) nodes.push({ id: pt.id, label: pt.title, type: "plot_thread", metadata: pt });
+  }
+  if (arcIds.length > 0) {
+    const { rows: arcs } = await p.query(`SELECT * FROM story_arcs WHERE id = ANY($1)`, [arcIds]);
+    for (const arc of arcs) nodes.push({ id: arc.id, label: arc.title, type: "story_arc", metadata: arc });
   }
 
   // Get edges between discovered nodes — scoped to this character's chats
@@ -494,16 +540,82 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   }
 
   if (charIds.length > 0 && eventIds.length > 0) {
-    const { rows: pi } = await p.query(
+    const { rows: partRows } = await p.query(
       `SELECT pi.character_id, pi.event_id, pi.role
        FROM participated_in pi
        JOIN events e ON e.id = pi.event_id
        WHERE pi.character_id = ANY($1) AND pi.event_id = ANY($2) AND e.chat_id = ANY($3)`,
       [charIds, eventIds, chatIds],
     );
-    for (const p of pi) {
-      edges.push({ id: `pi-${p.character_id}-${p.event_id}`, source: p.character_id, target: p.event_id,
-        type: "PARTICIPATED_IN", label: p.role || "participated", sentiment: 0, intensity: 0.5 });
+    for (const pr of partRows) {
+      edges.push({ id: `pi-${pr.character_id}-${pr.event_id}`, source: pr.character_id, target: pr.event_id,
+        type: "PARTICIPATED_IN", label: pr.role || "participated", sentiment: 0, intensity: 0.5 });
+    }
+  }
+
+  // Event location edges
+  if (eventIds.length > 0 && locIds.length > 0) {
+    const { rows: elocs } = await p.query(
+      `SELECT id, location_id FROM events WHERE id = ANY($1) AND location_id = ANY($2)`,
+      [eventIds, locIds],
+    );
+    for (const e of elocs) {
+      edges.push({ id: `at-${e.id}-${e.location_id}`, source: e.id, target: e.location_id,
+        type: "OCCURRED_AT", label: "at", sentiment: 0, intensity: 0.3 });
+    }
+  }
+
+  // Item ownership
+  if (itemIds.length > 0) {
+    const { rows: its } = await p.query(
+      `SELECT id, owner_id, location_id FROM items WHERE id = ANY($1)`, [itemIds],
+    );
+    for (const it of its) {
+      if (it.owner_id) edges.push({ id: `own-${it.owner_id}-${it.id}`, source: it.owner_id, target: it.id,
+        type: "OWNS", label: "owns", sentiment: 0, intensity: 0.4 });
+      if (it.location_id) edges.push({ id: `at-${it.id}-${it.location_id}`, source: it.id, target: it.location_id,
+        type: "LOCATED_AT", label: "located at", sentiment: 0, intensity: 0.3 });
+    }
+  }
+
+  // Plot thread links
+  if (plotIds.length > 0 && charIds.length > 0) {
+    const { rows: pts } = await p.query(
+      `SELECT plot_id, character_id FROM plot_thread_characters WHERE plot_id = ANY($1) AND character_id = ANY($2)`,
+      [plotIds, charIds],
+    );
+    for (const pt of pts) {
+      edges.push({ id: `pt-${pt.character_id}-${pt.plot_id}`, source: pt.character_id, target: pt.plot_id,
+        type: "INVOLVED_IN", label: "involved in", sentiment: 0, intensity: 0.4 });
+    }
+  }
+
+  // Arc containment
+  if (arcIds.length > 0 && eventIds.length > 0) {
+    const { rows: aes } = await p.query(
+      `SELECT arc_id, event_id, is_anchor FROM arc_events WHERE arc_id = ANY($1) AND event_id = ANY($2)`,
+      [arcIds, eventIds],
+    );
+    for (const ae of aes) {
+      edges.push({ id: `ae-${ae.arc_id}-${ae.event_id}`, source: ae.arc_id, target: ae.event_id,
+        type: "CONTAINS_EVENT", label: ae.is_anchor ? "anchor" : "contains",
+        sentiment: 0, intensity: ae.is_anchor ? 0.9 : 0.5, isAnchor: ae.is_anchor });
+    }
+  }
+
+  // Event chains
+  if (eventIds.length > 0) {
+    const { rows: chs } = await p.query(
+      `SELECT ec.from_event_id, ec.to_event_id, ec.chain_type, ec.description
+       FROM event_chains ec
+       JOIN events e ON e.id = ec.from_event_id
+       WHERE ec.from_event_id = ANY($1) AND ec.to_event_id = ANY($1) AND e.chat_id = ANY($2)`,
+      [eventIds, chatIds],
+    );
+    for (const c of chs) {
+      edges.push({ id: `ch-${c.from_event_id}-${c.to_event_id}`, source: c.from_event_id, target: c.to_event_id,
+        type: "CAUSED", label: c.chain_type || "caused", description: c.description,
+        sentiment: 0, intensity: 0.7 });
     }
   }
 

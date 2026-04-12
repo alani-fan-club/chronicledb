@@ -9,28 +9,47 @@ const API_BASE = IS_ST_PLUGIN
 
 const fetchOpts = { credentials: "include" };
 
-// ── Shift5-inverted palette ─────────────────────────────────────
+// ── SHIFT5 Operational palette ──────────────────────────────────
+// Reduced to 4 tonal levels + accent. Hierarchy from shape/size/opacity,
+// not hue. Coral reserved for PCs, arcs, and causal edges.
 const COLORS = {
-  bg: "#1a1a1a",
-  accent: "#E8503A",        // coral red
-  accentHover: "#ff6347",
-  character: "#8b95a8",     // warm grey-blue
-  location: "#6b8e7a",      // muted sage
-  item: "#b08968",          // warm tan
-  event: "#d4a574",         // warm amber
-  eventMajor: "#f0883e",    // brighter amber for anchor events
-  fact: "#555",             // dim grey
-  scene: "#444",
-  plot_thread: "#c77d5c",   // dusty orange
-  story_arc: "#E8503A",     // coral for arcs (the star)
-  positive: "#4ade80",
-  negative: "#ef4444",
-  neutral: "#94a3b8",
-  edge: "#3a3a3a",
-  edgeBright: "#555",
-  edgeCausal: "#E8503A",    // coral for causal chains
-  text: "#f0f0f0",
-  textDim: "#666",
+  bg: "#181818",
+
+  // Signal
+  accent:      "#FF5841",   // shift5 coral — PC, arcs, causal
+  accentHover: "#ff7057",
+  accentDim:   "rgba(255, 88, 65, 0.2)",
+
+  // 4-tier neutral scale — replaces the 7-color hue system
+  tier1: "#f0f0f0",         // primary:   characters, major events
+  tier2: "#b8b8b8",         // secondary: events, locations
+  tier3: "#6a6a6a",         // tertiary:  items, plot threads
+  tier4: "#3a3a3a",         // muted:     facts, scenes
+
+  // Legacy keys (kept as aliases so any old code paths still resolve)
+  character:  "#f0f0f0",
+  location:   "#8a8a8a",
+  item:       "#6a6a6a",
+  event:      "#b8b8b8",
+  eventMajor: "#FF5841",
+  fact:       "#3a3a3a",
+  scene:      "#3a3a3a",
+  plot_thread:"#6a6a6a",
+  story_arc:  "#FF5841",
+
+  // Status
+  positive: "#6ac47a",
+  negative: "#e05555",
+  neutral:  "#7a8594",
+
+  // Edges
+  edge:        "#2c2c2c",
+  edgeBright:  "#4a4a4a",
+  edgeCausal:  "#FF5841",
+
+  // Text
+  text:    "#f5f5f5",
+  textDim: "#6a6a6a",
 };
 
 // ── State ───────────────────────────────────────────────────────
@@ -53,36 +72,132 @@ function initCytoscape() {
     minZoom: 0.05,
     maxZoom: 8,
     style: [
-      // Default node — small dot, Obsidian-style
+      // ──────────────────────────────────────────────────────
+      // DEFAULT NODE — flat dim disc, hidden label
+      // ──────────────────────────────────────────────────────
       {
         selector: "node",
         style: {
-          "background-color": COLORS.fact,
+          "background-color": COLORS.tier4,
+          "background-opacity": 0.85,
           width: "data(size)",
           height: "data(size)",
           label: "data(label)",
           "text-valign": "bottom",
           "text-halign": "center",
-          "text-margin-y": 5,
-          "font-size": "0px", // hidden by default, shown on hover/zoom
-          "font-family": "Inter",
+          "text-margin-y": 7,
+          "font-size": "0px",
+          "font-family": "JetBrains Mono, Inter, monospace",
           "font-weight": "500",
           color: COLORS.text,
-          "text-outline-width": 2,
+          "text-transform": "uppercase",
+          "text-outline-width": 3,
           "text-outline-color": COLORS.bg,
+          "text-outline-opacity": 1,
           "border-width": 0,
-          "transition-property": "opacity, border-width, border-color, width, height, font-size",
-          "transition-duration": "0.2s",
+          "border-color": COLORS.edge,
+          "transition-property":
+            "opacity, border-width, border-color, width, height, font-size, background-opacity",
+          "transition-duration": "0.18s",
+        },
+      },
+
+      // ──────────────────────────────────────────────────────
+      // TIER 4 (deepest dim) — facts
+      // ──────────────────────────────────────────────────────
+      {
+        selector: "node[type='fact']",
+        style: {
+          "background-color": COLORS.tier4,
+          "background-opacity": 0.7,
+          shape: "rectangle",
+        },
+      },
+
+      // ──────────────────────────────────────────────────────
+      // TIER 3 (tertiary) — items, plot threads, scenes
+      // Differentiated by SHAPE, not color
+      // ──────────────────────────────────────────────────────
+      {
+        selector: "node[type='item']",
+        style: {
+          "background-color": COLORS.tier3,
+          "background-opacity": 0.85,
+          shape: "hexagon",
         },
       },
       {
+        selector: "node[type='plot_thread']",
+        style: {
+          "background-color": COLORS.tier3,
+          "background-opacity": 0.85,
+          shape: "diamond",
+        },
+      },
+
+      // ──────────────────────────────────────────────────────
+      // TIER 2 (secondary) — locations, standard events
+      // ──────────────────────────────────────────────────────
+      {
+        selector: "node[type='location']",
+        style: {
+          "background-color": COLORS.tier2,
+          "background-opacity": 0.9,
+          shape: "round-rectangle",
+        },
+      },
+      {
+        selector: "node[type='event']",
+        style: {
+          "background-color": COLORS.tier2,
+          "background-opacity": 0.9,
+          shape: "rectangle",
+          "border-width": 1,
+          "border-color": COLORS.edgeBright,
+        },
+      },
+
+      // ──────────────────────────────────────────────────────
+      // TIER 1 (primary) — characters
+      // ──────────────────────────────────────────────────────
+      {
         selector: "node[type='character']",
         style: {
-          "background-color": COLORS.character,
+          "background-color": COLORS.tier1,
+          "background-opacity": 1,
           "background-image": "data(avatarUrl)",
           "background-fit": "cover",
           "background-clip": "node",
           shape: "ellipse",
+          "border-width": 1,
+          "border-color": COLORS.edgeBright,
+        },
+      },
+
+      // ──────────────────────────────────────────────────────
+      // ACCENT — major events, story arcs, PCs
+      // Coral reserved for the things that matter most
+      // ──────────────────────────────────────────────────────
+      {
+        selector: "node[type='event'][significance >= 4]",
+        style: {
+          "background-color": COLORS.tier1,
+          "background-opacity": 1,
+          "border-width": 2,
+          "border-color": COLORS.accent,
+          shape: "rectangle",
+        },
+      },
+      {
+        selector: "node[type='story_arc']",
+        style: {
+          "background-color": COLORS.bg,
+          "background-opacity": 1,
+          shape: "round-rectangle",
+          "font-weight": "700",
+          "border-width": 2,
+          "border-color": COLORS.accent,
+          "text-outline-color": COLORS.bg,
         },
       },
       {
@@ -92,51 +207,10 @@ function initCytoscape() {
           "border-color": COLORS.accent,
         },
       },
-      {
-        selector: "node[type='location']",
-        style: { "background-color": COLORS.location },
-      },
-      {
-        selector: "node[type='item']",
-        style: { "background-color": COLORS.item },
-      },
-      {
-        selector: "node[type='event']",
-        style: {
-          "background-color": COLORS.event,
-          shape: "round-rectangle",
-        },
-      },
-      {
-        selector: "node[type='event'][significance >= 4]",
-        style: {
-          "background-color": COLORS.eventMajor,
-          "border-width": 2,
-          "border-color": COLORS.accent,
-        },
-      },
-      {
-        selector: "node[type='story_arc']",
-        style: {
-          "background-color": COLORS.story_arc,
-          shape: "round-rectangle",
-          "font-weight": "bold",
-          "border-width": 2,
-          "border-color": COLORS.accentHover,
-        },
-      },
-      {
-        selector: "node[type='fact']",
-        style: { "background-color": COLORS.fact },
-      },
-      {
-        selector: "node[type='plot_thread']",
-        style: {
-          "background-color": COLORS.plot_thread,
-          shape: "diamond",
-        },
-      },
-      // Edges — subtle thin lines
+
+      // ──────────────────────────────────────────────────────
+      // EDGES — thin dim lines by default
+      // ──────────────────────────────────────────────────────
       {
         selector: "edge",
         style: {
@@ -144,30 +218,30 @@ function initCytoscape() {
           "target-arrow-shape": "none",
           "line-color": COLORS.edge,
           width: 1,
-          opacity: 0.6,
+          opacity: 0.7,
           "transition-property": "opacity, line-color, width",
-          "transition-duration": "0.2s",
+          "transition-duration": "0.18s",
         },
       },
-      // CAUSED edges — directional coral arrows for causal chains
+      // CAUSED — directional coral chains
       {
         selector: "edge[type='CAUSED']",
         style: {
           "line-color": COLORS.edgeCausal,
           "target-arrow-color": COLORS.edgeCausal,
           "target-arrow-shape": "triangle",
-          "arrow-scale": 1.2,
-          width: 2,
-          opacity: 0.8,
+          "arrow-scale": 1.1,
+          width: 1.5,
+          opacity: 0.85,
           "curve-style": "bezier",
         },
       },
-      // CONTAINS_EVENT — arc → event (dashed)
+      // CONTAINS_EVENT — arc skeleton
       {
         selector: "edge[type='CONTAINS_EVENT']",
         style: {
           "line-color": COLORS.accent,
-          opacity: 0.4,
+          opacity: 0.25,
           width: 1,
           "line-style": "dashed",
         },
@@ -175,27 +249,27 @@ function initCytoscape() {
       {
         selector: "edge[type='CONTAINS_EVENT'][?isAnchor]",
         style: {
-          "line-color": COLORS.accentHover,
+          "line-color": COLORS.accent,
           opacity: 0.9,
-          width: 2.5,
+          width: 2,
           "line-style": "solid",
         },
       },
-      // FEELS_ABOUT edges colored by sentiment
+      // FEELS_ABOUT — status-coded (subtle)
       {
         selector: "edge[type='FEELS_ABOUT'][sentiment > 0.3]",
         style: {
           "line-color": COLORS.positive,
-          opacity: 0.5,
-          width: "mapData(intensity, 0, 1, 1, 3)",
+          opacity: 0.55,
+          width: "mapData(intensity, 0, 1, 1, 2.5)",
         },
       },
       {
         selector: "edge[type='FEELS_ABOUT'][sentiment < -0.3]",
         style: {
           "line-color": COLORS.negative,
-          opacity: 0.5,
-          width: "mapData(intensity, 0, 1, 1, 3)",
+          opacity: 0.55,
+          width: "mapData(intensity, 0, 1, 1, 2.5)",
         },
       },
       {
@@ -205,21 +279,26 @@ function initCytoscape() {
           opacity: 0.4,
         },
       },
-      // Highlight states
+
+      // ──────────────────────────────────────────────────────
+      // INTERACTION STATES
+      // ──────────────────────────────────────────────────────
       {
         selector: ".hovered",
         style: {
-          "border-width": 3,
+          "border-width": 2,
           "border-color": COLORS.accent,
-          "font-size": "11px",
+          "background-opacity": 1,
+          "font-size": "10px",
         },
       },
       {
         selector: ".neighbor",
         style: {
-          "border-width": 2,
-          "border-color": COLORS.accentHover,
-          "font-size": "10px",
+          "border-width": 1,
+          "border-color": COLORS.accent,
+          "background-opacity": 1,
+          "font-size": "9px",
         },
       },
       {
@@ -227,19 +306,20 @@ function initCytoscape() {
         style: {
           "line-color": COLORS.accent,
           opacity: 1,
-          width: 2,
+          width: 1.5,
         },
       },
       {
         selector: ".dimmed",
-        style: { opacity: 0.08 },
+        style: { opacity: 0.06 },
       },
       {
         selector: ".search-match",
         style: {
-          "border-width": 4,
+          "border-width": 2,
           "border-color": COLORS.accent,
-          "font-size": "12px",
+          "background-opacity": 1,
+          "font-size": "11px",
         },
       },
     ],
@@ -265,13 +345,22 @@ function initCytoscape() {
     if (activeCharacter) applyCharacterFilter();
   });
 
-  // Show labels on zoom in
+  // Progressive label reveal — important nodes first, then all
   cy.on("zoom", () => {
     const zoom = cy.zoom();
-    if (zoom > 1.2) {
-      cy.style().selector("node").style({ "font-size": "10px" }).update();
+    const s = cy.style();
+    if (zoom > 2.0) {
+      // Far zoom: show all labels
+      s.selector("node").style({ "font-size": "9px" }).update();
+    } else if (zoom > 1.1) {
+      // Medium zoom: characters, arcs, major events only
+      s.selector("node").style({ "font-size": "0px" }).update();
+      s.selector("node[type='character']").style({ "font-size": "10px" }).update();
+      s.selector("node[type='story_arc']").style({ "font-size": "10px" }).update();
+      s.selector("node[type='event'][significance >= 4]").style({ "font-size": "9px" }).update();
     } else {
-      cy.style().selector("node").style({ "font-size": "0px" }).update();
+      // Zoomed out: hide all labels (let topology breathe)
+      s.selector("node").style({ "font-size": "0px" }).update();
     }
   });
 }
@@ -492,7 +581,16 @@ function showDetailPanel(data) {
         const shown = items.slice(0, 15);
         for (const it of shown) {
           const sentClass = sentimentClass(it.sentiment);
-          const dotColor = it.type === "character" ? "#8b95a8" : it.type === "event" ? "#d4a574" : it.type === "fact" ? "#666" : it.type === "location" ? "#6b8e7a" : it.type === "item" ? "#b08968" : it.type === "plot_thread" ? "#c77d5c" : "#999";
+          // Tiered neutral dots — differentiation via brightness, not hue
+          const dotColor =
+            it.type === "character"   ? COLORS.tier1 :
+            it.type === "story_arc"   ? COLORS.accent :
+            it.type === "event"       ? COLORS.tier2 :
+            it.type === "location"    ? COLORS.tier2 :
+            it.type === "item"        ? COLORS.tier3 :
+            it.type === "plot_thread" ? COLORS.tier3 :
+            it.type === "fact"        ? COLORS.tier4 :
+            COLORS.tier3;
           html += `<li class="${sentClass}"><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(it.label)}</span></li>`;
         }
         if (items.length > 15) {

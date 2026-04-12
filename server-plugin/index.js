@@ -6,7 +6,12 @@
  */
 
 const db = require("./db");
-const { extract, embed } = require("./extractor");
+const {
+  extract,
+  embed,
+  applyExtractionToGraph,
+  applyMessagesToVectorStore,
+} = require("./extractor");
 const { retrieve, formatMemoryBlock } = require("./retriever");
 const { ingestLorebook, listLorebooks } = require("./lorebook");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
@@ -167,195 +172,36 @@ async function init(router) {
     try {
       const { characterName, userName, messages, chatId, messageIndex } = req.body;
 
-      // 1. Extract structured data from messages
+      // 1. Extract structured data from messages.
       const extraction = await extract(settings, { characterName, userName, messages });
 
-      // 2. Ingest into graph
-      for (const char of (extraction.characters || [])) {
-        await db.upsertCharacter(settings, {
-          name: char.name,
-          aliases: char.aliases || [],
-          description: (char.new_facts || []).join("; "),
-          firstSeen: new Date().toISOString(),
-        });
-
-        // Store character "new_facts" as traits (innate properties).
-        // Matches /ingest-chat semantics — traits is the canonical home
-        // for character personality/background, not the facts table.
-        const charId = db.slugify(char.name);
-        for (const fact of (char.new_facts || [])) {
-          await db.upsertTrait(settings, {
-            characterId: charId,
-            category: "personality",
-            content: fact,
-            sourceChat: chatId || "",
-          });
-        }
-      }
-
-      // Update character role/status/significance
-      for (const char of (extraction.characters || [])) {
-        if (char.role || char.status || char.significance) {
-          const p = db.getPool(settings);
-          const charId = db.slugify(char.name);
-          await p.query(
-            `UPDATE characters SET role = COALESCE(NULLIF($2, ''), role), status = COALESCE(NULLIF($3, ''), status), significance = GREATEST(significance, $4) WHERE id = $1`,
-            [charId, char.role || "", char.status || "", char.significance || 3],
-          );
-        }
-      }
-
-      for (const rel of (extraction.relationships || [])) {
-        await db.upsertRelationship(settings, {
-          from: rel.from,
-          to: rel.to,
-          sentiment: parseFloat(rel.sentiment) || 0,
-          intensity: parseFloat(rel.intensity) || 0.5,
-          description: rel.description || rel.evidence || "",
-          sessionId: chatId,
-        });
-      }
-
-      // Items
-      for (const item of (extraction.items || [])) {
-        await db.upsertItem(settings, {
-          name: item.name,
-          description: item.description,
-          powers: item.powers,
-          significance: item.significance,
-          owner: item.owner,
-          location: item.location,
-          status: item.status,
-          chatId,
-        });
-      }
-
-      // Location detail updates
-      for (const loc of (extraction.locations_detail || [])) {
-        const locId = await db.upsertLocation(settings, loc.name, loc.description || "");
-        const p = db.getPool(settings);
-        await p.query(
-          `UPDATE locations SET importance = GREATEST(importance, $2), current_state = $3 WHERE id = $1`,
-          [locId, loc.importance || 3, loc.current_state || ""],
-        ).catch(() => {});
-      }
-
-      // Contradictions — log for review
-      for (const c of (extraction.contradictions || [])) {
-        if (c) console.warn(`[ChronicleDB] Contradiction detected: ${c}`);
-      }
-
-      for (const event of (extraction.events || [])) {
-        const eventId = await db.upsertEvent(settings, {
-          summary: event.summary,
-          sourceText: event.source_quote,
-          participants: event.participants,
-          location: event.location,
-          significance: event.significance,
-          messageIndex,
-          sessionId: chatId,
-        });
-
-        // Embed the event
-        const eventEmbedding = await embed(settings, event.summary);
-        await db.storeEmbedding(settings, {
-          chatId: chatId || "",
-          nodeType: "event",
-          nodeId: eventId,
-          content: event.summary,
-          embedding: eventEmbedding,
-          characterScope: event.participants,
-          messageIndex,
-        });
-      }
-
-      for (const ws of (extraction.world_state || [])) {
-        await db.upsertWorldState(settings, { ...ws, chatId: chatId || null });
-      }
-
-      for (const ku of (extraction.knowledge_updates || [])) {
-        if (ku.learned) {
-          await db.upsertFact(settings, {
-            content: ku.learned,
-            domain: "knowledge",
-            confidence: 0.9,
-            characterScope: [ku.character],
-          });
-        }
-        // does_not_know entries are implicit — the character simply
-        // doesn't have a KNOWS edge to those facts
-      }
-
-      // 3. Ingest context snapshot
-      if (extraction.context_snapshot) {
-        const snap = extraction.context_snapshot;
-        const wsSnapshot = {};
-        for (const ws of (extraction.world_state || [])) {
-          wsSnapshot[ws.key] = ws.value;
-        }
-        await db.insertContextSnapshot(settings, {
-          chatId: chatId || "",
-          messageIndex: messageIndex || 0,
-          summary: snap.summary || "",
-          locationName: snap.location || null,
-          presentChars: snap.present_characters || [],
-          emotionalTone: snap.emotional_tone || "",
-          worldStateSnapshot: wsSnapshot,
-        });
-
-        // Mark these characters as currently present at this location.
-        // retriever.js::getLocations reads present_at to populate the
-        // "Current Scene" section, so without these writes that section
-        // is always empty.
-        if (snap.location && snap.present_characters?.length > 0) {
-          const locationId = await db.upsertLocation(settings, snap.location, "");
-          const p = db.getPool(settings);
-          const charIds = snap.present_characters.map((n) => db.slugify(n));
-          await p.query(
-            `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
-            [charIds],
-          ).catch(() => {});
-          for (const charName of snap.present_characters) {
-            const charId = db.slugify(charName);
-            await db.upsertCharacter(settings, { name: charName });
-            await p.query(
-              `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
-              [charId, locationId],
-            ).catch(() => {});
-          }
-        }
-      }
-
-      // 4. Ingest plot threads
-      for (const thread of (extraction.plot_threads || [])) {
-        await db.upsertPlotThread(settings, {
-          chatId: chatId || "",
-          title: thread.title,
-          description: thread.description || "",
-          threadType: thread.type || "pending",
-          involvedChars: thread.involved_characters || [],
-          plantedAt: messageIndex || null,
-          resolvedAt: thread.type === "resolved" ? messageIndex : null,
-          importance: thread.importance || 3,
-        });
-      }
-
-      // 5. Embed the full message batch for vector search
-      const batchText = messages
-        .filter((m) => !m.is_system)
-        .map((m) => `${m.name}: ${m.mes}`)
-        .join("\n")
-        .slice(0, 8000);
-
-      const batchEmbedding = await embed(settings, batchText);
-      await db.storeEmbedding(settings, {
-        chatId: chatId || "",
-        nodeType: "conversation",
-        nodeId: `batch-${Date.now()}`,
-        content: batchText.slice(0, 2000),
-        embedding: batchEmbedding,
-        characterScope: [characterName, userName],
+      // 2. Graph writes — single source of truth in extractor.js. Previously
+      //    this route reimplemented ~180 lines of upserts and was missing
+      //    event_chains, story_arcs, locations_detail, items, and present_at.
+      await applyExtractionToGraph(settings, {
+        extraction,
+        chatId,
+        charName: characterName,
+        userName,
         messageIndex,
+        batchSize: (messages || []).length,
+      });
+
+      // 3. Vector writes — chunk + situating blurb + per-msg embed +
+      //    dialogue quote extraction. Previously this route only stored a
+      //    single "conversation" blob embed per batch, losing chunking and
+      //    missing dialogue quotes entirely. In the live path `messages`
+      //    is only the recent batch (not the full chat), so batchStart=0
+      //    but messageIndexOffset is whatever ST told us the batch sits at
+      //    in the full-chat timeline.
+      const ctxWindow = settings.ingestContextWindow ?? 4;
+      await applyMessagesToVectorStore(settings, {
+        messages,
+        chatBatch: messages,
+        batchStart: 0,
+        messageIndexOffset: typeof messageIndex === "number" ? messageIndex : 0,
+        chatId,
+        ctxWindow,
       });
 
       res.json({ ok: true, extraction });
@@ -535,13 +381,16 @@ async function init(router) {
         } catch { /* skip malformed */ }
       }
 
-      // Process in batches with parallel extraction
-      const batchSize = 10;
-      const concurrency = 1; // serial — Gemini free tier chokes at higher concurrency
+      // Process in batches with parallel extraction. Concurrency is
+      // settings-driven (default 1) because the Gemini free tier chokes
+      // at higher concurrency; paid tiers can safely run 2-4.
+      const batchSize = settings.extractionBatchSize ?? 10;
+      const concurrency = Math.max(1, settings.extractionConcurrency ?? 1);
+      const ctxWindow = settings.ingestContextWindow ?? 4;
       let extracted = 0;
       const totalBatches = Math.ceil(messages.length / batchSize);
 
-      // Build all batches upfront
+      // Build all batches upfront.
       const allBatches = [];
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize).map((m) => ({
@@ -554,19 +403,18 @@ async function init(router) {
         allBatches.push({ batchIdx: i, batch });
       }
 
-      // Run extractions in parallel groups of `concurrency`
-      // Each group awaits all before starting DB writes
       for (let g = 0; g < allBatches.length; g += concurrency) {
         const group = allBatches.slice(g, g + concurrency);
 
-        // Parallel extraction calls
+        // Parallel extraction LLM calls — the only part that benefits from
+        // concurrency; DB writes downstream must stay serial to avoid
+        // deadlocks on shared entity rows.
         const extractionResults = await Promise.allSettled(
           group.map(({ batch }) =>
             extract(settings, { characterName: charName, userName, messages: batch })
           ),
         );
 
-        // Serial DB writes for this group (to avoid deadlocks on same entities)
         for (let k = 0; k < group.length; k++) {
           const { batchIdx: i, batch } = group[k];
           const er = extractionResults[k];
@@ -577,188 +425,28 @@ async function init(router) {
           const extraction = er.value;
 
           try {
-
-          // Ingest characters + traits
-          for (const char of (extraction.characters || [])) {
-            const description = (char.traits || []).map((t) => t.content).join("; ");
-            await db.upsertCharacter(settings, { name: char.name, aliases: char.aliases || [], description, firstSeen: chatId });
-            const charId = db.slugify(char.name);
-
-            if (char.role || char.status || char.significance) {
-              const p = db.getPool(settings);
-              await p.query(`UPDATE characters SET role = COALESCE(NULLIF($2,''),role), status = COALESCE(NULLIF($3,''),status), significance = GREATEST(significance,$4) WHERE id = $1`,
-                [charId, char.role || "", char.status || "", char.significance || 3]);
-            }
-
-            // Traits: innate properties (personality, skills, background, etc.)
-            for (const trait of (char.traits || [])) {
-              if (trait.content) {
-                await db.upsertTrait(settings, {
-                  characterId: charId,
-                  category: trait.category || "personality",
-                  content: trait.content,
-                  sourceChat: chatId,
-                });
-              }
-            }
-
-            // Legacy: handle old-style new_facts field if present (fallback)
-            for (const fact of (char.new_facts || [])) {
-              await db.upsertTrait(settings, {
-                characterId: charId,
-                category: "personality",
-                content: fact,
-                sourceChat: chatId,
-              });
-            }
-          }
-
-          // Relationships
-          for (const rel of (extraction.relationships || [])) {
-            await db.upsertRelationship(settings, { from: rel.from, to: rel.to, sentiment: parseFloat(rel.sentiment) || 0, intensity: parseFloat(rel.intensity) || 0.5, description: rel.description || "", sessionId: chatId });
-          }
-
-          // Events — track event_key → event_id mapping for arcs/chains
-          const eventKeyToId = new Map();
-          for (const event of (extraction.events || [])) {
-            const eventId = await db.upsertEvent(settings, { summary: event.summary, sourceText: event.source_quote, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
-            if (event.event_key) eventKeyToId.set(event.event_key, eventId);
-          }
-
-          // Event chains (causal links between events)
-          for (const chain of (extraction.event_chains || [])) {
-            const fromId = eventKeyToId.get(chain.from);
-            const toId = eventKeyToId.get(chain.to);
-            if (fromId && toId) {
-              await db.createEventChain(settings, {
-                fromEventId: fromId,
-                toEventId: toId,
-                chainType: chain.chain_type || "caused",
-                description: chain.description || "",
-              });
-            }
-          }
-
-          // Story arcs — group events into narrative arcs
-          for (const arc of (extraction.story_arcs || [])) {
-            const spineId = arc.spine_event_key ? eventKeyToId.get(arc.spine_event_key) : null;
-            const arcId = await db.upsertStoryArc(settings, {
+            await applyExtractionToGraph(settings, {
+              extraction,
               chatId,
-              title: arc.title,
-              description: arc.description || "",
-              arcType: arc.arc_type || "main",
-              status: arc.status || "active",
-              importance: arc.importance || 3,
-              startMsgIdx: i,
-              endMsgIdx: i + batch.length,
-              spineEventId: spineId,
+              charName,
+              userName,
+              messageIndex: i,
+              batchSize: batch.length,
             });
-            // Link all events in this arc
-            let pos = 0;
-            for (const key of (arc.event_keys || [])) {
-              const eventId = eventKeyToId.get(key);
-              if (eventId) {
-                const isAnchor = eventId === spineId;
-                await db.linkEventToArc(settings, { arcId, eventId, position: pos++, isAnchor });
-              }
-            }
-          }
-
-          // World state
-          for (const ws of (extraction.world_state || [])) {
-            await db.upsertWorldState(settings, { ...ws, chatId });
-          }
-
-          // Knowledge
-          for (const ku of (extraction.knowledge_updates || [])) {
-            if (ku.learned) await db.upsertFact(settings, { content: ku.learned, domain: "knowledge", confidence: 0.9, characterScope: [ku.character] });
-          }
-
-          // Items
-          for (const item of (extraction.items || [])) {
-            await db.upsertItem(settings, {
-              name: item.name,
-              description: item.description,
-              powers: item.powers,
-              significance: item.significance,
-              owner: item.owner,
-              location: item.location,
-              status: item.status,
+            await applyMessagesToVectorStore(settings, {
+              messages,
+              chatBatch: batch,
+              batchStart: i,
+              messageIndexOffset: i,
               chatId,
-            }).catch(()=>{});
-          }
-
-          // Context snapshot
-          if (extraction.context_snapshot) {
-            const snap = extraction.context_snapshot;
-            const wsSnap = {};
-            for (const ws of (extraction.world_state || [])) wsSnap[ws.key] = ws.value;
-            await db.insertContextSnapshot(settings, { chatId, messageIndex: i, summary: snap.summary||"", locationName: snap.location||null, presentChars: snap.present_characters||[], emotionalTone: snap.emotional_tone||"", worldStateSnapshot: wsSnap });
-
-            // Mark these characters as currently present at this location.
-            // retriever.js::getLocations reads present_at to populate the
-            // "Current Scene" section, so without these writes that section
-            // is always empty.
-            if (snap.location && snap.present_characters?.length > 0) {
-              const locationId = await db.upsertLocation(settings, snap.location, "");
-              const p = db.getPool(settings);
-              const charIds = snap.present_characters.map((n) => db.slugify(n));
-              await p.query(
-                `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
-                [charIds],
-              ).catch(() => {});
-              for (const charName of snap.present_characters) {
-                const charId = db.slugify(charName);
-                await db.upsertCharacter(settings, { name: charName });
-                await p.query(
-                  `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
-                  [charId, locationId],
-                ).catch(() => {});
-              }
-            }
-          }
-
-          // Plot threads
-          for (const pt of (extraction.plot_threads || [])) {
-            await db.upsertPlotThread(settings, { chatId, title: pt.title, description: pt.description||"", threadType: pt.type||"pending", involvedChars: pt.involved_characters||[], plantedAt: i, resolvedAt: pt.type==="resolved"?i:null, importance: pt.importance||3 });
-          }
-
-          // Embed the batch
-          const batchText = batch.filter(m=>!m.is_system).map(m=>`${m.name}: ${m.mes}`).join("\n").slice(0,8000);
-          const batchEmbed = await embed(settings, batchText);
-          await db.storeEmbedding(settings, { chatId, nodeType: "conversation", nodeId: `ingest-${chatId}-${i}`, content: batchText.slice(0,2000), embedding: batchEmbed, characterScope: [charName, userName], messageIndex: i });
-
-          // Per-message embeddings: each non-trivial message gets its own vector
-          // so needle-in-haystack queries can find specific quoted lines
-          for (let mi = 0; mi < batch.length; mi++) {
-            const m = batch[mi];
-            if (m.is_system) continue;
-            const text = `${m.name}: ${m.mes}`;
-            if (text.length < 80) continue; // skip trivial msgs
-            try {
-              const msgEmbedding = await embed(settings, text);
-              await db.storeEmbedding(settings, {
-                chatId,
-                nodeType: "message",
-                nodeId: `msg-${chatId}-${i + mi}`,
-                content: text.slice(0, 2000),
-                rawText: m.mes,
-                embedding: msgEmbedding,
-                characterScope: [m.name],
-                messageIndex: i + mi,
-              });
-            } catch (err) {
-              // Don't fail the whole batch if one message embed fails
-              console.warn(`[ChronicleDB] msg embed ${i+mi} failed:`, err.message);
-            }
-          }
-
-          extracted++;
+              ctxWindow,
+            });
+            extracted++;
           } catch (err) {
             console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message, err.stack?.split("\n").slice(0, 3).join(" | "));
           }
-        } // end for k (serial DB writes for group)
-      } // end for g (parallel extraction groups)
+        }
+      }
 
       // Record ingestion status
       const p = db.getPool(settings);

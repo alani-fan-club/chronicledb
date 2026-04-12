@@ -5,10 +5,8 @@ const { resolve, basename } = require("path");
 const db = require("./db");
 const {
   extract,
-  embed,
-  generateSituatingBlurb,
-  chunkText,
-  extractDialogueQuotes,
+  applyExtractionToGraph,
+  applyMessagesToVectorStore,
 } = require("./extractor");
 
 function loadConfig() {
@@ -108,187 +106,37 @@ async function run() {
       console.warn(`[ingest] batch ${i} extraction failed: ${err.message.slice(0, 200)}`);
     }
 
-    if (extraction) try {
-      for (const char of (extraction.characters || [])) {
-        const description = (char.traits || []).map((t) => t.content).join("; ");
-        await db.upsertCharacter(settings, { name: char.name, aliases: char.aliases || [], description, firstSeen: chatId });
-        const charId = db.slugify(char.name);
-        if (char.role || char.status || char.significance) {
-          const p = db.getPool(settings);
-          await p.query(
-            `UPDATE characters SET role = COALESCE(NULLIF($2,''),role), status = COALESCE(NULLIF($3,''),status), significance = GREATEST(significance,$4) WHERE id = $1`,
-            [charId, char.role || "", char.status || "", char.significance || 3],
-          );
-        }
-        for (const trait of (char.traits || [])) {
-          if (trait.content) {
-            await db.upsertTrait(settings, {
-              characterId: charId,
-              category: trait.category || "personality",
-              content: trait.content,
-              sourceChat: chatId,
-            });
-          }
-        }
-      }
-
-      for (const rel of (extraction.relationships || [])) {
-        await db.upsertRelationship(settings, {
-          from: rel.from, to: rel.to,
-          sentiment: parseFloat(rel.sentiment) || 0,
-          intensity: parseFloat(rel.intensity) || 0.5,
-          description: rel.description || "",
-          sessionId: chatId,
-        });
-      }
-
-      const eventKeyToId = new Map();
-      for (const event of (extraction.events || [])) {
-        const eventId = await db.upsertEvent(settings, {
-          summary: event.summary,
-          sourceText: event.source_quote,
-          participants: event.participants,
-          location: event.location,
-          significance: event.significance,
-          messageIndex: i,
-          sessionId: chatId,
-        });
-        if (event.event_key) eventKeyToId.set(event.event_key, eventId);
-      }
-
-      for (const chain of (extraction.event_chains || [])) {
-        const fromId = eventKeyToId.get(chain.from);
-        const toId = eventKeyToId.get(chain.to);
-        if (fromId && toId) {
-          await db.createEventChain(settings, {
-            fromEventId: fromId, toEventId: toId,
-            chainType: chain.chain_type || "caused",
-            description: chain.description || "",
-          });
-        }
-      }
-
-      for (const arc of (extraction.story_arcs || [])) {
-        const spineId = arc.spine_event_key ? eventKeyToId.get(arc.spine_event_key) : null;
-        const arcId = await db.upsertStoryArc(settings, {
-          chatId, title: arc.title, description: arc.description || "",
-          arcType: arc.arc_type || "main", status: arc.status || "active",
-          importance: arc.importance || 3, startMsgIdx: i, endMsgIdx: i + batch.length,
-          spineEventId: spineId,
-        });
-        let pos = 0;
-        for (const key of (arc.event_keys || [])) {
-          const eventId = eventKeyToId.get(key);
-          if (eventId) await db.linkEventToArc(settings, { arcId, eventId, position: pos++, isAnchor: eventId === spineId });
-        }
-      }
-
-      for (const ws of (extraction.world_state || [])) {
-        await db.upsertWorldState(settings, { ...ws, chatId });
-      }
-
-      for (const ku of (extraction.knowledge_updates || [])) {
-        if (ku.learned) await db.upsertFact(settings, { content: ku.learned, domain: "knowledge", confidence: 0.9, characterScope: [ku.character] });
-      }
-
-      for (const item of (extraction.items || [])) {
-        await db.upsertItem(settings, {
-          name: item.name, description: item.description, powers: item.powers,
-          significance: item.significance, owner: item.owner, location: item.location,
-          status: item.status, chatId,
-        }).catch(() => {});
-      }
-
-      if (extraction.context_snapshot) {
-        const snap = extraction.context_snapshot;
-        const wsSnap = {};
-        for (const ws of (extraction.world_state || [])) wsSnap[ws.key] = ws.value;
-        await db.insertContextSnapshot(settings, {
-          chatId, messageIndex: i,
-          summary: snap.summary || "",
-          locationName: snap.location || null,
-          presentChars: snap.present_characters || [],
-          emotionalTone: snap.emotional_tone || "",
-          worldStateSnapshot: wsSnap,
-        });
-      }
-
-      for (const pt of (extraction.plot_threads || [])) {
-        await db.upsertPlotThread(settings, {
-          chatId, title: pt.title, description: pt.description || "",
-          threadType: pt.type || "pending",
-          involvedChars: pt.involved_characters || [],
-          plantedAt: i, resolvedAt: pt.type === "resolved" ? i : null,
-          importance: pt.importance || 3,
-        });
-      }
-    } catch (err) {
-      console.warn(`[ingest] batch ${i} graph write error: ${err.message}`);
-    }
-
-    for (let mi = 0; mi < batch.length; mi++) {
-      const m = batch[mi];
-      if (m.is_system) continue;
-      const text = `${m.name}: ${m.mes}`;
-      if (text.length < 80) continue;
-      const messageIndex = i + mi;
-
-      const before = messages.slice(Math.max(0, messageIndex - ctxWindow), messageIndex);
-      const after = messages.slice(messageIndex + 1, messageIndex + 1 + ctxWindow);
-      const surroundingContext = [...before, ...after]
-        .filter((mm) => !mm.is_system)
-        .map((mm) => `${mm.name}: ${(mm.mes || "").slice(0, 400)}`)
-        .join("\n\n");
-
-      let situating = "";
+    if (extraction) {
       try {
-        situating = await generateSituatingBlurb(settings, {
-          chatTitle: chatId,
-          surroundingContext,
-          message: text,
+        await applyExtractionToGraph(settings, {
+          extraction,
+          chatId,
+          charName,
+          userName,
+          messageIndex: i,
+          batchSize: batch.length,
         });
       } catch (err) {
-        console.warn(`[ingest] msg ${messageIndex} situating failed: ${err.message}`);
+        console.warn(`[ingest] batch ${i} graph write error: ${err.message}`);
       }
+    }
 
-      const chunks = chunkText(m.mes);
-      for (let ci = 0; ci < chunks.length; ci++) {
-        const chunk = chunks[ci];
-        const labeledChunk = `${m.name}: ${chunk}`;
-        const embedInput = situating ? `${situating}\n\n${labeledChunk}` : labeledChunk;
-        try {
-          const v = await embed(settings, embedInput);
-          await db.upsertMemoryEmbedding(settings, {
-            chatId,
-            nodeType: chunks.length > 1 ? "message_chunk" : "message",
-            nodeId: chunks.length > 1
-              ? `msg-${chatId}-${messageIndex}-c${ci}`
-              : `msg-${chatId}-${messageIndex}`,
-            content: labeledChunk.slice(0, 2000),
-            rawText: chunk,
-            embedding: v,
-            characterScope: [m.name],
-            messageIndex,
-            contextPrefix: situating || null,
-          });
-          embedCount++;
-          if (chunks.length > 1) chunkCount++;
-        } catch (err) {
-          console.warn(`[ingest] msg ${messageIndex} chunk ${ci} embed failed: ${err.message}`);
-        }
-      }
-
-      const quotes = extractDialogueQuotes(m.mes);
-      for (const q of quotes) {
-        try {
-          await db.upsertDialogueQuote(settings, {
-            chatId, sessionId: chatId, speaker: m.name, quote: q, messageIndex,
-          });
-          quoteCount++;
-        } catch (err) {
-          console.warn(`[ingest] msg ${messageIndex} quote insert failed: ${err.message}`);
-        }
-      }
+    // Vector writes run even if graph writes threw — chunks/quotes are
+    // independently valuable for retrieval.
+    try {
+      const stats = await applyMessagesToVectorStore(settings, {
+        messages,
+        chatBatch: batch,
+        batchStart: i,
+        messageIndexOffset: i,
+        chatId,
+        ctxWindow,
+      });
+      embedCount += stats.embeds;
+      chunkCount += stats.chunks;
+      quoteCount += stats.quotes;
+    } catch (err) {
+      console.warn(`[ingest] batch ${i} vector write error: ${err.message}`);
     }
 
     extractedCount++;

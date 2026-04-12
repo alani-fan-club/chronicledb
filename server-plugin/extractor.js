@@ -24,19 +24,22 @@ RULES:
 
 Return ONLY valid JSON:
 {
-  "characters": [{ "name": "", "new_facts": [] }],
-  "relationships": [{ "from": "", "to": "", "sentiment": "", "intensity": 0.0, "evidence": "" }],
-  "events": [{ "summary": "", "participants": [], "location": "", "significance": 0 }],
+  "characters": [{ "name": "", "new_facts": [], "role": "protagonist/antagonist/ally/npc/mentor/etc", "status": "active/injured/missing/dead/etc", "significance": 3 }],
+  "relationships": [{ "from": "", "to": "", "sentiment": -1.0, "intensity": 0.5, "description": "Rich 2-3 sentence description of the relationship dynamics, emotional undercurrents, and recent developments" }],
+  "events": [{ "summary": "", "participants": [], "location": "", "significance": 3 }],
   "world_state": [{ "key": "", "value": "", "reason": "" }],
   "knowledge_updates": [
     { "character": "", "learned": "", "source": "" },
     { "character": "", "does_not_know": "" }
   ],
+  "items": [{ "name": "", "description": "", "powers": "", "significance": 3, "owner": "character name or null", "location": "location name or null", "status": "intact/damaged/lost/hidden/etc" }],
+  "locations_detail": [{ "name": "", "description": "", "importance": 3, "current_state": "What the location currently looks like or what's happening there" }],
   "context_snapshot": {
     "summary": "Brief description of the current scene",
     "location": "Where the scene is taking place",
     "present_characters": ["names of characters currently present"],
-    "emotional_tone": "tense/warm/hostile/playful/melancholic/etc"
+    "emotional_tone": "tense/warm/hostile/playful/melancholic/etc",
+    "genre": "The genre/mood of this RP (action/romance/mystery/horror/etc)"
   },
   "plot_threads": [
     {
@@ -46,7 +49,8 @@ Return ONLY valid JSON:
       "involved_characters": ["names"],
       "importance": 3
     }
-  ]
+  ],
+  "contradictions": ["Any detail that contradicts previously established facts, if noticed"]
 }`;
 
 async function extract(settings, { characterName, userName, messages }) {

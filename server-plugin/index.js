@@ -82,15 +82,58 @@ async function init(router) {
         }
       }
 
+      // Update character role/status/significance
+      for (const char of (extraction.characters || [])) {
+        if (char.role || char.status || char.significance) {
+          const p = db.getPool(settings);
+          const charId = db.slugify(char.name);
+          await p.query(
+            `UPDATE characters SET role = COALESCE(NULLIF($2, ''), role), status = COALESCE(NULLIF($3, ''), status), significance = GREATEST(significance, $4) WHERE id = $1`,
+            [charId, char.role || "", char.status || "", char.significance || 3],
+          );
+        }
+      }
+
       for (const rel of (extraction.relationships || [])) {
         await db.upsertRelationship(settings, {
           from: rel.from,
           to: rel.to,
           sentiment: parseFloat(rel.sentiment) || 0,
           intensity: parseFloat(rel.intensity) || 0.5,
-          description: rel.evidence || rel.sentiment,
+          description: rel.description || rel.evidence || "",
           sessionId: chatId,
         });
+      }
+
+      // Items
+      for (const item of (extraction.items || [])) {
+        const p = db.getPool(settings);
+        const itemId = `item-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+        let ownerId = null;
+        let locationId = null;
+        if (item.owner) ownerId = db.slugify(item.owner);
+        if (item.location) locationId = await db.upsertLocation(settings, item.location, "");
+        await p.query(
+          `INSERT INTO items (id, name, description, powers, significance, owner_id, location_id, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT DO NOTHING`,
+          [itemId, item.name, item.description || "", item.powers || "", item.significance || 3, ownerId, locationId, item.status || "intact"],
+        );
+      }
+
+      // Location detail updates
+      for (const loc of (extraction.locations_detail || [])) {
+        const locId = await db.upsertLocation(settings, loc.name, loc.description || "");
+        const p = db.getPool(settings);
+        await p.query(
+          `UPDATE locations SET importance = GREATEST(importance, $2), current_state = $3 WHERE id = $1`,
+          [locId, loc.importance || 3, loc.current_state || ""],
+        ).catch(() => {});
+      }
+
+      // Contradictions — log for review
+      for (const c of (extraction.contradictions || [])) {
+        if (c) console.warn(`[ChronicleDB] Contradiction detected: ${c}`);
       }
 
       for (const event of (extraction.events || [])) {

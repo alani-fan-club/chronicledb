@@ -6,20 +6,25 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- ── Node tables ────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS characters (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    aliases     TEXT[] DEFAULT '{}',
-    description TEXT DEFAULT '',
-    faction     TEXT,
-    first_seen  TEXT,
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    aliases      TEXT[] DEFAULT '{}',
+    description  TEXT DEFAULT '',
+    faction      TEXT,
+    role         TEXT DEFAULT '',
+    status       TEXT DEFAULT 'active',
+    significance INT DEFAULT 3,
+    first_seen   TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS locations (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
     description     TEXT DEFAULT '',
+    importance      INT DEFAULT 3,
+    current_state   TEXT DEFAULT '',
     parent_location TEXT REFERENCES locations(id),
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -133,6 +138,20 @@ CREATE TABLE IF NOT EXISTS plot_threads (
 
 CREATE INDEX IF NOT EXISTS idx_plot_active
     ON plot_threads (chat_id) WHERE resolved_at IS NULL;
+
+-- ── Items (key objects with owners, powers, significance) ──────
+
+CREATE TABLE IF NOT EXISTS items (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    description  TEXT DEFAULT '',
+    powers       TEXT DEFAULT '',
+    significance INT DEFAULT 3,
+    owner_id     TEXT REFERENCES characters(id),
+    location_id  TEXT REFERENCES locations(id),
+    status       TEXT DEFAULT 'intact',
+    created_at   TIMESTAMPTZ DEFAULT NOW()
+);
 
 -- ── Vector table ───────────────────────────────────────────────
 

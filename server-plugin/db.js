@@ -321,42 +321,31 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   const p = getPool(settings);
   const startId = slugify(characterName);
 
-  // Recursive CTE: walk relationships, knowledge, events, locations up to N hops
+  // Recursive CTE: walk through a unified edges view
+  // Single self-reference required by PostgreSQL
   const { rows } = await p.query(`
-    WITH RECURSIVE graph_walk AS (
-      -- Seed: the starting character
+    WITH RECURSIVE
+    -- Unified edges view: all graph edges as (from, from_type, to, to_type) tuples
+    all_edges AS (
+      SELECT from_char as src, 'character'::text as src_type, to_char as dst, 'character'::text as dst_type FROM feels_about
+      UNION ALL
+      SELECT to_char, 'character', from_char, 'character' FROM feels_about
+      UNION ALL
+      SELECT character_id, 'character', fact_id, 'fact' FROM knows
+      UNION ALL
+      SELECT character_id, 'character', event_id, 'event' FROM participated_in
+      UNION ALL
+      SELECT event_id, 'event', character_id, 'character' FROM participated_in
+      UNION ALL
+      SELECT character_id, 'character', location_id, 'location' FROM present_at WHERE is_current = TRUE
+    ),
+    graph_walk AS (
       SELECT $1::text as node_id, 'character'::text as node_type, 0 as hop
       UNION
-      -- Hop through feels_about (both directions)
-      SELECT CASE WHEN fa.from_char = gw.node_id THEN fa.to_char ELSE fa.from_char END,
-             'character', gw.hop + 1
+      SELECT ae.dst, ae.dst_type, gw.hop + 1
       FROM graph_walk gw
-      JOIN feels_about fa ON (fa.from_char = gw.node_id OR fa.to_char = gw.node_id)
-      WHERE gw.node_type = 'character' AND gw.hop < $2
-      UNION
-      -- Hop through knows (character → fact)
-      SELECT k.fact_id, 'fact', gw.hop + 1
-      FROM graph_walk gw
-      JOIN knows k ON k.character_id = gw.node_id
-      WHERE gw.node_type = 'character' AND gw.hop < $2
-      UNION
-      -- Hop through participated_in (character → event)
-      SELECT pi.event_id, 'event', gw.hop + 1
-      FROM graph_walk gw
-      JOIN participated_in pi ON pi.character_id = gw.node_id
-      WHERE gw.node_type = 'character' AND gw.hop < $2
-      UNION
-      -- Hop through events back to characters (event → participants)
-      SELECT pi.character_id, 'character', gw.hop + 1
-      FROM graph_walk gw
-      JOIN participated_in pi ON pi.event_id = gw.node_id
-      WHERE gw.node_type = 'event' AND gw.hop < $2
-      UNION
-      -- Hop through present_at (character → location)
-      SELECT pa.location_id, 'location', gw.hop + 1
-      FROM graph_walk gw
-      JOIN present_at pa ON pa.character_id = gw.node_id AND pa.is_current = TRUE
-      WHERE gw.node_type = 'character' AND gw.hop < $2
+      JOIN all_edges ae ON ae.src = gw.node_id AND ae.src_type = gw.node_type
+      WHERE gw.hop < $2
     )
     SELECT DISTINCT node_id, node_type, min(hop) as hop
     FROM graph_walk
@@ -390,6 +379,8 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
 
   // Get edges between discovered nodes
   const edges = [];
+  const allNodeIds = [...charIds, ...factIds, ...eventIds, ...locIds];
+
   if (charIds.length > 0) {
     const { rows: rels } = await p.query(
       `SELECT from_char as source, to_char as target, sentiment, intensity, description
@@ -398,7 +389,30 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
     );
     for (const r of rels) {
       edges.push({ id: `fa-${r.source}-${r.target}`, source: r.source, target: r.target,
-        type: "FEELS_ABOUT", label: r.description, sentiment: r.sentiment, intensity: r.intensity });
+        type: "FEELS_ABOUT", label: r.description || "",
+        sentiment: parseFloat(r.sentiment) || 0, intensity: parseFloat(r.intensity) || 0.5 });
+    }
+  }
+
+  if (charIds.length > 0 && factIds.length > 0) {
+    const { rows: kn } = await p.query(
+      `SELECT character_id, fact_id FROM knows WHERE character_id = ANY($1) AND fact_id = ANY($2)`,
+      [charIds, factIds],
+    );
+    for (const k of kn) {
+      edges.push({ id: `kn-${k.character_id}-${k.fact_id}`, source: k.character_id, target: k.fact_id,
+        type: "KNOWS", label: "knows", sentiment: 0, intensity: 0.3 });
+    }
+  }
+
+  if (charIds.length > 0 && eventIds.length > 0) {
+    const { rows: pi } = await p.query(
+      `SELECT character_id, event_id, role FROM participated_in WHERE character_id = ANY($1) AND event_id = ANY($2)`,
+      [charIds, eventIds],
+    );
+    for (const p of pi) {
+      edges.push({ id: `pi-${p.character_id}-${p.event_id}`, source: p.character_id, target: p.event_id,
+        type: "PARTICIPATED_IN", label: p.role || "participated", sentiment: 0, intensity: 0.5 });
     }
   }
 

@@ -61,7 +61,7 @@ function initCytoscape() {
           "text-halign": "center",
           "text-margin-y": 5,
           "font-size": "0px", // hidden by default, shown on hover/zoom
-          "font-family": "'Inter', sans-serif",
+          "font-family": "Inter",
           "font-weight": "500",
           color: COLORS.text,
           "text-outline-width": 2,
@@ -236,9 +236,17 @@ async function loadGraphData(scope = "global", params = {}) {
 function renderGraph(data) {
   cy.elements().remove();
 
-  // Calculate node sizes by connection count (Obsidian-style)
+  // Build set of valid node IDs
+  const nodeIds = new Set(data.nodes.map((n) => n.id));
+
+  // Filter edges to only ones where both endpoints exist
+  const validEdges = data.edges.filter(
+    (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
+  );
+
+  // Calculate node sizes by connection count
   const connectionCount = new Map();
-  for (const e of data.edges) {
+  for (const e of validEdges) {
     connectionCount.set(e.source, (connectionCount.get(e.source) || 0) + 1);
     connectionCount.set(e.target, (connectionCount.get(e.target) || 0) + 1);
   }
@@ -267,7 +275,7 @@ function renderGraph(data) {
     });
   }
 
-  for (const edge of data.edges) {
+  for (const edge of validEdges) {
     elements.push({
       group: "edges",
       data: {

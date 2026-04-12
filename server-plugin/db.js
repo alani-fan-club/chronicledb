@@ -62,19 +62,39 @@ async function upsertCharacter(settings, { name, aliases, description, firstSeen
   await p.query(
     `INSERT INTO characters (id, name, aliases, description, first_seen)
      VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (id) DO UPDATE SET aliases = $3, description = $4, updated_at = NOW()`,
+     ON CONFLICT (id) DO UPDATE SET
+       aliases = (
+         SELECT array_agg(DISTINCT a)
+         FROM unnest(characters.aliases || EXCLUDED.aliases) a
+       ),
+       description = COALESCE(NULLIF(EXCLUDED.description, ''), characters.description),
+       updated_at = NOW()`,
     [id, name, aliases || [], description || "", firstSeen || ""],
   );
   return id;
 }
 
+async function findCharacterByNameOrAlias(settings, name) {
+  const p = getPool(settings);
+  const { rows } = await p.query(
+    `SELECT id, name, aliases FROM characters
+     WHERE name = $1 OR $1 = ANY(aliases) OR id = $2
+     LIMIT 1`,
+    [name, slugify(name)],
+  );
+  return rows[0] || null;
+}
+
 async function upsertLocation(settings, name, description) {
   const p = getPool(settings);
   const id = "loc-" + name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  // Conflict on id (deterministic). Different spellings/casings of the same
+  // name slug to the same id, so the name unique constraint isn't enough.
   await p.query(
     `INSERT INTO locations (id, name, description)
      VALUES ($1, $2, $3)
-     ON CONFLICT (name) DO UPDATE SET description = $3`,
+     ON CONFLICT (id) DO UPDATE SET
+       description = COALESCE(NULLIF(EXCLUDED.description, ''), locations.description)`,
     [id, name, description || ""],
   );
   return id;
@@ -97,7 +117,7 @@ async function upsertRelationship(settings, { from, to, sentiment, intensity, de
   );
 }
 
-async function upsertEvent(settings, { summary, participants, location, significance, messageIndex, sessionId }) {
+async function upsertEvent(settings, { summary, sourceText, participants, location, significance, messageIndex, sessionId }) {
   const p = getPool(settings);
   const id = contentId("evt", `${summary}|${sessionId || ""}|${messageIndex || 0}`);
 
@@ -107,10 +127,13 @@ async function upsertEvent(settings, { summary, participants, location, signific
   }
 
   await p.query(
-    `INSERT INTO events (id, summary, significance, message_index, location_id, chat_id, timestamp)
-     VALUES ($1, $2, $3, $4, $5, $6, NOW())
-     ON CONFLICT (id) DO UPDATE SET summary = EXCLUDED.summary, significance = EXCLUDED.significance`,
-    [id, summary, significance || 3, messageIndex || 0, locationId, sessionId || ""],
+    `INSERT INTO events (id, summary, source_text, significance, message_index, location_id, chat_id, timestamp)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       summary = EXCLUDED.summary,
+       source_text = COALESCE(NULLIF(EXCLUDED.source_text, ''), events.source_text),
+       significance = EXCLUDED.significance`,
+    [id, summary, sourceText || "", significance || 3, messageIndex || 0, locationId, sessionId || ""],
   );
 
   for (const name of (participants || [])) {
@@ -152,14 +175,17 @@ async function upsertFact(settings, { content, domain, confidence, characterScop
 }
 
 async function upsertWorldState(settings, { key, value, reason }) {
+  if (!key || typeof key !== "string" || !key.trim()) return;
+  if (value === undefined || value === null) return;
   const p = getPool(settings);
+  const k = key.trim();
   await p.query(
     `UPDATE world_state SET valid_until = NOW() WHERE key = $1 AND valid_until IS NULL`,
-    [key],
+    [k],
   );
   await p.query(
     `INSERT INTO world_state (key, value, reason) VALUES ($1, $2, $3)`,
-    [key, value, reason || ""],
+    [k, String(value), reason || ""],
   );
 }
 
@@ -321,13 +347,42 @@ async function upsertItem(settings, { name, description, powers, significance, o
 
 // ── Vector operations ───────────────────────────────────────��──
 
-async function storeEmbedding(settings, { chatId, nodeType, nodeId, content, embedding, characterScope, messageIndex }) {
+async function storeEmbedding(settings, { chatId, nodeType, nodeId, content, embedding, characterScope, messageIndex, rawText }) {
   const p = getPool(settings);
   await p.query(
-    `INSERT INTO memory_embeddings (chat_id, node_type, node_id, content, embedding, character_scope, message_index)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-    [chatId, nodeType, nodeId, content, JSON.stringify(embedding), characterScope || [], messageIndex || null],
+    `INSERT INTO memory_embeddings (chat_id, node_type, node_id, content, embedding, character_scope, message_index, raw_text)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [chatId, nodeType, nodeId, content, JSON.stringify(embedding), characterScope || [], messageIndex || null, rawText || null],
   );
+}
+
+async function upsertMemoryEmbedding(settings, { chatId, nodeType, nodeId, content, embedding, characterScope, messageIndex, rawText, contextPrefix }) {
+  const p = getPool(settings);
+  // Dedupe by (chat_id, node_type, node_id) so re-ingest replaces rather than appends.
+  await p.query(
+    `DELETE FROM memory_embeddings WHERE chat_id = $1 AND node_type = $2 AND node_id = $3`,
+    [chatId, nodeType, nodeId],
+  );
+  await p.query(
+    `INSERT INTO memory_embeddings (chat_id, node_type, node_id, content, embedding, character_scope, message_index, raw_text, context_prefix)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    [chatId, nodeType, nodeId, content, JSON.stringify(embedding), characterScope || [], messageIndex ?? null, rawText || null, contextPrefix || null],
+  );
+}
+
+async function upsertDialogueQuote(settings, { chatId, sessionId, speaker, quote, messageIndex }) {
+  const p = getPool(settings);
+  const id = createHash("sha1")
+    .update(`${chatId}|${messageIndex ?? ""}|${speaker}|${quote}`)
+    .digest("hex")
+    .slice(0, 16);
+  await p.query(
+    `INSERT INTO dialogue_quotes (id, chat_id, session_id, speaker, quote, message_index)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (id) DO NOTHING`,
+    [id, chatId, sessionId || null, speaker, quote, messageIndex ?? null],
+  );
+  return id;
 }
 
 async function vectorSearch(settings, { embedding, chatId, limit, characterScope }) {
@@ -341,7 +396,8 @@ async function vectorSearch(settings, { embedding, chatId, limit, characterScope
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
   const { rows } = await p.query(
-    `SELECT id, chat_id, node_type, node_id, content, character_scope, message_index,
+    `SELECT id, chat_id, node_type, node_id, content, COALESCE(raw_text, content) as raw_text,
+            character_scope, message_index, context_prefix,
             1 - (embedding <=> $1::vector) as similarity
      FROM memory_embeddings ${where}
      ORDER BY embedding <=> $1::vector LIMIT $2`,
@@ -353,7 +409,8 @@ async function vectorSearch(settings, { embedding, chatId, limit, characterScope
 async function vectorSearchScoped(settings, { embedding, chatIds, limit }) {
   const p = getPool(settings);
   const { rows } = await p.query(
-    `SELECT id, chat_id, node_type, node_id, content, character_scope, message_index,
+    `SELECT id, chat_id, node_type, node_id, content, COALESCE(raw_text, content) as raw_text,
+            character_scope, message_index, context_prefix,
             1 - (embedding <=> $1::vector) as similarity
      FROM memory_embeddings
      WHERE chat_id = ANY($3::text[])
@@ -361,6 +418,87 @@ async function vectorSearchScoped(settings, { embedding, chatIds, limit }) {
     [JSON.stringify(embedding), limit || 10, chatIds],
   );
   return rows;
+}
+
+/**
+ * PostgreSQL full-text lexical search on memory_embeddings.
+ * Uses the GENERATED tsv column + GIN index. Returns rows ordered
+ * by ts_rank descending. chatIds may be an array (scoped) or a
+ * single string; if falsy, searches globally.
+ */
+async function lexicalSearch(settings, { query, chatId, chatIds, limit }) {
+  const p = getPool(settings);
+  const conditions = ["tsv @@ plainto_tsquery('english', $1)"];
+  const params = [query, limit || 20];
+  let idx = 3;
+  const scopedIds = Array.isArray(chatIds) && chatIds.length > 0
+    ? chatIds
+    : (chatId ? [chatId] : null);
+  if (scopedIds) {
+    conditions.push(`chat_id = ANY($${idx}::text[])`);
+    params.push(scopedIds);
+    idx++;
+  }
+  const { rows } = await p.query(
+    `SELECT id, chat_id, node_type, node_id, content, COALESCE(raw_text, content) as raw_text,
+            character_scope, message_index, context_prefix,
+            ts_headline('english', COALESCE(raw_text, content),
+              plainto_tsquery('english', $1),
+              'MaxWords=150, MinWords=30, MaxFragments=5, FragmentDelimiter=" ... "') as headline,
+            ts_rank(tsv, plainto_tsquery('english', $1)) as rank
+     FROM memory_embeddings
+     WHERE ${conditions.join(" AND ")}
+     ORDER BY rank DESC
+     LIMIT $2`,
+    params,
+  );
+  return rows;
+}
+
+/**
+ * Hybrid vector + lexical search fused via Reciprocal Rank Fusion.
+ * RRF formula: score = sum(1 / (k + rank)) across result lists, where
+ * `rank` is the 1-indexed position in each list and k=60 (standard).
+ * Overfetches each source by ~3× to give fusion material to work with.
+ */
+async function hybridSearch(settings, { embedding, query, chatId, chatIds, limit, characterScope }) {
+  const k = 60; // RRF constant
+  const finalLimit = limit || 8;
+  const fetchSize = finalLimit * 3;
+
+  const scopedIds = Array.isArray(chatIds) && chatIds.length > 0
+    ? chatIds
+    : (chatId ? [chatId] : null);
+
+  const vectorPromise = scopedIds
+    ? vectorSearchScoped(settings, { embedding, chatIds: scopedIds, limit: fetchSize })
+    : vectorSearch(settings, { embedding, limit: fetchSize, characterScope });
+
+  const [vectorResults, lexicalResults] = await Promise.all([
+    vectorPromise,
+    lexicalSearch(settings, { query, chatIds: scopedIds, limit: fetchSize }),
+  ]);
+
+  const scores = new Map(); // id → { score, item }
+  vectorResults.forEach((r, i) => {
+    const s = 1 / (k + i + 1);
+    scores.set(r.id, { score: s, item: r });
+  });
+  lexicalResults.forEach((r, i) => {
+    const s = 1 / (k + i + 1);
+    if (scores.has(r.id)) {
+      const existing = scores.get(r.id);
+      existing.score += s;
+      if (r.headline && !existing.item.headline) existing.item.headline = r.headline;
+    } else {
+      scores.set(r.id, { score: s, item: r });
+    }
+  });
+
+  return [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, finalLimit)
+    .map((x) => x.item);
 }
 
 // ── Query helpers for retrieval ────────────────────────────────
@@ -441,7 +579,7 @@ async function getRecentEvents(settings, chatId, limit, chatIds) {
   const params = scopeIds ? [limit || 5, scopeIds] : [limit || 5];
   const where = scopeIds ? `WHERE e.chat_id = ANY($2::text[])` : "";
   const { rows } = await p.query(
-    `SELECT e.summary, e.significance, e.timestamp, e.message_index,
+    `SELECT e.summary, e.source_text, e.significance, e.timestamp, e.message_index,
             array_agg(c.name) as participants
      FROM events e
      LEFT JOIN participated_in pi ON e.id = pi.event_id
@@ -894,12 +1032,12 @@ async function closePool() {
 
 module.exports = {
   getPool, initSchema, slugify,
-  upsertCharacter, upsertLocation, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
+  upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
   upsertTrait, getTraitsForCharacter,
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads, upsertItem,
   upsertStoryArc, linkEventToArc, createEventChain,
-  storeEmbedding, vectorSearch, vectorSearchScoped,
+  storeEmbedding, upsertMemoryEmbedding, upsertDialogueQuote, vectorSearch, vectorSearchScoped, lexicalSearch, hybridSearch,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
   getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig, closePool,
 };

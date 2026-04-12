@@ -2,6 +2,7 @@
 -- No Apache AGE needed: graph stored as relational tables
 
 CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- ── Node tables ────────────────────────────────────────────────
 
@@ -30,16 +31,28 @@ CREATE TABLE IF NOT EXISTS locations (
 );
 
 CREATE TABLE IF NOT EXISTS events (
-    id            TEXT PRIMARY KEY,
-    summary       TEXT NOT NULL,
-    significance  INT DEFAULT 3,
-    message_index INT,
-    location_id   TEXT REFERENCES locations(id),
-    chat_id       TEXT,
-    timestamp     TIMESTAMPTZ DEFAULT NOW()
+    id                TEXT PRIMARY KEY,
+    summary           TEXT NOT NULL,
+    source_text       TEXT DEFAULT '',
+    significance      INT DEFAULT 3,
+    message_index     INT,
+    location_id       TEXT REFERENCES locations(id),
+    chat_id           TEXT,
+    timestamp         TIMESTAMPTZ DEFAULT NOW(),
+    tier              TEXT DEFAULT 'recent',
+    condensed_summary TEXT,
+    is_major          BOOLEAN GENERATED ALWAYS AS (significance >= 4) STORED
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_chat        ON events (chat_id);
+CREATE INDEX IF NOT EXISTS idx_events_chat ON events (chat_id);
+CREATE INDEX IF NOT EXISTS idx_events_major ON events (chat_id) WHERE is_major = true;
+
+ALTER TABLE events ADD COLUMN IF NOT EXISTS source_text TEXT DEFAULT '';
+ALTER TABLE events ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'recent';
+ALTER TABLE events ADD COLUMN IF NOT EXISTS condensed_summary TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_events_source_tsv
+    ON events USING GIN (to_tsvector('english', source_text));
 
 CREATE TABLE IF NOT EXISTS facts (
     id         TEXT PRIMARY KEY,
@@ -248,13 +261,46 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     embedding       vector(768) NOT NULL,
     character_scope TEXT[] DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
-    message_index   INT
+    message_index   INT,
+    raw_text        TEXT,
+    tsv             tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
 );
 
 CREATE INDEX IF NOT EXISTS idx_embed_hnsw
     ON memory_embeddings USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_embed_chat_type
     ON memory_embeddings (chat_id, node_type);
+
+-- Ensure raw_text column exists on existing deployments
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS raw_text TEXT;
+
+-- Ensure tsvector lexical search column exists on existing deployments
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+CREATE INDEX IF NOT EXISTS idx_embed_tsv ON memory_embeddings USING gin(tsv);
+
+-- Contextual retrieval: LLM-generated situating blurb prepended at embed time
+-- (Anthropic contextual-retrieval pattern). Nullable, no default.
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS context_prefix TEXT;
+
+-- ── Dialogue quotes (separate index for "what did X say" questions) ────
+
+CREATE TABLE IF NOT EXISTS dialogue_quotes (
+    id            TEXT PRIMARY KEY,
+    chat_id       TEXT NOT NULL,
+    session_id    TEXT,
+    speaker       TEXT NOT NULL,
+    quote         TEXT NOT NULL,
+    message_index INTEGER,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_tsv
+    ON dialogue_quotes USING GIN (to_tsvector('english', quote));
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_trgm
+    ON dialogue_quotes USING GIN (quote gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_chat_speaker
+    ON dialogue_quotes (chat_id, speaker);
 
 -- ── Session & config tables ────────────────────────────────────
 

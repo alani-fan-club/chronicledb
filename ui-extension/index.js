@@ -327,6 +327,13 @@ function saveAndSync(settings) {
   syncSettings(settings);
 }
 
+async function fetchWithCsrf(url, options = {}) {
+  const csrfRes = await fetch("/csrf-token");
+  const { token } = await csrfRes.json();
+  options.headers = { ...options.headers, "X-CSRF-Token": token };
+  return fetch(url, options);
+}
+
 async function syncSettings(settings) {
   try {
     await fetch(`${PLUGIN_BASE}/settings`, {
@@ -380,14 +387,17 @@ async function loadChatSelector() {
     for (const chat of chats) {
       const checked = selected.has(chat.chatId) ? "checked" : "";
       const dateLabel = chat.date || "unknown date";
+      const displayName = chat.chatId.split(" - ").pop() || chat.chatId;
       html += `
-        <label class="chronicle-chat-item">
+        <div class="chronicle-chat-item">
           <input type="checkbox" value="${chat.chatId}" ${checked}
                  class="chronicle-chat-checkbox">
-          <span>${chat.chatId.split(" - ").pop() || chat.chatId}</span>
+          <span class="chronicle-chat-name" title="${chat.chatId}">${displayName}</span>
           <span class="chronicle-chat-msgs">~${chat.messageEstimate} msgs</span>
           <span class="chronicle-chat-date">${dateLabel}</span>
-        </label>`;
+          <button class="chronicle-ingest-btn menu_button menu_button_small"
+                  data-filename="${chat.filename}" data-character="${characterName}">Ingest</button>
+        </div>`;
     }
 
     container.html(html);
@@ -396,10 +406,56 @@ async function loadChatSelector() {
     container.find(".chronicle-chat-checkbox").on("change", () => {
       saveCharacterChatSelection(characterName);
     });
+
+    // Ingest button per chat
+    container.find(".chronicle-ingest-btn").on("click", async function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      const btn = $(this);
+      const filename = btn.data("filename");
+      const charName = btn.data("character");
+
+      btn.prop("disabled", true).val("Ingesting...");
+      try {
+        const res = await fetchWithCsrf(`${PLUGIN_BASE}/ingest-chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ characterName: charName, filename }),
+        });
+        const data = await res.json();
+        if (res.ok) {
+          btn.val("Done!").addClass("success");
+          toastr.success(`Ingested ${data.messagesTotal} messages (${data.batchesProcessed}/${data.batchesTotal} batches) from ${charName}.`);
+        } else {
+          btn.val("Error");
+          toastr.error(`Ingest failed: ${data.error}`);
+        }
+      } catch (err) {
+        btn.val("Error");
+        toastr.error(`Ingest error: ${err.message}`);
+      }
+      setTimeout(() => btn.prop("disabled", false).val("Ingest"), 3000);
+    });
   } catch (err) {
     console.warn("[ChronicleDB] Failed to load chat selector:", err);
     container.html('<p class="chronicle-hint">Could not load chat list.</p>');
   }
+
+  // Ingest All button
+  $("#chronicle_ingestAllChats").off("click").on("click", async () => {
+    const buttons = container.find(".chronicle-ingest-btn");
+    if (buttons.length === 0) return;
+    toastr.info(`Ingesting ${buttons.length} chats for ${characterName}... this may take a while.`);
+    for (const btn of buttons) {
+      $(btn).trigger("click");
+      // Wait for each to finish before starting next (sequential to avoid hammering API)
+      await new Promise((resolve) => {
+        const check = setInterval(() => {
+          if (!$(btn).prop("disabled")) { clearInterval(check); resolve(); }
+        }, 500);
+      });
+    }
+  });
 
   // Select All / Select None buttons
   $("#chronicle_selectAllChats").off("click").on("click", () => {

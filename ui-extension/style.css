@@ -78,3 +78,21 @@
   padding: 2px 8px;
   font-size: 11px;
 }
+
+.chronicle-chat-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chronicle-ingest-btn {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+}
+
+.chronicle-ingest-btn.success {
+  border-color: var(--SmartThemeQuoteColor, #3fb950);
+  color: var(--SmartThemeQuoteColor, #3fb950);
+}

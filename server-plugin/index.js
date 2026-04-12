@@ -326,6 +326,146 @@ async function init(router) {
     }
   });
 
+  // ── Chat ingestion (backfill a specific chat file) ───────────
+
+  router.post("/ingest-chat", async (req, res) => {
+    try {
+      const { characterName, filename } = req.body;
+      if (!characterName || !filename) {
+        return res.status(400).json({ error: "characterName and filename required" });
+      }
+
+      const { readFileSync } = require("fs");
+      const { resolve, join } = require("path");
+
+      const dataRoot = settings.stDataRoot || "";
+      const chatsBase = resolve(dataRoot, "chats");
+
+      // Find matching directory
+      const { readdirSync } = require("fs");
+      const entries = readdirSync(chatsBase);
+      const matchingDir = entries.find((e) => e === characterName || e.startsWith(characterName));
+      if (!matchingDir) return res.status(404).json({ error: "Character chat dir not found" });
+
+      const filePath = join(chatsBase, matchingDir, filename);
+      const raw = readFileSync(filePath, "utf-8");
+      const lines = raw.split("\n").filter((l) => l.trim());
+      if (lines.length === 0) return res.status(400).json({ error: "Empty chat file" });
+
+      // Parse metadata from first line
+      const metadata = JSON.parse(lines[0]);
+      const charName = metadata.character_name || characterName;
+      const userName = metadata.user_name || "User";
+      const chatId = filename.replace(".jsonl", "");
+
+      // Parse messages
+      const messages = [];
+      for (let i = 1; i < lines.length; i++) {
+        try {
+          const msg = JSON.parse(lines[i]);
+          if (msg.mes !== undefined) messages.push(msg);
+        } catch { /* skip malformed */ }
+      }
+
+      // Process in batches
+      const batchSize = 10;
+      let extracted = 0;
+      const totalBatches = Math.ceil(messages.length / batchSize);
+
+      for (let i = 0; i < messages.length; i += batchSize) {
+        const batch = messages.slice(i, i + batchSize).map((m) => ({
+          name: m.name,
+          is_user: m.is_user,
+          is_system: m.is_system || false,
+          mes: m.swipe_id !== undefined && m.swipes?.[m.swipe_id] ? m.swipes[m.swipe_id] : m.mes,
+          send_date: m.send_date,
+        }));
+
+        try {
+          // Extract via Gemini
+          const extraction = await extract(settings, { characterName: charName, userName, messages: batch });
+
+          // Ingest characters
+          for (const char of (extraction.characters || [])) {
+            await db.upsertCharacter(settings, { name: char.name, aliases: [], description: (char.new_facts || []).join("; "), firstSeen: chatId });
+            if (char.role || char.status || char.significance) {
+              const p = db.getPool(settings);
+              await p.query(`UPDATE characters SET role = COALESCE(NULLIF($2,''),role), status = COALESCE(NULLIF($3,''),status), significance = GREATEST(significance,$4) WHERE id = $1`,
+                [db.slugify(char.name), char.role || "", char.status || "", char.significance || 3]);
+            }
+            for (const fact of (char.new_facts || [])) {
+              await db.upsertFact(settings, { content: fact, domain: "character", confidence: 0.8, characterScope: [char.name] });
+            }
+          }
+
+          // Relationships
+          for (const rel of (extraction.relationships || [])) {
+            await db.upsertRelationship(settings, { from: rel.from, to: rel.to, sentiment: parseFloat(rel.sentiment) || 0, intensity: parseFloat(rel.intensity) || 0.5, description: rel.description || "", sessionId: chatId });
+          }
+
+          // Events
+          for (const event of (extraction.events || [])) {
+            await db.insertEvent(settings, { summary: event.summary, participants: event.participants, location: event.location, significance: event.significance, messageIndex: i, sessionId: chatId });
+          }
+
+          // World state
+          for (const ws of (extraction.world_state || [])) {
+            await db.upsertWorldState(settings, ws);
+          }
+
+          // Knowledge
+          for (const ku of (extraction.knowledge_updates || [])) {
+            if (ku.learned) await db.upsertFact(settings, { content: ku.learned, domain: "knowledge", confidence: 0.9, characterScope: [ku.character] });
+          }
+
+          // Items
+          for (const item of (extraction.items || [])) {
+            const p = db.getPool(settings);
+            const itemId = `item-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+            let ownerId = item.owner ? db.slugify(item.owner) : null;
+            let locationId = item.location ? await db.upsertLocation(settings, item.location, "") : null;
+            await p.query(`INSERT INTO items (id,name,description,powers,significance,owner_id,location_id,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
+              [itemId, item.name, item.description||"", item.powers||"", item.significance||3, ownerId, locationId, item.status||"intact"]).catch(()=>{});
+          }
+
+          // Context snapshot
+          if (extraction.context_snapshot) {
+            const snap = extraction.context_snapshot;
+            const wsSnap = {};
+            for (const ws of (extraction.world_state || [])) wsSnap[ws.key] = ws.value;
+            await db.insertContextSnapshot(settings, { chatId, messageIndex: i, summary: snap.summary||"", locationName: snap.location||null, presentChars: snap.present_characters||[], emotionalTone: snap.emotional_tone||"", worldStateSnapshot: wsSnap });
+          }
+
+          // Plot threads
+          for (const pt of (extraction.plot_threads || [])) {
+            await db.upsertPlotThread(settings, { chatId, title: pt.title, description: pt.description||"", threadType: pt.type||"pending", involvedChars: pt.involved_characters||[], plantedAt: i, resolvedAt: pt.type==="resolved"?i:null, importance: pt.importance||3 });
+          }
+
+          // Embed the batch
+          const batchText = batch.filter(m=>!m.is_system).map(m=>`${m.name}: ${m.mes}`).join("\n").slice(0,8000);
+          const batchEmbed = await embed(settings, batchText);
+          await db.storeEmbedding(settings, { chatId, nodeType: "conversation", nodeId: `ingest-${chatId}-${i}`, content: batchText.slice(0,2000), embedding: batchEmbed, characterScope: [charName, userName], messageIndex: i });
+
+          extracted++;
+        } catch (err) {
+          console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message);
+        }
+      }
+
+      res.json({
+        ok: true,
+        character: charName,
+        chatId,
+        messagesTotal: messages.length,
+        batchesProcessed: extracted,
+        batchesTotal: totalBatches,
+      });
+    } catch (err) {
+      console.error("[ChronicleDB] Ingest chat error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Lorebook ingestion ───────────────────────────────────────
 
   router.get("/lorebooks", async (_req, res) => {

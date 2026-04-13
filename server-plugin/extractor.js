@@ -828,7 +828,10 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
   }
 
   // Events — build event_key → event_id map so arcs/chains can resolve keys.
+  // Also accumulate ids and embedding texts for the post-loop batch embed.
   const eventKeyToId = new Map();
+  const insertedEventIds = [];
+  const insertedEventTexts = [];
   for (const event of (extraction.events || [])) {
     const eventId = await db.upsertEvent(settings, {
       summary: event.summary,
@@ -840,6 +843,33 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
       sessionId: safeChat,
     });
     if (event.event_key) eventKeyToId.set(event.event_key, eventId);
+    insertedEventIds.push(eventId);
+    const text = (event.source_quote || "").trim()
+      ? `${event.summary}\n\n${event.source_quote}`
+      : (event.summary || "");
+    insertedEventTexts.push(text.slice(0, 8000));
+  }
+
+  // Populate events.embedding in a single batch call so arc-builder's
+  // cosine term has real signal on freshly-ingested rows. Without this
+  // the events.embedding column stays NULL and the 5-signal weighted
+  // graph degenerates into a near-complete topology (Path 1 smoke test
+  // caught exactly that failure — 3 arcs at Q=0.076). Failures are
+  // swallowed: event writes must not abort on an embed hiccup.
+  if (insertedEventIds.length > 0) {
+    try {
+      const vecs = await embedBatch(settings, insertedEventTexts);
+      const p = db.getPool(settings);
+      for (let i = 0; i < insertedEventIds.length; i++) {
+        if (!vecs[i]) continue;
+        await p.query(
+          `UPDATE events SET embedding = $1::vector WHERE id = $2`,
+          [JSON.stringify(vecs[i]), insertedEventIds[i]],
+        );
+      }
+    } catch (err) {
+      console.warn(`[ChronicleDB] event embedding at ingest failed: ${err.message}`);
+    }
   }
 
   // Event chains — only link when both endpoints were actually extracted

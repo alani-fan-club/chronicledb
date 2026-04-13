@@ -527,6 +527,7 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         domain: "knowledge",
         confidence: 0.9,
         characterScope: [ku.character],
+        chatId: safeChat,
       });
     }
   }
@@ -579,16 +580,20 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
       const locationId = await db.upsertLocation(settings, snap.location, "");
       const p = db.getPool(settings);
       const charIds = snap.present_characters.map((n) => db.slugify(n));
+      // Only clear presence within THIS chat so a character present in
+      // chat A doesn't get kicked out of their location in chat B when
+      // chat A's extraction fires.
       await p.query(
-        `UPDATE present_at SET is_current = FALSE WHERE character_id = ANY($1::text[])`,
-        [charIds],
+        `UPDATE present_at SET is_current = FALSE
+         WHERE character_id = ANY($1::text[]) AND chat_id = $2`,
+        [charIds, safeChat],
       ).catch(() => {});
       for (const presentName of snap.present_characters) {
         const pCharId = db.slugify(presentName);
         await db.upsertCharacter(settings, { name: presentName });
         await p.query(
-          `INSERT INTO present_at (character_id, location_id, is_current) VALUES ($1, $2, TRUE)`,
-          [pCharId, locationId],
+          `INSERT INTO present_at (character_id, location_id, is_current, chat_id) VALUES ($1, $2, TRUE, $3)`,
+          [pCharId, locationId, safeChat],
         ).catch(() => {});
       }
     }

@@ -150,8 +150,13 @@ async function upsertEvent(settings, { summary, sourceText, participants, locati
   return id;
 }
 
-async function upsertFact(settings, { content, domain, confidence, characterScope }) {
+async function upsertFact(settings, { content, domain, confidence, characterScope, chatId }) {
   const p = getPool(settings);
+  // Facts themselves stay globally-deduped (same content = same row) so
+  // dedup still works. The chat scope lives on the knows edge instead —
+  // "character X knows fact Y in chat Z" — so the same fact can be
+  // known by different characters in different chats without bleeding
+  // across scope.
   const id = contentId("fact", `${content}|${domain || "other"}`);
   await p.query(
     `INSERT INTO facts (id, content, domain, confidence)
@@ -162,13 +167,13 @@ async function upsertFact(settings, { content, domain, confidence, characterScop
 
   for (const charName of (characterScope || [])) {
     const charId = slugify(charName);
-    // Ensure character exists
     await upsertCharacter(settings, { name: charName });
     await p.query(
-      `INSERT INTO knows (character_id, fact_id, source)
-       VALUES ($1, $2, 'discovered')
-       ON CONFLICT (character_id, fact_id) DO NOTHING`,
-      [charId, id],
+      `INSERT INTO knows (character_id, fact_id, source, chat_id)
+       VALUES ($1, $2, 'discovered', $3)
+       ON CONFLICT (character_id, fact_id) DO UPDATE SET
+         chat_id = COALESCE(knows.chat_id, EXCLUDED.chat_id)`,
+      [charId, id, chatId || null],
     );
   }
 
@@ -340,20 +345,24 @@ async function getActivePlotThreads(settings, chatId) {
 
 async function upsertItem(settings, { name, description, powers, significance, owner, location, status, chatId }) {
   const p = getPool(settings);
+  // ID is content-addressed by (name, chatId) so the same-named item in two
+  // different chats gets two separate rows. This means OWNS edges never
+  // bleed across chats even when the same character appears in both.
   const id = contentId("item", `${name}|${chatId || ""}`);
   const ownerId = owner ? slugify(owner) : null;
   const locationId = location ? await upsertLocation(settings, location, "") : null;
   await p.query(
-    `INSERT INTO items (id, name, description, powers, significance, owner_id, location_id, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `INSERT INTO items (id, name, description, powers, significance, owner_id, location_id, status, chat_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (id) DO UPDATE SET
        description = EXCLUDED.description,
        powers = EXCLUDED.powers,
        significance = EXCLUDED.significance,
        owner_id = EXCLUDED.owner_id,
        location_id = EXCLUDED.location_id,
-       status = EXCLUDED.status`,
-    [id, name, description || "", powers || "", significance || 3, ownerId, locationId, status || "intact"],
+       status = EXCLUDED.status,
+       chat_id = COALESCE(items.chat_id, EXCLUDED.chat_id)`,
+    [id, name, description || "", powers || "", significance || 3, ownerId, locationId, status || "intact", chatId || null],
   );
   return id;
 }
@@ -709,8 +718,9 @@ async function traverseFromCharacter(settings, characterName, depth = 3, overrid
       SELECT to_char, 'character', from_char, 'character'
       FROM feels_about WHERE session_id = ANY($3)
       UNION ALL
-      -- Character knows facts
-      SELECT k.character_id, 'character', k.fact_id, 'fact' FROM knows k
+      -- Character knows facts (chat-scoped via knows.chat_id)
+      SELECT k.character_id, 'character', k.fact_id, 'fact'
+      FROM knows k WHERE k.chat_id = ANY($3)
       UNION ALL
       -- Character participated in events (from this char's chats)
       SELECT pi.character_id, 'character', pi.event_id, 'event'
@@ -725,11 +735,13 @@ async function traverseFromCharacter(settings, characterName, depth = 3, overrid
       SELECT e.id, 'event', e.location_id, 'location'
       FROM events e WHERE e.chat_id = ANY($3) AND e.location_id IS NOT NULL
       UNION ALL
-      -- Characters own items
-      SELECT i.owner_id, 'character', i.id, 'item' FROM items i WHERE i.owner_id IS NOT NULL
+      -- Characters own items (chat-scoped via items.chat_id)
+      SELECT i.owner_id, 'character', i.id, 'item'
+      FROM items i WHERE i.owner_id IS NOT NULL AND i.chat_id = ANY($3)
       UNION ALL
-      -- Items at locations
-      SELECT i.id, 'item', i.location_id, 'location' FROM items i WHERE i.location_id IS NOT NULL
+      -- Items at locations (chat-scoped)
+      SELECT i.id, 'item', i.location_id, 'location'
+      FROM items i WHERE i.location_id IS NOT NULL AND i.chat_id = ANY($3)
       UNION ALL
       -- Characters involved in plot threads
       SELECT ptc.character_id, 'character', ptc.plot_id, 'plot_thread'
@@ -979,20 +991,18 @@ async function getGraphData(settings, { scope, character, chatIds }) {
     });
   }
 
-  // Items: no chat_id column — include only if an in-scope character owns
-  // them (via connectedIds filled above). When unscoped, keep the old
-  // behavior of showing all items with an owner/location.
+  // Items: directly scoped by chat_id. Legacy rows with NULL chat_id are
+  // dropped under scoped mode (same pattern as feels_about.session_id).
+  // Unscoped mode keeps the old behavior of showing everything with an
+  // owner/location regardless of chat.
   const itemSql = scoped
-    ? `SELECT i.id, i.name, i.owner_id, i.location_id
-       FROM items i
-       WHERE (i.owner_id = ANY($1::text[]) OR i.location_id IS NOT NULL)
-         AND (i.owner_id IS NOT NULL OR i.location_id IS NOT NULL)`
+    ? `SELECT id, name, owner_id, location_id FROM items
+       WHERE chat_id = ANY($1::text[])
+         AND (owner_id IS NOT NULL OR location_id IS NOT NULL)`
     : `SELECT id, name, owner_id, location_id FROM items
        WHERE owner_id IS NOT NULL OR location_id IS NOT NULL`;
-  const itemParams = scoped ? [[...connectedIds]] : [];
-  const { rows: itemOwners } = await p.query(itemSql, itemParams);
+  const { rows: itemOwners } = await p.query(itemSql, scoped ? [chatIds] : []);
   for (const it of itemOwners) {
-    if (scoped && it.owner_id && !connectedIds.has(it.owner_id)) continue;
     connectedIds.add(it.id);
     if (it.owner_id) {
       connectedIds.add(it.owner_id);

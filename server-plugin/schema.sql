@@ -100,10 +100,13 @@ CREATE TABLE IF NOT EXISTS knows (
     fact_id     TEXT NOT NULL REFERENCES facts(id),
     learned_at  TIMESTAMPTZ DEFAULT NOW(),
     source      TEXT DEFAULT 'witnessed',
+    chat_id     TEXT,
     UNIQUE(character_id, fact_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_knows_fact         ON knows (fact_id);
+ALTER TABLE knows ADD COLUMN IF NOT EXISTS chat_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_knows_fact ON knows (fact_id);
+CREATE INDEX IF NOT EXISTS idx_knows_chat ON knows (chat_id);
 
 CREATE TABLE IF NOT EXISTS participated_in (
     id           SERIAL PRIMARY KEY,
@@ -121,11 +124,14 @@ CREATE TABLE IF NOT EXISTS present_at (
     location_id  TEXT NOT NULL REFERENCES locations(id),
     since        TIMESTAMPTZ DEFAULT NOW(),
     until_time   TIMESTAMPTZ,
-    is_current   BOOLEAN DEFAULT TRUE
+    is_current   BOOLEAN DEFAULT TRUE,
+    chat_id      TEXT
 );
 
+ALTER TABLE present_at ADD COLUMN IF NOT EXISTS chat_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_present_at_current
     ON present_at (character_id) WHERE is_current = TRUE;
+CREATE INDEX IF NOT EXISTS idx_present_at_chat ON present_at (chat_id);
 
 -- ── Context snapshots (scene state at a point in time) ─────────
 
@@ -240,11 +246,14 @@ CREATE TABLE IF NOT EXISTS items (
     owner_id     TEXT REFERENCES characters(id),
     location_id  TEXT REFERENCES locations(id),
     status       TEXT DEFAULT 'intact',
-    created_at   TIMESTAMPTZ DEFAULT NOW()
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    chat_id      TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_items_owner        ON items (owner_id);
-CREATE INDEX IF NOT EXISTS idx_items_location     ON items (location_id);
+ALTER TABLE items ADD COLUMN IF NOT EXISTS chat_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_items_owner ON items (owner_id);
+CREATE INDEX IF NOT EXISTS idx_items_location ON items (location_id);
+CREATE INDEX IF NOT EXISTS idx_items_chat ON items (chat_id);
 
 -- ── Ingestion status tracking ──────────────────────────────────
 

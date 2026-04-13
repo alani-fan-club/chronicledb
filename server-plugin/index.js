@@ -563,12 +563,16 @@ async function init(router) {
       const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
         ? req.query.chat_id
         : null;
+      // User-visible trait read: filter out merged variant rows so the
+      // same trait never surfaces twice. Path 1's canonical-row dedup
+      // pipeline keeps merged rows in place for provenance, but they
+      // must never reach the UI.
       const sql = chatId
         ? `SELECT category, content, source_chat FROM traits
-           WHERE character_id = $1 AND source_chat = $2
+           WHERE character_id = $1 AND source_chat = $2 AND canonical_id IS NULL
            ORDER BY category, content`
         : `SELECT category, content, source_chat FROM traits
-           WHERE character_id = $1
+           WHERE character_id = $1 AND canonical_id IS NULL
            ORDER BY category, content`;
       const params = chatId ? [charId, chatId] : [charId];
       const { rows } = await p.query(sql, params);

@@ -109,6 +109,28 @@ Extract:
        something is a trait or a mood, it's a mood — put it in
        scene_state or drop it. Emit 3-5 very confident persistent
        traits per character per batch rather than 15 maybe-traits.
+     * **Every trait MUST come with an evidence_sentence**: one
+       sentence drawn verbatim from the passage (lightly cleaned is OK:
+       strip dialogue tags, redundant framing, and he-said/she-said
+       attribution) that directly justifies the trait. This is what the
+       downstream embedder uses to disambiguate "stoic the trait" from
+       "stoic the fleeting mood"; without it the trait cannot be
+       deduped against existing ones correctly.
+
+       Positive examples of good evidence_sentence:
+         * Trait: "stoic"
+           evidence_sentence: "He did not flinch when the blade
+             grazed his cheek, and his expression never changed."
+         * Trait: "former yakuza captain"
+           evidence_sentence: "Protagonist served as a captain under
+             Faction for six years before the 1988 incident."
+         * Trait: "protective of children"
+           evidence_sentence: "She stepped between the child and the
+             gunman without hesitation."
+       Each of those is one sentence, drawn from the passage,
+       descriptive or quoted, and specifically justifies the trait.
+       If no single sentence supports the trait, do not emit the
+       trait — choose a different one you can actually evidence.
 
    ── scene_state ─────────────────────────────────────────────────────
    How the character is feeling / behaving IN THIS SCENE ONLY. Momentary
@@ -183,7 +205,7 @@ Return ONLY valid JSON:
     "name": "",
     "aliases": [],
     "persistent_traits": [
-      { "category": "personality | skill | background | physical | faction", "content": "" }
+      { "category": "personality | skill | background | physical | faction", "content": "", "evidence_sentence": "<one sentence from the passage that justifies this trait>" }
     ],
     "scene_state": [
       "amused",
@@ -557,10 +579,17 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
     }
     for (const trait of persistentTraits) {
       if (trait && trait.content) {
+        // Path 1: pass characterName + evidence_sentence so upsertTrait
+        // can build a contextual embedding text of the form
+        // `${name} is ${content}: ${evidence_sentence}`. When the prompt
+        // didn't emit an evidence sentence (older prompts, or the LLM
+        // omitted it), upsertTrait falls back to `${name} is ${content}`.
         await db.upsertTrait(settings, {
           characterId: charId,
+          characterName: char.name,
           category: trait.category || "personality",
           content: trait.content,
+          evidenceSentence: trait.evidence_sentence || "",
           sourceChat: safeChat,
         });
       }
@@ -569,6 +598,7 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
     for (const fact of (char.new_facts || [])) {
       await db.upsertTrait(settings, {
         characterId: charId,
+        characterName: char.name,
         category: "personality",
         content: fact,
         sourceChat: safeChat,

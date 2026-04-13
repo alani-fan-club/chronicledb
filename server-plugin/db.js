@@ -377,11 +377,24 @@ function classifyDisposition(candidate, category) {
   return "verify";
 }
 
-async function upsertTrait(settings, { characterId, category, content, sourceChat }) {
+// Cosine thresholds for Path 1's canonical-row dedup pipeline. See
+// RESEARCH_TRAITS.md §5 Path 1 for the calibration rationale. Top-hit
+// cosine ≥ MERGE_THRESHOLD means "same trait, merge onto canonical";
+// VERIFY_THRESHOLD–MERGE_THRESHOLD is the band where Path 3's LLM
+// verifier would be invoked once it exists; below VERIFY_THRESHOLD is a
+// new canonical row.
+const TRAIT_MERGE_COSINE = 0.88;
+const TRAIT_VERIFY_COSINE = 0.80;
+
+async function upsertTrait(
+  settings,
+  { characterId, characterName, category, content, evidenceSentence, sourceChat },
+) {
   const p = getPool(settings);
   if (!content || !String(content).trim()) return null;
   const cleaned = String(content).trim();
   const cat = category || "personality";
+  const evidence = (evidenceSentence || "").toString().trim();
 
   // Reject obvious transient emotional states before they land as
   // "personality traits". The prompt tells the LLM not to emit these but
@@ -413,11 +426,15 @@ async function upsertTrait(settings, { characterId, category, content, sourceCha
   //     / "Former manager of the Grand")
   // When a match is found, keep whichever content is longer (more specific
   // wording wins). No UPDATE — just return the winner's id.
+  //
+  // The fuzzy pre-check only considers canonical rows (canonical_id IS
+  // NULL) — merged variants would otherwise re-match their own alias
+  // content and block the Path 1 embedding pipeline from being reached.
   const { rows: similar } = await p.query(
     `SELECT id, content, length(content) AS len,
             similarity(lower(content), lower($3)) AS sim
      FROM traits
-     WHERE character_id = $1 AND category = $2
+     WHERE character_id = $1 AND category = $2 AND canonical_id IS NULL
        AND (
          stemmed_content = strip(to_tsvector('english', $3))::text
          OR lower(content) LIKE '%' || lower($3) || '%'
@@ -447,31 +464,174 @@ async function upsertTrait(settings, { characterId, category, content, sourceCha
     return match.id;
   }
 
-  // No fuzzy match. Insert, with ON CONFLICT on the exact-normalized
-  // unique index as a safety net for race conditions + case variants.
+  // ── Path 1: contextual embedding → kNN → canonical-row dedup ──
+  //
+  // Build the contextual embedding text (Anthropic contextual-retrieval
+  // pattern). The evidence sentence is what makes "stoic" / "unflappable"
+  // / "keeps composure under pressure" land in the same neighborhood.
+  // Fall back to the bare `${name} is ${content}` form when evidence is
+  // missing (legacy callers, legacy prompts).
+  const name = (characterName || "").toString().trim() || characterId;
+  const embedText = evidence
+    ? `${name} is ${cleaned}: ${evidence}`
+    : `${name} is ${cleaned}`;
+
+  let embedding = null;
+  try {
+    // Lazy require to avoid the db ↔ extractor circular import.
+    const extractor = require("./extractor");
+    embedding = await extractor.embed(settings, embedText);
+  } catch (err) {
+    console.warn(`[ChronicleDB] trait embed failed (${err.message}); inserting without embedding`);
+    embedding = null;
+  }
+
+  // kNN against existing canonical traits for the same character and
+  // category. We restrict the search to canonical_id IS NULL both so the
+  // partial HNSW index (idx_traits_embedding_hnsw) is used, and so merged
+  // variants never get returned and re-merged onto themselves.
+  let topHit = null;
+  if (embedding) {
+    try {
+      const { rows: neighbors } = await p.query(
+        `SELECT id, content, 1 - (embedding <=> $1::vector) AS cos
+         FROM traits
+         WHERE character_id = $2 AND category = $3
+           AND canonical_id IS NULL
+           AND embedding IS NOT NULL
+         ORDER BY embedding <=> $1::vector
+         LIMIT 3`,
+        [JSON.stringify(embedding), characterId, cat],
+      );
+      if (neighbors.length > 0) topHit = neighbors[0];
+    } catch (err) {
+      console.warn(`[ChronicleDB] trait kNN failed (${err.message}); falling through to canonical insert`);
+      topHit = null;
+    }
+  }
+
+  // Build the alias string we'd stash on the canonical row if we merge.
+  // Keep the evidence alongside the content so retrieval can do full-
+  // text fallback on the merged variants without a second table.
+  const aliasEntry = evidence ? `${cleaned}: ${evidence}` : cleaned;
+
+  if (topHit && typeof topHit.cos === "number" && topHit.cos >= TRAIT_MERGE_COSINE) {
+    // MERGE: append to the canonical row's aliases, bump merged_count,
+    // and insert this row pointing at it so the provenance survives.
+    try {
+      await p.query(
+        `UPDATE traits
+         SET aliases = array_append(COALESCE(aliases, '{}'::text[]), $2),
+             merged_count = COALESCE(merged_count, 1) + 1
+         WHERE id = $1`,
+        [topHit.id, aliasEntry],
+      );
+    } catch (err) {
+      console.warn(`[ChronicleDB] trait merge UPDATE failed (${err.message})`);
+    }
+    const mergedId = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    try {
+      await p.query(
+        `INSERT INTO traits (id, character_id, category, content, source_chat, embedding, evidence_sentence, canonical_id)
+         VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8)
+         ON CONFLICT (character_id, category, normalized_content) DO NOTHING`,
+        [
+          mergedId,
+          characterId,
+          cat,
+          cleaned,
+          sourceChat || "",
+          embedding ? JSON.stringify(embedding) : null,
+          evidence || null,
+          topHit.id,
+        ],
+      );
+    } catch (err) {
+      // A normalized-index conflict means an identical row already
+      // exists — nothing to do.
+    }
+    try {
+      await recomputeCharacterSummary(settings, characterId);
+    } catch (err) {
+      console.warn(`[ChronicleDB] recomputeCharacterSummary failed after merge: ${err.message}`);
+    }
+    return topHit.id;
+  }
+
+  if (
+    topHit &&
+    typeof topHit.cos === "number" &&
+    topHit.cos >= TRAIT_VERIFY_COSINE &&
+    topHit.cos < TRAIT_MERGE_COSINE
+  ) {
+    // VERIFY band. Path 3 (LLM verifier) is not yet built — log the
+    // near-miss and fall through to NEW_CANONICAL so we don't lose the
+    // candidate. TODO(Path 3): replace this branch with a call to the
+    // verifier that returns MERGE / KEEP_DISTINCT / REJECT_NEW.
+    console.info(
+      `[ChronicleDB] trait verifier queue: "${cleaned}" vs "${topHit.content}" cos=${topHit.cos.toFixed(4)} (char=${characterId} cat=${cat})`,
+    );
+  }
+
+  // NEW_CANONICAL: insert as a fresh canonical row, embedding populated
+  // if we have one, canonical_id = NULL. The existing exact-normalized
+  // ON CONFLICT remains as a safety net against races/case variants.
   const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const { rows: inserted } = await p.query(
-    `INSERT INTO traits (id, character_id, category, content, source_chat)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO traits (id, character_id, category, content, source_chat, embedding, evidence_sentence)
+     VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
      ON CONFLICT (character_id, category, normalized_content) DO NOTHING
      RETURNING id`,
-    [id, characterId, cat, cleaned, sourceChat || ""],
+    [
+      id,
+      characterId,
+      cat,
+      cleaned,
+      sourceChat || "",
+      embedding ? JSON.stringify(embedding) : null,
+      evidence || null,
+    ],
   );
-  if (inserted.length > 0) return inserted[0].id;
-  const { rows: existing } = await p.query(
-    `SELECT id FROM traits
-     WHERE character_id = $1 AND category = $2
-       AND normalized_content = regexp_replace(lower($3), '[^a-z0-9]', '', 'g')
-     LIMIT 1`,
-    [characterId, cat, cleaned],
-  );
-  return existing[0]?.id ?? null;
+  let finalId;
+  if (inserted.length > 0) {
+    finalId = inserted[0].id;
+  } else {
+    const { rows: existing } = await p.query(
+      `SELECT id FROM traits
+       WHERE character_id = $1 AND category = $2
+         AND normalized_content = regexp_replace(lower($3), '[^a-z0-9]', '', 'g')
+       LIMIT 1`,
+      [characterId, cat, cleaned],
+    );
+    finalId = existing[0]?.id ?? null;
+  }
+
+  // Keep the per-character rollup fresh. Failure here must not fail the
+  // trait insert — the rollup is recoverable via /recompute-character-
+  // summaries. Only bother calling it when we actually produced an
+  // embedding; the function is a no-op against rows with NULL embedding
+  // but the extra query is pointless in that case.
+  if (finalId && embedding) {
+    try {
+      await recomputeCharacterSummary(settings, characterId);
+    } catch (err) {
+      console.warn(`[ChronicleDB] recomputeCharacterSummary failed after new canonical: ${err.message}`);
+    }
+  }
+
+  return finalId;
 }
 
 async function getTraitsForCharacter(settings, characterId) {
   const p = getPool(settings);
+  // User-visible trait read: filter out merged variant rows
+  // (canonical_id IS NOT NULL) so the same trait never surfaces twice.
+  // Path 1's canonical-row dedup pipeline leaves merged variants in place
+  // for provenance but they must never be returned to the UI.
   const { rows } = await p.query(
-    `SELECT category, content FROM traits WHERE character_id = $1 ORDER BY category`,
+    `SELECT category, content FROM traits
+     WHERE character_id = $1 AND canonical_id IS NULL
+     ORDER BY category`,
     [characterId],
   );
   return rows;
@@ -1437,7 +1597,8 @@ async function getCharacterPanelStats(settings, characterName, chatId) {
             JOIN events e ON e.id = pi.event_id
             WHERE pi.character_id = $1 AND e.chat_id = $2)::int AS events,
          (SELECT COUNT(*) FROM traits
-            WHERE character_id = $1 AND source_chat = $2)::int AS traits,
+            WHERE character_id = $1 AND source_chat = $2
+              AND canonical_id IS NULL)::int AS traits,
          (SELECT COUNT(*) FROM feels_about
             WHERE (from_char = $1 OR to_char = $1) AND session_id = $2)::int AS relationships,
          (SELECT MAX(e.message_index) FROM events e
@@ -1456,7 +1617,8 @@ async function getCharacterPanelStats(settings, characterName, chatId) {
   const { rows } = await p.query(
     `SELECT
        (SELECT COUNT(*) FROM participated_in WHERE character_id = $1)::int AS events,
-       (SELECT COUNT(*) FROM traits WHERE character_id = $1)::int AS traits,
+       (SELECT COUNT(*) FROM traits
+          WHERE character_id = $1 AND canonical_id IS NULL)::int AS traits,
        (SELECT COUNT(*) FROM feels_about WHERE from_char = $1 OR to_char = $1)::int AS relationships,
        (SELECT MAX(e.message_index) FROM events e
           JOIN participated_in pi ON pi.event_id = e.id

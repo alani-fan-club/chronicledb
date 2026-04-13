@@ -261,12 +261,35 @@ ALTER TABLE traits ADD COLUMN IF NOT EXISTS stemmed_content TEXT
 -- Nullable; recomputeCharacterSummary skips rows where embedding IS NULL
 -- when rolling up into characters.summary_embedding.
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS embedding vector(768);
+
+-- Path 1: canonical-row dedup. `evidence_sentence` is the one-sentence
+-- quote from the source batch that justifies the trait, used to make the
+-- contextual embedding text. `canonical_id` points at the canonical row
+-- when this row is a merged variant (NULL for canonical rows themselves);
+-- `aliases` carries the raw content/evidence strings merged into this
+-- canonical; `merged_count` is a cheap popularity signal.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS evidence_sentence TEXT;
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS canonical_id TEXT REFERENCES traits(id) ON DELETE SET NULL;
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS aliases TEXT[] DEFAULT '{}';
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS merged_count INT DEFAULT 1;
+
 CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
 CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);
 CREATE INDEX IF NOT EXISTS idx_traits_stem
   ON traits (character_id, category, stemmed_content);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_traits_unique_norm
   ON traits (character_id, category, normalized_content);
+-- Path 1 retrieval accelerators. idx_traits_canonical speeds up the
+-- "get all merged variants of this canonical" and `WHERE canonical_id IS
+-- NULL` user-visible filters. The HNSW index is intentionally PARTIAL on
+-- `canonical_id IS NULL` — we only want to kNN-search canonical rows,
+-- not merged aliases, so upsertTrait's kNN lookup must never return the
+-- alias rows.
+CREATE INDEX IF NOT EXISTS idx_traits_canonical
+  ON traits (character_id, canonical_id);
+CREATE INDEX IF NOT EXISTS idx_traits_embedding_hnsw
+  ON traits USING hnsw (embedding vector_cosine_ops)
+  WHERE canonical_id IS NULL;
 
 -- ── Items (key objects with owners, powers, significance) ──────
 

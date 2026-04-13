@@ -295,6 +295,14 @@ async function dialogueQuoteSearch(pool, chatIds, query, limit = 5) {
  *
  * One event may belong to multiple arcs — picks the highest-importance
  * arc per event (first row per event after the ORDER BY).
+ *
+ * Path 5 hierarchy filter: restricts the arc-join to hierarchy_level=1
+ * rows, which are the Path 1 "arc"-tier rows (plus any legacy pre-Path-5
+ * rows, whose default hierarchy_level is 1). Super-arcs (level 0) and
+ * episodes (level 2) are intentionally excluded from the default ±1
+ * expansion path — see RESEARCH_ARCS.md §5 Path 5. Rows with NULL
+ * hierarchy_level (should not exist after the ALTER but matched here
+ * for forward-compat) are treated as level 1.
  */
 async function fetchArcExpansion(pool, eventIds) {
   const result = new Map();
@@ -312,6 +320,7 @@ async function fetchArcExpansion(pool, eventIds) {
        e_neighbor.source_text AS neighbor_source_text
      FROM arc_events ae_hit
      JOIN story_arcs sa ON sa.id = ae_hit.arc_id
+       AND COALESCE(sa.hierarchy_level, 1) = 1
      LEFT JOIN arc_events ae_neighbor
        ON ae_neighbor.arc_id = ae_hit.arc_id
        AND ae_neighbor.position IN (ae_hit.position - 1, ae_hit.position + 1)

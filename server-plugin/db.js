@@ -738,26 +738,33 @@ async function recomputeCharacterSummary(settings, characterId) {
 
 // ── Story arcs and event chains ────────────────────────────────
 
-async function upsertStoryArc(settings, { chatId, title, description, arcType, status, importance, startMsgIdx, endMsgIdx, spineEventId, source }) {
+async function upsertStoryArc(settings, { chatId, title, description, arcType, status, importance, startMsgIdx, endMsgIdx, spineEventId, source, parentArcId, hierarchyLevel }) {
   const p = getPool(settings);
   const src = source || "llm"; // RESEARCH_ARCS Path 1: structural arcs pass "structural"
+  // RESEARCH_ARCS Path 5: parentArcId / hierarchyLevel default to null / 1 so
+  // every pre-Path-5 caller keeps producing flat arcs with the same semantics.
+  const parent = parentArcId ?? null;
+  const level = Number.isInteger(hierarchyLevel) ? hierarchyLevel : 1;
+  // Scope the title-collision check by hierarchy_level so Path 5's three
+  // levels can't step on each other even in the unlikely case two spines
+  // produce the same 80-char templated title within one rebuild pass.
   const { rows: existing } = await p.query(
-    `SELECT id FROM story_arcs WHERE chat_id = $1 AND title = $2`,
-    [chatId, title],
+    `SELECT id FROM story_arcs WHERE chat_id = $1 AND title = $2 AND COALESCE(hierarchy_level, 1) = $3`,
+    [chatId, title, level],
   );
   let arcId;
   if (existing.length > 0) {
     arcId = existing[0].id;
     await p.query(
-      `UPDATE story_arcs SET description = $2, arc_type = $3, status = $4, importance = $5, end_msg_idx = $6, spine_event_id = COALESCE($7, spine_event_id), source = $8, updated_at = NOW() WHERE id = $1`,
-      [arcId, description || "", arcType || "main", status || "active", importance || 3, endMsgIdx, spineEventId, src],
+      `UPDATE story_arcs SET description = $2, arc_type = $3, status = $4, importance = $5, end_msg_idx = $6, spine_event_id = COALESCE($7, spine_event_id), source = $8, parent_arc_id = $9, hierarchy_level = $10, updated_at = NOW() WHERE id = $1`,
+      [arcId, description || "", arcType || "main", status || "active", importance || 3, endMsgIdx, spineEventId, src, parent, level],
     );
   } else {
     arcId = `arc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     await p.query(
-      `INSERT INTO story_arcs (id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id, source)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-      [arcId, chatId, title, description || "", arcType || "main", status || "active", importance || 3, startMsgIdx, endMsgIdx, spineEventId, src],
+      `INSERT INTO story_arcs (id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id, source, parent_arc_id, hierarchy_level)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [arcId, chatId, title, description || "", arcType || "main", status || "active", importance || 3, startMsgIdx, endMsgIdx, spineEventId, src, parent, level],
     );
   }
   return arcId;

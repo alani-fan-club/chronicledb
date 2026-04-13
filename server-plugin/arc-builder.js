@@ -1,6 +1,12 @@
 // Path 1 arc builder — structural arc discovery via Louvain community
 // detection on a weighted event graph. See RESEARCH_ARCS.md §5 Path 1.
 //
+// Path 5 extends this with a hierarchical three-level output (super-arcs →
+// arcs → episodes) produced by sweeping the Louvain resolution parameter γ
+// over the same weighted graph. The middle level (γ=0.5) is bit-for-bit
+// identical to the flat Path 1 partition; levels 0 and 2 are new, gated on
+// events.length >= 100, and link to the middle level via parent_arc_id.
+//
 // Entry point: rebuildArcsForChat(settings, chatId, opts?)
 //
 // This runs post-ingest (after /ingest-chat finishes its batch loop) and is
@@ -42,6 +48,27 @@ const DEFAULT_SEED = 42;
 // mega-clusters Louvain finds at γ=1.0 with the same weight kernel.
 const DEFAULT_RESOLUTION = 0.5;
 
+// Path 5 hierarchy (RESEARCH_ARCS.md §5 Path 5): three-level Louvain sweep.
+//   γ=0.25 → super-arcs (hierarchy_level=0, ~3-6 per 449-event chat)
+//   γ=0.5  → arcs (hierarchy_level=1, unchanged Path 2 winner)
+//   γ=1.0  → episodes (hierarchy_level=2, ~20-40 per 449-event chat)
+// The research doc originally suggested γ ∈ {0.5, 1.0, 2.0}, but Path 2's
+// tuning moved the "arcs" resolution down to 0.5 (from Louvain's 1.0 default)
+// because the participant-signal floor and the temporal penalty need the
+// lower γ to let the 10-arc partition emerge. Shifting the hierarchy window
+// down by the same amount: super-arcs at γ=0.25 (half of 0.5, mirroring the
+// research doc's "half the arc resolution" pattern), episodes at γ=1.0
+// (Louvain's modularity-default, which Path 2's grid confirmed produces the
+// ~40-50 very granular clusters the research doc calls "episodes").
+const HIERARCHY_RESOLUTION_SUPER = 0.25;
+const HIERARCHY_RESOLUTION_EPISODE = 1.0;
+
+// Gate: hierarchy only applies to chats with >= HIERARCHY_MIN_EVENTS events.
+// Shorter chats get flat Path 1 output as before — the research doc's
+// "Don't ship hierarchy before ship flat" caveat plus the explicit
+// "Gate path 5 on events.length >= 100" guidance.
+const HIERARCHY_MIN_EVENTS = 100;
+
 // "Recentered signal" floors. The diagnostic on the Protagonist eval chat showed
 // that raw cosine lives on a bell curve centered ~0.69 (p10=0.59, p90=0.77)
 // and raw Jaccard bottoms at 0.4 for half the pairs in a 2-3 character chat.
@@ -69,6 +96,9 @@ module.exports = {
   DEFAULT_COS_FLOOR,
   DEFAULT_JACC_FLOOR,
   DEFAULT_ARC_NAMING_DENSITY_GATE,
+  HIERARCHY_RESOLUTION_SUPER,
+  HIERARCHY_RESOLUTION_EPISODE,
+  HIERARCHY_MIN_EVENTS,
 };
 
 // ── Embedding helpers ─────────────────────────────────────────────
@@ -147,7 +177,16 @@ function jaccard(aSet, bSet) {
  *                                    /ingest-chat wires this to true.
  * @param {number}  [opts.densityGate] - override DEFAULT_ARC_NAMING_DENSITY_GATE.
  *                                       Ignored unless nameArcs is true.
- * @returns {Promise<{builtArcs:number, prunedArcs:number, totalEvents:number, modularityQ:number, namedArcs?:number, templatedArcs?:number, communities?:Array}>}
+ * @param {boolean} [opts.nameHierarchy] - Path 5: opt into LLM naming for the
+ *                                         super-arc (level 0) and episode
+ *                                         (level 2) tiers too. Default false
+ *                                         (templated titles only for those
+ *                                         levels); wired in but intentionally
+ *                                         unused this tick — requires a
+ *                                         different prompt than nameStoryArc
+ *                                         to handle the cross-cluster spanning
+ *                                         super-arcs produce.
+ * @returns {Promise<{builtArcs:number, prunedArcs:number, totalEvents:number, modularityQ:number, namedArcs?:number, templatedArcs?:number, superArcs:number, episodes:number, modularityQSuper:number, modularityQEpisodes:number, communities?:Array}>}
  */
 async function rebuildArcsForChat(settings, chatId, opts = {}) {
   const weights = { ...DEFAULT_WEIGHTS, ...(opts.weights || {}) };
@@ -161,6 +200,9 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
   const densityGate = Number.isFinite(opts.densityGate)
     ? opts.densityGate
     : DEFAULT_ARC_NAMING_DENSITY_GATE;
+  // Path 5: `nameHierarchy` is wired but default-off. Super-arc and episode
+  // titles are templated in this tick; flipping this flag is a follow-up.
+  const nameHierarchy = Boolean(opts.nameHierarchy);
 
   const p = db.getPool(settings);
 
@@ -175,7 +217,16 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
 
   // Bail early on degenerate cases. 3-event clustering is noise.
   if (events.length < 4) {
-    return { builtArcs: 0, prunedArcs: 0, totalEvents: events.length, modularityQ: 0 };
+    return {
+      builtArcs: 0,
+      prunedArcs: 0,
+      totalEvents: events.length,
+      modularityQ: 0,
+      superArcs: 0,
+      episodes: 0,
+      modularityQSuper: 0,
+      modularityQEpisodes: 0,
+    };
   }
 
   // Parse embeddings once, cache norms.
@@ -278,54 +329,6 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     }
   }
 
-  // 5. Run Louvain. Use .detailed() to get modularity Q alongside the
-  //    partition in one pass — graphology-communities-louvain exposes
-  //    { communities, modularity, count, ... } from the detailed variant.
-  const rng = mulberry32(seed);
-  const detailed = louvain.detailed(g, {
-    getEdgeWeight: "weight",
-    resolution,
-    rng,
-  });
-  const partition = detailed.communities || {};
-  const modularityQ = Number.isFinite(detailed.modularity) ? detailed.modularity : 0;
-
-  // 6. Group nodes by community.
-  const communities = new Map();
-  for (const [nodeId, c] of Object.entries(partition)) {
-    let bucket = communities.get(c);
-    if (!bucket) {
-      bucket = [];
-      communities.set(c, bucket);
-    }
-    bucket.push(nodeId);
-  }
-
-  const eventById = new Map(events.map((e) => [e.id, e]));
-
-  // 7. Prune tiny communities, sort survivors by their first event's msg_idx
-  //    so arc IDs increment in chat order. Ties broken by the raw community
-  //    index for stability.
-  const arcsToBuild = [...communities.entries()]
-    .filter(([, ids]) => ids.length >= minArcSize)
-    .map(([cIdx, ids]) => {
-      const members = ids
-        .map((id) => eventById.get(id))
-        .filter(Boolean);
-      members.sort((a, b) => (a.message_index ?? 0) - (b.message_index ?? 0));
-      return { cIdx, members };
-    })
-    .sort((a, b) => {
-      const aFirst = a.members[0]?.message_index ?? 0;
-      const bFirst = b.members[0]?.message_index ?? 0;
-      if (aFirst !== bFirst) return aFirst - bFirst;
-      return a.cIdx - b.cIdx;
-    });
-
-  const totalCommunities = communities.size;
-  const builtArcs = arcsToBuild.length;
-  const prunedArcs = totalCommunities - builtArcs;
-
   // Graph-level stats needed for the density proxy: total edge count and
   // node count. density = intraEdges / expectedEdges, where expectedEdges
   // assumes random placement of the graph's edges across all node pairs:
@@ -336,63 +339,144 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
   const totalNodes = g.order;
   const totalPairs = Math.max(1, (totalNodes * (totalNodes - 1)) / 2);
 
-  // 7b. Enrich each surviving community with its spine event, templated
-  //     title, importance, and intra-community density. Computed once here
-  //     so both the dry-run return payload and the real DB-write branch
-  //     reuse the same shape (and Path 2's eval harness can show --detail
-  //     output identical to what would land in the DB).
-  const enrichedArcs = arcsToBuild.map(({ cIdx, members }) => {
-    const spine = members
-      .slice()
-      .sort((a, b) => {
-        const sigDiff = (b.significance ?? 0) - (a.significance ?? 0);
-        if (sigDiff !== 0) return sigDiff;
-        return (a.message_index ?? 0) - (b.message_index ?? 0);
-      })[0];
+  const eventById = new Map(events.map((e) => [e.id, e]));
 
-    // Templated title. Replaced below with LLM-generated name if density
-    // gate passes and opts.nameArcs is true; otherwise this is the final
-    // title that lands in the DB.
-    const summary = (spine?.summary || "(no summary)").trim();
-    const title = `Arc: ${summary.slice(0, 80)}`;
+  // Path 5: helper that runs one Louvain pass at a specific γ and produces a
+  // sorted list of enriched, pruned community descriptors. The γ=0.5 call
+  // must be invoked with the exact same (seed, resolution, graph) as Path 1
+  // used pre-hierarchy so the level-1 partition is bit-for-bit identical to
+  // the old flat output; the other two passes share the graph but use their
+  // own mulberry32(seed) streams so each level is independently reproducible
+  // and the level-1 result isn't perturbed by level-0 / level-2 RNG advances.
+  //
+  // Returns:
+  //   { enrichedArcs, modularityQ, communitiesSize }
+  // where `enrichedArcs` is ordered by first-member msg_idx and already
+  // pruned to >= minArcSize.
+  function runPartition(gamma, levelPrefix) {
+    const rng = mulberry32(seed);
+    const detailed = louvain.detailed(g, {
+      getEdgeWeight: "weight",
+      resolution: gamma,
+      rng,
+    });
+    const partition = detailed.communities || {};
+    const modularity = Number.isFinite(detailed.modularity) ? detailed.modularity : 0;
 
-    const importance = Math.min(
-      5,
-      Math.max(1, Math.round(spine?.significance ?? 3)),
-    );
-
-    const startMsgIdx = members[0].message_index ?? null;
-    const endMsgIdx = members[members.length - 1].message_index ?? null;
-
-    // Count intra-community edges by iterating the member list. This is
-    // O(k²) per cluster which sums to O(N²) total in the worst case but
-    // in practice is ~2-3% of the outer N² kernel on sparse graphs.
-    let intraEdges = 0;
-    for (let i = 0; i < members.length; i++) {
-      for (let j = i + 1; j < members.length; j++) {
-        if (g.hasEdge(members[i].id, members[j].id)) intraEdges++;
+    const communities = new Map();
+    for (const [nodeId, c] of Object.entries(partition)) {
+      let bucket = communities.get(c);
+      if (!bucket) {
+        bucket = [];
+        communities.set(c, bucket);
       }
+      bucket.push(nodeId);
     }
-    const k = members.length;
-    const expectedEdges = totalPairs > 0
-      ? (totalEdges * (k * (k - 1)) / 2) / totalPairs
-      : 0;
-    const density = expectedEdges > 0 ? intraEdges / expectedEdges : 0;
+
+    // Prune tiny communities, sort survivors by their first event's msg_idx
+    // so arc IDs increment in chat order. Ties broken by the raw community
+    // index for stability.
+    const arcsToBuildLocal = [...communities.entries()]
+      .filter(([, ids]) => ids.length >= minArcSize)
+      .map(([cIdx, ids]) => {
+        const members = ids
+          .map((id) => eventById.get(id))
+          .filter(Boolean);
+        members.sort((a, b) => (a.message_index ?? 0) - (b.message_index ?? 0));
+        return { cIdx, members };
+      })
+      .sort((a, b) => {
+        const aFirst = a.members[0]?.message_index ?? 0;
+        const bFirst = b.members[0]?.message_index ?? 0;
+        if (aFirst !== bFirst) return aFirst - bFirst;
+        return a.cIdx - b.cIdx;
+      });
+
+    // Enrich each surviving community with its spine event, templated title,
+    // importance, and intra-community density. Computed once here so both
+    // the dry-run return payload and the real DB-write branch reuse the
+    // same shape.
+    const enriched = arcsToBuildLocal.map(({ cIdx, members }) => {
+      const spine = members
+        .slice()
+        .sort((a, b) => {
+          const sigDiff = (b.significance ?? 0) - (a.significance ?? 0);
+          if (sigDiff !== 0) return sigDiff;
+          return (a.message_index ?? 0) - (b.message_index ?? 0);
+        })[0];
+
+      const summary = (spine?.summary || "(no summary)").trim();
+      const title = `${levelPrefix}${summary.slice(0, 80)}`;
+
+      const importance = Math.min(
+        5,
+        Math.max(1, Math.round(spine?.significance ?? 3)),
+      );
+
+      const startMsgIdx = members[0].message_index ?? null;
+      const endMsgIdx = members[members.length - 1].message_index ?? null;
+
+      // Count intra-community edges by iterating the member list. This is
+      // O(k²) per cluster which sums to O(N²) total in the worst case but
+      // in practice is ~2-3% of the outer N² kernel on sparse graphs.
+      let intraEdges = 0;
+      for (let i = 0; i < members.length; i++) {
+        for (let j = i + 1; j < members.length; j++) {
+          if (g.hasEdge(members[i].id, members[j].id)) intraEdges++;
+        }
+      }
+      const k = members.length;
+      const expectedEdges = totalPairs > 0
+        ? (totalEdges * (k * (k - 1)) / 2) / totalPairs
+        : 0;
+      const density = expectedEdges > 0 ? intraEdges / expectedEdges : 0;
+
+      return {
+        cIdx,
+        members,
+        spine,
+        title,
+        description: "",
+        importance,
+        startMsgIdx,
+        endMsgIdx,
+        intraEdges,
+        expectedEdges,
+        density,
+      };
+    });
 
     return {
-      cIdx,
-      members,
-      spine,
-      title,
-      description: "",
-      importance,
-      startMsgIdx,
-      endMsgIdx,
-      intraEdges,
-      expectedEdges,
-      density,
+      enrichedArcs: enriched,
+      modularityQ: modularity,
+      communitiesSize: communities.size,
     };
-  });
+  }
+
+  // 5. Run Louvain at the arc-level γ (Path 1 / Path 2 winner). This is the
+  //    level retrieval reads by default and the one whose partition MUST be
+  //    bit-for-bit identical to pre-Path-5 output.
+  const arcPass = runPartition(resolution, "Arc: ");
+  const enrichedArcs = arcPass.enrichedArcs;
+  const modularityQ = arcPass.modularityQ;
+  const totalCommunities = arcPass.communitiesSize;
+  const builtArcs = enrichedArcs.length;
+  const prunedArcs = totalCommunities - builtArcs;
+
+  // 5b. Path 5: run the super-arc and episode passes iff the chat is large
+  //     enough for hierarchy to mean anything (>= 100 events per the research
+  //     doc's caveat). Shorter chats get only the flat level-1 output.
+  const hierarchyEnabled = events.length >= HIERARCHY_MIN_EVENTS;
+  const superPass = hierarchyEnabled
+    ? runPartition(HIERARCHY_RESOLUTION_SUPER, "Super Arc: ")
+    : { enrichedArcs: [], modularityQ: 0, communitiesSize: 0 };
+  const episodePass = hierarchyEnabled
+    ? runPartition(HIERARCHY_RESOLUTION_EPISODE, "Episode: ")
+    : { enrichedArcs: [], modularityQ: 0, communitiesSize: 0 };
+  const enrichedSuperArcs = superPass.enrichedArcs;
+  const enrichedEpisodes = episodePass.enrichedArcs;
+  const modularityQSuper = superPass.modularityQ;
+  const modularityQEpisodes = episodePass.modularityQ;
 
   if (dryRun) {
     // Edge/degree stats are only computed for dry-run because the eval
@@ -407,6 +491,10 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
       modularityQ,
       edgeCount,
       avgDegree,
+      superArcs: enrichedSuperArcs.length,
+      episodes: enrichedEpisodes.length,
+      modularityQSuper,
+      modularityQEpisodes,
       communities: enrichedArcs.map((a) => ({
         spineEventId: a.spine?.id || null,
         eventIds: a.members.map((m) => m.id),
@@ -423,12 +511,17 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     };
   }
 
-  // 7c. Path 4: LLM arc naming. Opt-in via opts.nameArcs. Gated on cluster
-  //     density so incoherent communities fall back to the template. We
-  //     resolve the chat's protagonist once here (character with the most
-  //     participated_in edges across this chat's events) and share it for
-  //     all naming calls. `"the protagonist"` is the fallback when the chat
-  //     has no participated_in rows.
+  // 6. Path 4: LLM arc naming at hierarchy_level=1 only. Opt-in via
+  //    opts.nameArcs. Gated on cluster density so incoherent communities
+  //    fall back to the template. We resolve the chat's protagonist once
+  //    here (character with the most participated_in edges across this
+  //    chat's events) and share it for all naming calls. `"the protagonist"`
+  //    is the fallback when the chat has no participated_in rows.
+  //
+  //    Super-arc (level 0) and episode (level 2) titles stay templated in
+  //    this tick regardless of opts.nameArcs — see nameHierarchy caveat in
+  //    the JSDoc. Wiring nameHierarchy through requires a different prompt
+  //    (the nameStoryArc prompt assumes a mid-grain narrative container).
   let namedArcs = 0;
   let templatedArcs = 0;
   if (nameArcs && enrichedArcs.length > 0) {
@@ -488,9 +581,104 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     templatedArcs = enrichedArcs.length;
   }
 
+  // nameHierarchy is intentionally a no-op this tick even if set. Touch
+  // the variable so lint doesn't flag it as unused while we wire the flag
+  // through for later.
+  void nameHierarchy;
+
+  // 7. Parent-linking: match each level-1 arc to the level-0 super-arc
+  //    whose event set contains a majority of the level-1 arc's members,
+  //    and each level-2 episode to the level-1 arc whose event set contains
+  //    a majority of the episode's members. "Majority" here is implemented
+  //    as "greatest overlap" — tie-break implicit in the sort order of the
+  //    parent list (earliest-starting parent wins on ties, which is stable
+  //    because the parent list is already sorted by first-member msg_idx).
+  //
+  //    The build routine runs before the DB writes so each enriched arc
+  //    gets a `parentIdx` field populated (or undefined if no overlap). We
+  //    resolve parentIdx → parent arc id during the insert loop, where the
+  //    parent row's actual DB id is known.
+  function assignParents(children, parents) {
+    if (parents.length === 0) {
+      for (const child of children) child.parentIdx = undefined;
+      return;
+    }
+    // Build a nodeId → parent index map once, then count overlaps per child.
+    const nodeToParentIdx = new Map();
+    for (let pi = 0; pi < parents.length; pi++) {
+      for (const m of parents[pi].members) {
+        nodeToParentIdx.set(m.id, pi);
+      }
+    }
+    for (const child of children) {
+      const tally = new Map();
+      for (const m of child.members) {
+        const pi = nodeToParentIdx.get(m.id);
+        if (pi === undefined) continue;
+        tally.set(pi, (tally.get(pi) || 0) + 1);
+      }
+      let bestIdx = undefined;
+      let bestCount = 0;
+      for (const [pi, cnt] of tally.entries()) {
+        if (cnt > bestCount || (cnt === bestCount && (bestIdx === undefined || pi < bestIdx))) {
+          bestCount = cnt;
+          bestIdx = pi;
+        }
+      }
+      child.parentIdx = bestIdx;
+    }
+  }
+
+  if (hierarchyEnabled) {
+    // Level-1 arcs point at their containing level-0 super-arc.
+    assignParents(enrichedArcs, enrichedSuperArcs);
+    // Level-2 episodes point at their containing level-1 arc.
+    assignParents(enrichedEpisodes, enrichedArcs);
+  } else {
+    // Flat mode: level-1 arcs are the only rows, parent is always null.
+    for (const arc of enrichedArcs) arc.parentIdx = undefined;
+  }
+
   // 8. Drop and rebuild inside a single transaction. The DELETE on arc_events
   //    is technically redundant given ON DELETE CASCADE on story_arcs, but
   //    explicit is safer and survives any future CASCADE change.
+  //
+  //    Insert order matters because of the parent_arc_id foreign key:
+  //    super-arcs first (parent_arc_id=NULL), then arcs (may reference
+  //    super-arc ids), then episodes (reference arc ids).
+  const superArcIdByIdx = new Map();
+  const arcIdByIdx = new Map();
+
+  // Helper to insert one enriched arc and its arc_events rows.
+  async function insertArcAndEvents({ arc, hierarchyLevel, parentArcId }) {
+    const arcId = await db.upsertStoryArc(settings, {
+      chatId,
+      title: arc.title,
+      description: arc.description || "",
+      arcType: "main",
+      // Ingested chats are by definition complete at rebuild time.
+      status: "resolved",
+      importance: arc.importance,
+      startMsgIdx: arc.startMsgIdx,
+      endMsgIdx: arc.endMsgIdx,
+      spineEventId: arc.spine?.id || null,
+      source: "structural",
+      parentArcId: parentArcId ?? null,
+      hierarchyLevel,
+    });
+
+    let pos = 0;
+    for (const m of arc.members) {
+      await db.linkEventToArc(settings, {
+        arcId,
+        eventId: m.id,
+        position: pos++,
+        isAnchor: m.id === arc.spine?.id,
+      });
+    }
+    return arcId;
+  }
+
   await p.query("BEGIN");
   try {
     await p.query(
@@ -499,30 +687,43 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     );
     await p.query(`DELETE FROM story_arcs WHERE chat_id = $1`, [chatId]);
 
-    for (const arc of enrichedArcs) {
-      const arcId = await db.upsertStoryArc(settings, {
-        chatId,
-        title: arc.title,
-        description: arc.description || "",
-        arcType: "main",
-        // Ingested chats are by definition complete at rebuild time.
-        status: "resolved",
-        importance: arc.importance,
-        startMsgIdx: arc.startMsgIdx,
-        endMsgIdx: arc.endMsgIdx,
-        spineEventId: arc.spine?.id || null,
-        source: "structural",
+    // Level 0 — super-arcs (parent_arc_id = NULL). Templated titles only;
+    // LLM naming for this level would need a different prompt.
+    for (let i = 0; i < enrichedSuperArcs.length; i++) {
+      const arc = enrichedSuperArcs[i];
+      const arcId = await insertArcAndEvents({
+        arc,
+        hierarchyLevel: 0,
+        parentArcId: null,
       });
+      superArcIdByIdx.set(i, arcId);
+    }
 
-      let pos = 0;
-      for (const m of arc.members) {
-        await db.linkEventToArc(settings, {
-          arcId,
-          eventId: m.id,
-          position: pos++,
-          isAnchor: m.id === arc.spine?.id,
-        });
-      }
+    // Level 1 — arcs (may be LLM-named per opts.nameArcs, templated otherwise).
+    // parent_arc_id is resolved from parentIdx → superArcIdByIdx.
+    for (let i = 0; i < enrichedArcs.length; i++) {
+      const arc = enrichedArcs[i];
+      const parentArcId =
+        arc.parentIdx !== undefined ? superArcIdByIdx.get(arc.parentIdx) : null;
+      const arcId = await insertArcAndEvents({
+        arc,
+        hierarchyLevel: 1,
+        parentArcId: parentArcId ?? null,
+      });
+      arcIdByIdx.set(i, arcId);
+    }
+
+    // Level 2 — episodes (templated titles only). parent_arc_id resolves to
+    // the level-1 arc, not a level-0 super-arc.
+    for (let i = 0; i < enrichedEpisodes.length; i++) {
+      const arc = enrichedEpisodes[i];
+      const parentArcId =
+        arc.parentIdx !== undefined ? arcIdByIdx.get(arc.parentIdx) : null;
+      await insertArcAndEvents({
+        arc,
+        hierarchyLevel: 2,
+        parentArcId: parentArcId ?? null,
+      });
     }
 
     await p.query("COMMIT");
@@ -538,6 +739,10 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     modularityQ,
     namedArcs,
     templatedArcs,
+    superArcs: enrichedSuperArcs.length,
+    episodes: enrichedEpisodes.length,
+    modularityQSuper,
+    modularityQEpisodes,
   };
 }
 

@@ -204,6 +204,8 @@ CREATE TABLE IF NOT EXISTS story_arcs (
     end_msg_idx     INT,
     spine_event_id  TEXT,                   -- the defining event
     source          TEXT DEFAULT 'llm',     -- llm | structural (RESEARCH_ARCS Path 1)
+    parent_arc_id   TEXT REFERENCES story_arcs(id) ON DELETE SET NULL,
+    hierarchy_level INT DEFAULT 1,          -- 0 = super-arc, 1 = arc, 2 = episode (RESEARCH_ARCS Path 5)
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
@@ -214,6 +216,17 @@ CREATE TABLE IF NOT EXISTS story_arcs (
 -- supports the post-ingest DELETE + INSERT cycle.
 ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'llm';
 CREATE INDEX IF NOT EXISTS idx_story_arcs_chat ON story_arcs (chat_id);
+
+-- Path 5 hierarchical arcs (RESEARCH_ARCS.md §5 Path 5): three-level Louvain
+-- resolution sweep (γ=0.25 super-arcs, γ=0.5 arcs, γ=1.0 episodes). Existing
+-- flat rows default to hierarchy_level=1 and parent_arc_id=NULL, which
+-- preserves the Path 1 semantics exactly. Parent index speeds up child→parent
+-- walks; (chat_id, hierarchy_level) speeds up "fetch all level-1 arcs for
+-- this chat" which retrieval's fetchArcExpansion filters on.
+ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS parent_arc_id TEXT REFERENCES story_arcs(id) ON DELETE SET NULL;
+ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS hierarchy_level INT DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_story_arcs_parent ON story_arcs (parent_arc_id);
+CREATE INDEX IF NOT EXISTS idx_story_arcs_level ON story_arcs (chat_id, hierarchy_level);
 
 -- Arc membership: events can belong to multiple arcs
 CREATE TABLE IF NOT EXISTS arc_events (

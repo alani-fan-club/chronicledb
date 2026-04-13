@@ -203,9 +203,17 @@ CREATE TABLE IF NOT EXISTS story_arcs (
     start_msg_idx   INT,
     end_msg_idx     INT,
     spine_event_id  TEXT,                   -- the defining event
+    source          TEXT DEFAULT 'llm',     -- llm | structural (RESEARCH_ARCS Path 1)
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Path 1 arc rebuild (RESEARCH_ARCS.md §5): distinguishes Leiden/Louvain-built
+-- rows from legacy per-batch LLM rows. 'llm' is the default for backward
+-- compatibility; rebuildArcsForChat inserts with 'structural'. The chat index
+-- supports the post-ingest DELETE + INSERT cycle.
+ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'llm';
+CREATE INDEX IF NOT EXISTS idx_story_arcs_chat ON story_arcs (chat_id);
 
 -- Arc membership: events can belong to multiple arcs
 CREATE TABLE IF NOT EXISTS arc_events (

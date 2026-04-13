@@ -187,11 +187,10 @@ Extract:
    - 1 = flavor detail (background action, mundane interaction, transitional scene)
    Be strict about 4-5. In a typical batch you'll have 1-3 major events at most, many minor ones.
 4. **Event chains** — when one event directly causes, triggers, or leads to another. Think causally: "X caused Y", "Because of A, B happened". Only chain events that have a clear causal link.
-5. **Story arcs** — identify narrative arcs like in manga/anime. An arc is a set of connected events that form a coherent story beat. Examples: "The Betrayal Arc", "First Meeting Arc", "Confession Arc", "Training Arc". Each arc has a defining "spine" event (the most important one) and flavor events around it.
-6. **World state** — environmental/setting changes (key-value)
-7. **Knowledge updates** — what each character learned AND what they explicitly do not know
-8. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
-9. **Plot threads** — foreshadowing, pending events, unresolved tensions, promises, threats. Mark if a prior thread got resolved.
+5. **World state** — environmental/setting changes (key-value)
+6. **Knowledge updates** — what each character learned AND what they explicitly do not know
+7. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
+8. **Plot threads** — foreshadowing, pending events, unresolved tensions, promises, threats. Mark if a prior thread got resolved.
 
 RULES:
 - Only attribute knowledge to characters who were PRESENT and could perceive it
@@ -226,15 +225,6 @@ Return ONLY valid JSON:
     "significance": 3
   }],
   "event_chains": [{ "from": "event_key", "to": "event_key", "chain_type": "caused | triggered | led_to | followed_by", "description": "" }],
-  "story_arcs": [{
-    "title": "",
-    "description": "",
-    "arc_type": "main | subplot | character_arc | world_arc",
-    "status": "active | resolved | ongoing",
-    "importance": 3,
-    "spine_event_key": "the defining event_key",
-    "event_keys": ["list", "of", "event_keys", "in", "this", "arc"]
-  }],
   "world_state": [{ "key": "", "value": "", "reason": "" }],
   "knowledge_updates": [
     { "character": "", "learned": "", "source": "" },
@@ -733,33 +723,9 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
     }
   }
 
-  // Story arcs — depend on events existing for FK lookups.
-  for (const arc of (extraction.story_arcs || [])) {
-    const spineId = arc.spine_event_key ? eventKeyToId.get(arc.spine_event_key) : null;
-    const arcId = await db.upsertStoryArc(settings, {
-      chatId: safeChat,
-      title: arc.title,
-      description: arc.description || "",
-      arcType: arc.arc_type || "main",
-      status: arc.status || "active",
-      importance: arc.importance || 3,
-      startMsgIdx: msgIdx,
-      endMsgIdx: msgIdx != null && batchSize ? msgIdx + batchSize : msgIdx,
-      spineEventId: spineId,
-    });
-    let pos = 0;
-    for (const key of (arc.event_keys || [])) {
-      const eventId = eventKeyToId.get(key);
-      if (eventId) {
-        await db.linkEventToArc(settings, {
-          arcId,
-          eventId,
-          position: pos++,
-          isAnchor: eventId === spineId,
-        });
-      }
-    }
-  }
+  // Path 1: arcs are built structurally post-ingest by arc-builder.rebuildArcsForChat.
+  // The LLM no longer emits story_arcs; if a legacy response still includes the field
+  // it is intentionally ignored here. See RESEARCH_ARCS.md §5 Path 1.
 
   // World state — written before the context snapshot snapshots them.
   for (const ws of (extraction.world_state || [])) {

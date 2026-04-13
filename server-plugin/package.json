@@ -3,8 +3,10 @@
   "version": "0.1.0",
   "description": "ChronicleDB — persistent graph+vector memory for SillyTavern RP",
   "dependencies": {
+    "dotenv": "^16.4.7",
+    "graphology": "^0.26.0",
+    "graphology-communities-louvain": "^2.0.2",
     "pg": "^8.13.1",
-    "pgvector": "^0.2.0",
-    "dotenv": "^16.4.7"
+    "pgvector": "^0.2.0"
   }
 }

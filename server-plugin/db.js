@@ -738,8 +738,9 @@ async function recomputeCharacterSummary(settings, characterId) {
 
 // ── Story arcs and event chains ────────────────────────────────
 
-async function upsertStoryArc(settings, { chatId, title, description, arcType, status, importance, startMsgIdx, endMsgIdx, spineEventId }) {
+async function upsertStoryArc(settings, { chatId, title, description, arcType, status, importance, startMsgIdx, endMsgIdx, spineEventId, source }) {
   const p = getPool(settings);
+  const src = source || "llm"; // RESEARCH_ARCS Path 1: structural arcs pass "structural"
   const { rows: existing } = await p.query(
     `SELECT id FROM story_arcs WHERE chat_id = $1 AND title = $2`,
     [chatId, title],
@@ -748,15 +749,15 @@ async function upsertStoryArc(settings, { chatId, title, description, arcType, s
   if (existing.length > 0) {
     arcId = existing[0].id;
     await p.query(
-      `UPDATE story_arcs SET description = $2, arc_type = $3, status = $4, importance = $5, end_msg_idx = $6, spine_event_id = COALESCE($7, spine_event_id), updated_at = NOW() WHERE id = $1`,
-      [arcId, description || "", arcType || "main", status || "active", importance || 3, endMsgIdx, spineEventId],
+      `UPDATE story_arcs SET description = $2, arc_type = $3, status = $4, importance = $5, end_msg_idx = $6, spine_event_id = COALESCE($7, spine_event_id), source = $8, updated_at = NOW() WHERE id = $1`,
+      [arcId, description || "", arcType || "main", status || "active", importance || 3, endMsgIdx, spineEventId, src],
     );
   } else {
     arcId = `arc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     await p.query(
-      `INSERT INTO story_arcs (id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-      [arcId, chatId, title, description || "", arcType || "main", status || "active", importance || 3, startMsgIdx, endMsgIdx, spineEventId],
+      `INSERT INTO story_arcs (id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id, source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      [arcId, chatId, title, description || "", arcType || "main", status || "active", importance || 3, startMsgIdx, endMsgIdx, spineEventId, src],
     );
   }
   return arcId;

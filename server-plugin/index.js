@@ -448,6 +448,21 @@ async function init(router) {
         }
       }
 
+      // Path 1: after the batch loop completes, rebuild arcs structurally
+      // over the full chat's events via Louvain community detection on a
+      // weighted event graph. Non-fatal — ingest succeeds even if clustering
+      // fails. See RESEARCH_ARCS.md §5 Path 1 and arc-builder.js.
+      try {
+        const { rebuildArcsForChat } = require("./arc-builder");
+        const { builtArcs, prunedArcs, totalEvents, modularityQ } =
+          await rebuildArcsForChat(settings, chatId);
+        console.log(
+          `[ChronicleDB] Arc rebuild for ${chatId}: ${builtArcs} built, ${prunedArcs} pruned, Q=${(modularityQ ?? 0).toFixed(3)}, N=${totalEvents}`,
+        );
+      } catch (err) {
+        console.warn(`[ChronicleDB] Arc rebuild failed for ${chatId}:`, err.message);
+      }
+
       // Record ingestion status
       const p = db.getPool(settings);
       await p.query(

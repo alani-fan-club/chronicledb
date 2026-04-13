@@ -213,11 +213,97 @@ async function upsertWorldState(settings, { key, value, reason, chatId }) {
 // consider two traits near-duplicates. Lower = more aggressive merging.
 const TRAIT_SIMILARITY_THRESHOLD = 0.55;
 
+// Emotional states / transient moods / momentary reactions that the LLM
+// tends to emit as "personality traits" when the character is feeling them
+// in a single scene. These are never dispositional, so we reject them
+// from `category = 'personality'` at write time.
+//
+// The check is against the English-stemmed form of the content (to collapse
+// adoring/adored/adoration → 'ador', amused/amusement → 'amus', etc), so
+// listing the base form is enough to catch the variants. Multi-word traits
+// that contain a state word are still allowed ("calmly analytical" still
+// contains "analytic" stem so it'd pass — we only reject when the ENTIRE
+// content stems to just one of these words).
+const TRAIT_STATE_STEMS = new Set([
+  "ador", "amus", "angri", "annoy", "anxious", "appreci", "anticipatori",
+  "arous", "asham", "astonish", "astound", "awe", "awestruck", "baffl",
+  "bemus", "besot", "bewilder", "captiv", "charm", "confus",
+  "content", "curious", "delight", "depress", "desir", "disgust", "distress",
+  "eager", "elat", "embarrass", "enamor", "enrag", "enthrall", "excit",
+  "exhaust", "fascin", "fear", "flush", "frustrat", "furious", "gleeful",
+  "grate", "griev", "guilti", "happi", "horrifi", "humili", "impress",
+  "infatu", "intimid", "irrit", "joyful", "lonely", "lust", "melancholi",
+  "mesmer", "miser", "mournful", "nervou", "offend", "overwhelm", "pleas",
+  "puzzl", "relax", "reliev", "remors", "resent", "sad", "scare", "shock",
+  "smitten", "sorrow", "stun", "surpris", "terrifi", "thankful", "thrill",
+  "touch", "uncomfort", "uneasi", "upset", "weari", "worri", "wound",
+  "aghast", "mortifi", "appal", "dismay",
+  // Additional state words / narrative mood phrases flagged after the
+  // first cleanup pass surfaced remaining noise:
+  "concern", "desper", "disarm", "disappoint", "devast", "defeat",
+  "hesit", "hurt", "humbl", "indifferent", "insecur", "jealous",
+  "lose", "miss", "outrag", "overjoy", "panick", "perturb", "rattl",
+  "reassur", "reluctant", "repuls", "resign", "satisfi", "skeptic",
+  "startl", "stress", "troubl", "tumultu", "unfazed", "unsettl",
+  "unsur", "vulnerab", "wistful", "dread",
+]);
+
+function approxStem(word) {
+  // Approximate the Snowball English stem by stripping common suffixes.
+  // Good enough to catch the obvious offenders; TRAIT_STATE_STEMS is
+  // keyed on the same approximation.
+  return word
+    .replace(/ies$/, "i")
+    .replace(/sses$/, "ss")
+    .replace(/ied$/, "i")
+    .replace(/(ing|ed|ly|ness|ion|ions|ful|er|est|s)$/, "");
+}
+
+function isTransientEmotionStem(content) {
+  if (!content) return false;
+  const words = String(content)
+    .toLowerCase()
+    .replace(/[^a-z]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  // Drop common English filler so "was angry" is treated the same as
+  // "angry" and "annoyed at staff" collapses to "annoyed staff" where
+  // "annoyed" is the first meaningful word.
+  const filler = new Set(["was", "is", "am", "are", "be", "been", "being",
+    "feels", "feel", "felt", "seems", "seem", "appeared", "appears",
+    "very", "somewhat", "quite", "rather", "a", "an", "the", "of", "at",
+    "to", "for", "with", "by", "in", "on", "but", "and", "or", "from"]);
+  const meaningful = words.filter((w) => !filler.has(w));
+  if (meaningful.length === 0) return false;
+  // Single-word case: reject if the stem matches.
+  if (meaningful.length === 1) {
+    const stem = approxStem(meaningful[0]);
+    return TRAIT_STATE_STEMS.has(stem) || TRAIT_STATE_STEMS.has(meaningful[0]);
+  }
+  // Short phrase case (≤4 meaningful words): reject if it STARTS with a
+  // state stem. "annoyed at staff", "awe struck", "appreciative of
+  // genuine interaction" all land here. Longer phrases (5+ words) likely
+  // carry enough narrative context to be more than a mood, let them through.
+  if (meaningful.length > 4) return false;
+  const firstStem = approxStem(meaningful[0]);
+  return TRAIT_STATE_STEMS.has(firstStem) || TRAIT_STATE_STEMS.has(meaningful[0]);
+}
+
 async function upsertTrait(settings, { characterId, category, content, sourceChat }) {
   const p = getPool(settings);
   if (!content || !String(content).trim()) return null;
   const cleaned = String(content).trim();
   const cat = category || "personality";
+
+  // Reject obvious transient emotional states before they land as
+  // "personality traits". The prompt tells the LLM not to emit these but
+  // it does anyway on long ingests; this is the write-side safety net.
+  // Only applies to the `personality` category — a skill, background, or
+  // physical entry that happens to contain an emotion word is fine.
+  if (cat === "personality" && isTransientEmotionStem(cleaned)) {
+    return null;
+  }
 
   // Fuzzy pre-check: catch duplicates the exact-normalized unique index
   // can't see. A trait is considered a dupe of an existing one if ANY of:

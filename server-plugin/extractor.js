@@ -56,26 +56,63 @@ Extract:
    - **aliases**: alternate forms of the name. E.g., "Alex Reynolds" might also be
      called "Protagonist", "Alex", "Al", "Night Captain". List all forms
      you've seen in this passage or know from earlier context.
-   - **traits**: innate properties (distinct from learned knowledge). Categories:
-     personality, skill, background, physical, faction.
+   - **traits**: **dispositional** properties — things the character IS over
+     the long run, not what they're feeling right now. This distinction is
+     the most common extraction failure, so read the rules carefully:
 
-     TRAIT FORMAT RULES — these are load-bearing, the trait list is user-visible:
+     A trait is INNATE, STABLE, and PERSISTENT. It would still be true of
+     the character tomorrow, next week, in a completely different scene.
+     It is something another character in the story would describe as
+     "just who they are".
+
+     **DO NOT emit as traits**:
+       * Emotional states or moods (angry, sad, happy, amused, annoyed,
+         besotted, aroused, awed, baffled, bemused, charmed, astonished,
+         frustrated, afraid, nervous, excited, content, distressed,
+         curious at the moment, etc). These belong in
+         context_snapshot.emotional_tone, NOT here.
+       * Reactions to one scene (annoyed at staff, calm but firm, cold
+         conviction, appreciative of the gift). Reactions aren't traits.
+       * Situational descriptors that only apply right now (soaked from
+         the rain, limping, out of breath).
+       * Gerunds / participles describing what they're doing
+         (calculating the odds, charming the guard). Use the dispositional
+         adjective if the character IS habitually that way.
+       * Momentary physical states (aroused, trembling, flushed, crying).
+       * Single-scene philosophies dressed up as values ("annihilation
+         over submission" — phrase-of-the-moment, not a life-long credo
+         unless the narrator literally says so).
+
+     **DO emit as traits**:
+       * Persistent personality dispositions: stoic, cunning, protective,
+         impulsive, analytical, loyal, jealous (the permanent-disposition
+         kind), reserved, charismatic, paranoid, cynical.
+       * Long-term skills: knife fighting, leadership, piano, forgery,
+         combat proficiency, field medicine.
+       * Background facts: former yakuza captain, raised in an orphanage,
+         lost left eye in prison, speaks three languages.
+       * Persistent physical features: facial marker on the jaw, mismatched
+         eyes, tattoo sleeve.
+       * Faction / allegiance: Faction family, Hidden Leaf ANBU.
+
+     TRAIT FORMAT RULES:
      * Use the **canonical adjective / noun form**, not the gerund or past
        tense. "charming" (not "charmed" or "charms"), "observant" (not "was
        observant" or "observing"), "resourceful" (not "is resourceful").
      * **Single word when possible**, short phrase only when necessary.
-       "stoic" not "generally stoic and reserved". "calm" not "is calm under
-       pressure" (that's personality+context, pick one).
+       "stoic" not "generally stoic and reserved".
      * **Do not emit morphological variants** of a trait you've already
-       listed. If you're about to write "charmed", check whether you already
-       wrote "charming" — if so, drop it. If "besotted" is already listed,
-       don't also write "Besotted" or "besottedly in love".
+       listed. If you're about to write "charmed", check whether you
+       already wrote "charming" — if so, drop it.
      * **Lowercase** unless it's a proper noun. "stoic", not "Stoic".
      * **No redundant qualifiers** like "somewhat", "very", "extremely",
-       "always" unless they change the meaning. "violent" suffices for
-       "very violent".
+       "always" unless they change the meaning.
      * Each trait is **one fact** — don't emit "brave, loyal, and protective"
        as a single trait; that's three separate entries.
+     * **Bias STRONGLY toward not emitting.** If you're unsure whether
+       something is a trait or a mood, it's a mood — skip it. The trait
+       list is user-visible and noise pollutes it. Emit 3-5 very confident
+       traits per character per batch rather than 15 maybe-traits.
 
    Example of permissive extraction:
    A passage mentions "the bartender the bartender set down a drink" — extract the bartender as a

@@ -37,8 +37,22 @@ function getPool(settings) {
 
 async function initSchema(settings) {
   const p = getPool(settings);
-  const sql = readFileSync(resolve(__dirname, "schema.sql"), "utf-8");
-  const stmts = sql.split(";").map((s) => s.trim()).filter((s) => s && !s.startsWith("--"));
+  const raw = readFileSync(resolve(__dirname, "schema.sql"), "utf-8");
+  // Strip `--` line comments BEFORE splitting on `;`. Comments can
+  // legally contain `;` and backticks, and the previous naive splitter
+  // would mid-cut a comment block and send the dangling second half
+  // ("...`merged_count` is a cheap popularity signal. ALTER TABLE...")
+  // straight to Postgres as a syntax error, silently dropping the ALTER.
+  // schema.sql has no `--` inside SQL string literals, so a whole-line
+  // strip is safe here.
+  const sql = raw
+    .split("\n")
+    .map((line) => {
+      const idx = line.indexOf("--");
+      return idx === -1 ? line : line.slice(0, idx);
+    })
+    .join("\n");
+  const stmts = sql.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
 
   for (const stmt of stmts) {
     try {

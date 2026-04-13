@@ -231,16 +231,25 @@ CREATE TABLE IF NOT EXISTS traits (
     source_chat  TEXT,
     created_at   TIMESTAMPTZ DEFAULT NOW(),
     normalized_content TEXT GENERATED ALWAYS AS
-      (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED
+      (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED,
+    stemmed_content TEXT GENERATED ALWAYS AS
+      (strip(to_tsvector('english', content))::text) STORED
 );
 
 -- Case/punctuation variants (Awed / awed / Awe-struck / Awestruck) collapse
--- via the generated normalized_content column. upsertTrait uses ON CONFLICT
--- against this unique index to dedup on write.
+-- via normalized_content. Morphological variants (charmed / charming /
+-- observant / observing) collapse via stemmed_content, which runs the
+-- Postgres English stemmer. upsertTrait uses ON CONFLICT against the
+-- normalized unique index and a pre-check against stemmed_content for
+-- dedup on write.
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS normalized_content TEXT
   GENERATED ALWAYS AS (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED;
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS stemmed_content TEXT
+  GENERATED ALWAYS AS (strip(to_tsvector('english', content))::text) STORED;
 CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
 CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);
+CREATE INDEX IF NOT EXISTS idx_traits_stem
+  ON traits (character_id, category, stemmed_content);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_traits_unique_norm
   ON traits (character_id, category, normalized_content);
 

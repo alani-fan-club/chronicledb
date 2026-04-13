@@ -59,6 +59,24 @@ Extract:
    - **traits**: innate properties (distinct from learned knowledge). Categories:
      personality, skill, background, physical, faction.
 
+     TRAIT FORMAT RULES — these are load-bearing, the trait list is user-visible:
+     * Use the **canonical adjective / noun form**, not the gerund or past
+       tense. "charming" (not "charmed" or "charms"), "observant" (not "was
+       observant" or "observing"), "resourceful" (not "is resourceful").
+     * **Single word when possible**, short phrase only when necessary.
+       "stoic" not "generally stoic and reserved". "calm" not "is calm under
+       pressure" (that's personality+context, pick one).
+     * **Do not emit morphological variants** of a trait you've already
+       listed. If you're about to write "charmed", check whether you already
+       wrote "charming" — if so, drop it. If "besotted" is already listed,
+       don't also write "Besotted" or "besottedly in love".
+     * **Lowercase** unless it's a proper noun. "stoic", not "Stoic".
+     * **No redundant qualifiers** like "somewhat", "very", "extremely",
+       "always" unless they change the meaning. "violent" suffices for
+       "very violent".
+     * Each trait is **one fact** — don't emit "brave, loyal, and protective"
+       as a single trait; that's three separate entries.
+
    Example of permissive extraction:
    A passage mentions "the bartender the bartender set down a drink" — extract the bartender as a
    character even though she has one line. Extract "the doorman the doorman" even if

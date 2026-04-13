@@ -219,21 +219,26 @@ async function upsertTrait(settings, { characterId, category, content, sourceCha
   const cleaned = String(content).trim();
   const cat = category || "personality";
 
-  // Fuzzy pre-check: catch semantic/substring duplicates the generated
-  // normalized_content column can't see. A trait is considered a dupe of
-  // an existing one if EITHER:
-  //  - one is a substring of the other (case-insensitive), OR
-  //  - pg_trgm similarity > TRAIT_SIMILARITY_THRESHOLD
-  // When a match is found, we keep whichever content string is longer
-  // (more specific wording wins: "Former prisoner (Setting, 'the hole')"
-  // beats "Former prisoner"). No UPDATE — just return the winner's id.
+  // Fuzzy pre-check: catch duplicates the exact-normalized unique index
+  // can't see. A trait is considered a dupe of an existing one if ANY of:
+  //   - `stemmed_content` matches (English stemmer collapses
+  //     charmed/charming/charms to 'charm', observant/observing to 'observ',
+  //     etc — this is the layer that catches morphological variants)
+  //   - one content is a case-insensitive substring of the other
+  //     (catches "Former prisoner" / "Former prisoner (Setting...)")
+  //   - pg_trgm similarity > TRAIT_SIMILARITY_THRESHOLD
+  //     (catches reordered/rephrased variants like "Manager of the Grand"
+  //     / "Former manager of the Grand")
+  // When a match is found, keep whichever content is longer (more specific
+  // wording wins). No UPDATE — just return the winner's id.
   const { rows: similar } = await p.query(
     `SELECT id, content, length(content) AS len,
             similarity(lower(content), lower($3)) AS sim
      FROM traits
      WHERE character_id = $1 AND category = $2
        AND (
-         lower(content) LIKE '%' || lower($3) || '%'
+         stemmed_content = strip(to_tsvector('english', $3))::text
+         OR lower(content) LIKE '%' || lower($3) || '%'
          OR lower($3) LIKE '%' || lower(content) || '%'
          OR similarity(lower(content), lower($3)) > $4
        )

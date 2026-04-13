@@ -209,33 +209,74 @@ async function upsertWorldState(settings, { key, value, reason, chatId }) {
 
 // ── Character traits ───────────────────────────────────────────
 
+// Threshold tuned against representative trait pairs. Above this, we
+// consider two traits near-duplicates. Lower = more aggressive merging.
+const TRAIT_SIMILARITY_THRESHOLD = 0.55;
+
 async function upsertTrait(settings, { characterId, category, content, sourceChat }) {
   const p = getPool(settings);
   if (!content || !String(content).trim()) return null;
-  // Dedup is enforced by the unique index on
-  // (character_id, category, normalized_content) where normalized_content
-  // is a generated column: lower(content) with non-alphanumerics stripped.
-  // That collapses case/punctuation variants ("Awed"/"awed"/"awe-struck"/
-  // "Awestruck") into one row. ON CONFLICT DO NOTHING + RETURNING id
-  // gives us back the inserted id when new, empty when it was a dupe;
-  // we then fetch the existing id via the same normalized key.
-  const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const cleaned = String(content).trim();
   const cat = category || "personality";
+
+  // Fuzzy pre-check: catch semantic/substring duplicates the generated
+  // normalized_content column can't see. A trait is considered a dupe of
+  // an existing one if EITHER:
+  //  - one is a substring of the other (case-insensitive), OR
+  //  - pg_trgm similarity > TRAIT_SIMILARITY_THRESHOLD
+  // When a match is found, we keep whichever content string is longer
+  // (more specific wording wins: "Former prisoner (Setting, 'the hole')"
+  // beats "Former prisoner"). No UPDATE — just return the winner's id.
+  const { rows: similar } = await p.query(
+    `SELECT id, content, length(content) AS len,
+            similarity(lower(content), lower($3)) AS sim
+     FROM traits
+     WHERE character_id = $1 AND category = $2
+       AND (
+         lower(content) LIKE '%' || lower($3) || '%'
+         OR lower($3) LIKE '%' || lower(content) || '%'
+         OR similarity(lower(content), lower($3)) > $4
+       )
+     ORDER BY len DESC, sim DESC
+     LIMIT 1`,
+    [characterId, cat, cleaned, TRAIT_SIMILARITY_THRESHOLD],
+  );
+  if (similar.length > 0) {
+    const match = similar[0];
+    if (match.len >= cleaned.length) return match.id;
+    // New trait is longer/more specific. Rewrite the existing row's
+    // content so the longer version becomes canonical. The generated
+    // normalized_content column updates with it via STORED regeneration.
+    try {
+      await p.query(
+        `UPDATE traits SET content = $1 WHERE id = $2`,
+        [cleaned, match.id],
+      );
+    } catch (err) {
+      // Rewrite could violate the unique normalized index if two distinct
+      // groups collapse into one. Ignore and keep the existing row; the
+      // cleanup script handles the rest.
+    }
+    return match.id;
+  }
+
+  // No fuzzy match. Insert, with ON CONFLICT on the exact-normalized
+  // unique index as a safety net for race conditions + case variants.
+  const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const { rows: inserted } = await p.query(
     `INSERT INTO traits (id, character_id, category, content, source_chat)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (character_id, category, normalized_content) DO NOTHING
      RETURNING id`,
-    [id, characterId, cat, content, sourceChat || ""],
+    [id, characterId, cat, cleaned, sourceChat || ""],
   );
   if (inserted.length > 0) return inserted[0].id;
-  // Dupe: fetch the existing id via the same normalized key.
   const { rows: existing } = await p.query(
     `SELECT id FROM traits
      WHERE character_id = $1 AND category = $2
        AND normalized_content = regexp_replace(lower($3), '[^a-z0-9]', '', 'g')
      LIMIT 1`,
-    [characterId, cat, content],
+    [characterId, cat, cleaned],
   );
   return existing[0]?.id ?? null;
 }

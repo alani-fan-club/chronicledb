@@ -240,6 +240,7 @@ CREATE TABLE IF NOT EXISTS traits (
     confidence   REAL DEFAULT 0.8,
     source_chat  TEXT,
     created_at   TIMESTAMPTZ DEFAULT NOW(),
+    verified_at  TIMESTAMPTZ,
     embedding    vector(768),
     normalized_content TEXT GENERATED ALWAYS AS
       (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED,
@@ -272,6 +273,10 @@ ALTER TABLE traits ADD COLUMN IF NOT EXISTS evidence_sentence TEXT;
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS canonical_id TEXT REFERENCES traits(id) ON DELETE SET NULL;
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS aliases TEXT[] DEFAULT '{}';
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS merged_count INT DEFAULT 1;
+-- Path 3: LLM verifier timestamp. Stamped every time the 0.80-0.88 band
+-- verifier evaluates a candidate against this canonical, regardless of
+-- the MERGE / KEEP_DISTINCT / REJECT_NEW outcome. Observability signal.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
 CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);

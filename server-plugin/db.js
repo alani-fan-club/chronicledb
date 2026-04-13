@@ -386,6 +386,10 @@ function classifyDisposition(candidate, category) {
 const TRAIT_MERGE_COSINE = 0.88;
 const TRAIT_VERIFY_COSINE = 0.80;
 
+// Process-local cache for Path 3 verifier decisions. Key is
+// `${canonical_id}::${normalized_candidate}`. Cleared on restart.
+const traitVerifyCache = new Map();
+
 async function upsertTrait(
   settings,
   { characterId, characterName, category, content, evidenceSentence, sourceChat },
@@ -515,9 +519,11 @@ async function upsertTrait(
   // text fallback on the merged variants without a second table.
   const aliasEntry = evidence ? `${cleaned}: ${evidence}` : cleaned;
 
-  if (topHit && typeof topHit.cos === "number" && topHit.cos >= TRAIT_MERGE_COSINE) {
-    // MERGE: append to the canonical row's aliases, bump merged_count,
-    // and insert this row pointing at it so the provenance survives.
+  // Shared merge path used by both the ≥0.88 branch and Path 3's MERGE
+  // verdict. Appends aliasEntry to topHit.aliases, bumps merged_count,
+  // inserts this candidate as a merged variant pointing at topHit, and
+  // refreshes the per-character summary rollup. Returns topHit.id.
+  async function mergeCandidateOntoCanonical() {
     try {
       await p.query(
         `UPDATE traits
@@ -558,19 +564,66 @@ async function upsertTrait(
     return topHit.id;
   }
 
+  if (topHit && typeof topHit.cos === "number" && topHit.cos >= TRAIT_MERGE_COSINE) {
+    // MERGE: ≥0.88 cosine against an existing canonical — collapse.
+    return await mergeCandidateOntoCanonical();
+  }
+
   if (
     topHit &&
     typeof topHit.cos === "number" &&
     topHit.cos >= TRAIT_VERIFY_COSINE &&
     topHit.cos < TRAIT_MERGE_COSINE
   ) {
-    // VERIFY band. Path 3 (LLM verifier) is not yet built — log the
-    // near-miss and fall through to NEW_CANONICAL so we don't lose the
-    // candidate. TODO(Path 3): replace this branch with a call to the
-    // verifier that returns MERGE / KEEP_DISTINCT / REJECT_NEW.
+    // Path 3: 0.80-0.88 is the ambiguous band. Ask a tiny LLM verifier
+    // to decide MERGE / KEEP_DISTINCT / REJECT_NEW. Process-local cache
+    // on (canonical_id, normalized_cleaned) avoids re-verifying the
+    // same pair within a long ingest. Any error or unexpected response
+    // falls through to NEW_CANONICAL — we never drop a trait because
+    // the verifier failed.
+    const cacheKey = `${topHit.id}::${cleaned.toLowerCase()}`;
+    let decision = traitVerifyCache.get(cacheKey);
+
+    if (!decision) {
+      try {
+        const extractor = require("./extractor");
+        decision = await extractor.verifyTraitPair(settings, {
+          characterName: name,
+          category: cat,
+          candidateContent: cleaned,
+          candidateEvidence: evidence,
+          existingContent: topHit.content,
+          existingEvidence: "",
+          cosine: topHit.cos,
+        });
+        traitVerifyCache.set(cacheKey, decision);
+      } catch (err) {
+        console.warn(`[ChronicleDB] trait verifier failed (${err.message}); falling through to NEW_CANONICAL`);
+        decision = "KEEP_DISTINCT";
+      }
+    }
+
     console.info(
-      `[ChronicleDB] trait verifier queue: "${cleaned}" vs "${topHit.content}" cos=${topHit.cos.toFixed(4)} (char=${characterId} cat=${cat})`,
+      `[ChronicleDB] trait verify: "${cleaned}" vs "${topHit.content}" cos=${topHit.cos.toFixed(4)} -> ${decision}`,
     );
+
+    // Mark the canonical as verified regardless of outcome — the pair
+    // has been evaluated. verified_at is an observability / staleness
+    // signal, not a correctness gate.
+    try {
+      await p.query(`UPDATE traits SET verified_at = NOW() WHERE id = $1`, [topHit.id]);
+    } catch (_) {
+      // verified_at update is best-effort; never fail the trait insert.
+    }
+
+    if (decision === "MERGE") {
+      return await mergeCandidateOntoCanonical();
+    }
+    if (decision === "REJECT_NEW") {
+      // Drop the candidate entirely. No insert, no alias, no row.
+      return topHit.id;
+    }
+    // KEEP_DISTINCT (or any error fallback): fall through to NEW_CANONICAL.
   }
 
   // NEW_CANONICAL: insert as a fresh canonical row, embedding populated

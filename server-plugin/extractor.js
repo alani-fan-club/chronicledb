@@ -433,6 +433,90 @@ async function embed(settings, text) {
   });
 }
 
+// Path 3: tiny trait-pair verifier. Called by db.upsertTrait when a candidate
+// lands in the 0.80-0.88 cosine band against an existing canonical. Returns
+// exactly one of "MERGE" / "KEEP_DISTINCT" / "REJECT_NEW"; anything else throws
+// and the caller falls through to NEW_CANONICAL.
+async function verifyTraitPair(settings, args) {
+  const {
+    characterName,
+    category,
+    candidateContent,
+    candidateEvidence,
+    existingContent,
+    existingEvidence,
+    cosine,
+  } = args || {};
+
+  const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
+  const model = (settings.verifierModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
+  const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
+
+  if (!apiKey) {
+    const err = new Error("verifyTraitPair: settings missing apiKey");
+    throw err;
+  }
+
+  const cosStr = (typeof cosine === "number" ? cosine : 0).toFixed(3);
+  const prompt = `You are deduplicating character trait facts for a story-memory database.
+
+Character: ${characterName}
+Category: ${category}
+
+Candidate trait: "${candidateContent}"
+Candidate evidence: ${candidateEvidence || "(none)"}
+
+Existing canonical trait: "${existingContent}"
+Existing evidence: ${existingEvidence || "(none)"}
+
+They scored ${cosStr} cosine similarity — close but not identical.
+
+Decide whether the candidate:
+  MERGE        — same disposition as existing, just phrased differently. Collapse them.
+  KEEP_DISTINCT — both are valid dispositional traits but they capture different things.
+  REJECT_NEW   — the candidate is redundant noise, transient emotion, or a worse phrasing of the existing trait; drop it.
+
+Rules:
+- Prefer MERGE when one wording is clearly a paraphrase of the other.
+- Prefer KEEP_DISTINCT when both add distinct information about the character.
+- Prefer REJECT_NEW when the candidate is vaguer, shorter, or a transient feeling that should not be a persistent trait.
+- Answer with EXACTLY one token: MERGE, KEEP_DISTINCT, or REJECT_NEW. No preamble, no punctuation, no explanation.
+
+Answer:`;
+
+  return withExponentialBackoff(async () => {
+    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        // 32 rather than 8: Gemini 2.5 models sometimes consume output
+        // tokens on internal thinking before emitting visible text, and
+        // a prior bug silently zeroed out the eval judge with a tight
+        // cap. 32 is still ≤1 cent per thousand calls and gives room for
+        // "Answer: MERGE" or similar incidental preamble.
+        generationConfig: { temperature: 0.0, maxOutputTokens: 32 },
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      const err = new Error(`Trait verifier LLM error ${res.status}: ${body}`);
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    // Tolerant parse: the three valid tokens are disjoint substrings, so
+    // check longest-first. Handles "Answer: MERGE", "**MERGE**", "MERGE.",
+    // etc. without falling through to KEEP_DISTINCT on incidental preamble.
+    const up = text.toUpperCase();
+    if (up.includes("KEEP_DISTINCT")) return "KEEP_DISTINCT";
+    if (up.includes("REJECT_NEW")) return "REJECT_NEW";
+    if (up.includes("MERGE")) return "MERGE";
+    throw new Error(`verifyTraitPair: unexpected response "${(text || "").slice(0, 40)}"`);
+  });
+}
+
 async function generateSituatingBlurb(settings, { chatTitle, surroundingContext, message }) {
   const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
   // contextModel is legacy — the UI now surfaces a single model. Fall back
@@ -943,6 +1027,7 @@ module.exports = {
   embed,
   embedBatch,
   generateSituatingBlurb,
+  verifyTraitPair,
   chunkText,
   extractDialogueQuotes,
   withExponentialBackoff,

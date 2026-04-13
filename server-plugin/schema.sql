@@ -7,18 +7,28 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- ── Node tables ────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS characters (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL UNIQUE,
-    aliases      TEXT[] DEFAULT '{}',
-    description  TEXT DEFAULT '',
-    faction      TEXT,
-    role         TEXT DEFAULT '',
-    status       TEXT DEFAULT 'active',
-    significance INT DEFAULT 3,
-    first_seen   TEXT,
-    created_at   TIMESTAMPTZ DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ DEFAULT NOW()
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL UNIQUE,
+    aliases           TEXT[] DEFAULT '{}',
+    description       TEXT DEFAULT '',
+    faction           TEXT,
+    role              TEXT DEFAULT '',
+    status            TEXT DEFAULT 'active',
+    significance      INT DEFAULT 3,
+    first_seen        TEXT,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW(),
+    summary_embedding vector(768)
 );
+
+-- Per-character rollup embedding: mean-pool of dispositional trait embeddings
+-- for that character. Recomputed by recomputeCharacterSummary on trait
+-- insert/delete and via the /recompute-character-summaries admin route.
+-- Used for "find similar characters across chats" retrieval and cheap
+-- character-archetype prefetch. HNSW-indexed for cosine kNN.
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS summary_embedding vector(768);
+CREATE INDEX IF NOT EXISTS idx_characters_summary_hnsw
+    ON characters USING hnsw (summary_embedding vector_cosine_ops);
 
 CREATE TABLE IF NOT EXISTS locations (
     id              TEXT PRIMARY KEY,
@@ -230,6 +240,7 @@ CREATE TABLE IF NOT EXISTS traits (
     confidence   REAL DEFAULT 0.8,
     source_chat  TEXT,
     created_at   TIMESTAMPTZ DEFAULT NOW(),
+    embedding    vector(768),
     normalized_content TEXT GENERATED ALWAYS AS
       (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED,
     stemmed_content TEXT GENERATED ALWAYS AS
@@ -246,6 +257,10 @@ ALTER TABLE traits ADD COLUMN IF NOT EXISTS normalized_content TEXT
   GENERATED ALWAYS AS (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED;
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS stemmed_content TEXT
   GENERATED ALWAYS AS (strip(to_tsvector('english', content))::text) STORED;
+-- Contextual-embedding column populated lazily by the extractor (Path 1).
+-- Nullable; recomputeCharacterSummary skips rows where embedding IS NULL
+-- when rolling up into characters.summary_embedding.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS embedding vector(768);
 CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
 CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);
 CREATE INDEX IF NOT EXISTS idx_traits_stem

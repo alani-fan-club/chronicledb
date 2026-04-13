@@ -3,6 +3,7 @@ const { readFileSync } = require("fs");
 const { resolve } = require("path");
 const { createHash } = require("crypto");
 const { buildOrTsquery } = require("../shared/ts-query");
+const { GOLDBERG_100, NRC_EMOTION, NRC_VAD } = require("../shared/trait-lexicons");
 
 let pool = null;
 let poolConfigHash = "";
@@ -259,22 +260,29 @@ function approxStem(word) {
     .replace(/(ing|ed|ly|ness|ion|ions|ful|er|est|s)$/, "");
 }
 
-function isTransientEmotionStem(content) {
-  if (!content) return false;
-  const words = String(content)
+// Common English fillers we drop before inspecting trait content, so that
+// "was angry" is treated the same as "angry" and "appreciative of genuine
+// interaction" collapses to words where "appreciative" is the first
+// meaningful token.
+const TRAIT_FILLER_WORDS = new Set([
+  "was", "is", "am", "are", "be", "been", "being",
+  "feels", "feel", "felt", "seems", "seem", "appeared", "appears",
+  "very", "somewhat", "quite", "rather", "a", "an", "the", "of", "at",
+  "to", "for", "with", "by", "in", "on", "but", "and", "or", "from",
+]);
+
+function meaningfulWords(content) {
+  return String(content || "")
     .toLowerCase()
     .replace(/[^a-z]+/g, " ")
     .trim()
     .split(/\s+/)
-    .filter(Boolean);
-  // Drop common English filler so "was angry" is treated the same as
-  // "angry" and "annoyed at staff" collapses to "annoyed staff" where
-  // "annoyed" is the first meaningful word.
-  const filler = new Set(["was", "is", "am", "are", "be", "been", "being",
-    "feels", "feel", "felt", "seems", "seem", "appeared", "appears",
-    "very", "somewhat", "quite", "rather", "a", "an", "the", "of", "at",
-    "to", "for", "with", "by", "in", "on", "but", "and", "or", "from"]);
-  const meaningful = words.filter((w) => !filler.has(w));
+    .filter((w) => w && !TRAIT_FILLER_WORDS.has(w));
+}
+
+function isTransientEmotionStem(content) {
+  if (!content) return false;
+  const meaningful = meaningfulWords(content);
   if (meaningful.length === 0) return false;
   // Single-word case: reject if the stem matches.
   if (meaningful.length === 1) {
@@ -290,6 +298,85 @@ function isTransientEmotionStem(content) {
   return TRAIT_STATE_STEMS.has(firstStem) || TRAIT_STATE_STEMS.has(meaningful[0]);
 }
 
+// Arousal threshold used by `classifyDisposition` when deciding whether a
+// NRC-emotion-tagged word should be auto-rejected vs queued for verification.
+// NRC-VAD publishes arousal scores on a normalized [0, 1] axis. We set the
+// cutoff at 0.55 — calibrated against the Path 2 spec ("arousal > 0.6") and
+// the audit-reject list in RESEARCH_TRAITS.md. 0.55 is just below the
+// "intense affect reaction" band where words like excited (~0.85), aroused
+// (~0.85), terrified (~0.93), enamored/captivated/adoring (~0.55-0.62),
+// frustrated/embarrassed/fascinated (~0.55-0.62), horrified (~0.88) sit.
+// Everything below 0.55 and no Goldberg hit falls into 'verify', where
+// Path 1's canonical-row dedup system makes the final call.
+//
+// Exact threshold uses a strict `>=` on purpose so that mid-arousal words
+// sitting at the boundary (awed=0.55, confused=0.55, puzzled=0.55,
+// grieving=0.55, upset=0.55) land on 'reject' rather than 'verify'.
+const TRAIT_AROUSAL_REJECT_THRESHOLD = 0.55;
+
+/**
+ * Lexicon-first disposition classifier (Path 2 from RESEARCH_TRAITS.md §5).
+ *
+ * Runs BEFORE any embedding or LLM call in upsertTrait. Removes ~70% of
+ * transient-emotion noise with zero network calls by matching candidates
+ * against:
+ *   - GOLDBERG_100: known persistent personality adjectives (auto-accept)
+ *   - NRC_EMOTION + NRC_VAD arousal: known transient affect words
+ *
+ * @param {string} candidate trait content text (may be multi-word)
+ * @param {string} category trait category (only 'personality' is gated here)
+ * @returns {'accept' | 'reject' | 'verify'}
+ */
+function classifyDisposition(candidate, category) {
+  // Skills / background / physical / faction pass through unchanged — a
+  // faction name or a physical attribute that happens to contain an emotion
+  // word shouldn't be rejected.
+  if ((category || "personality") !== "personality") return "verify";
+
+  const meaningful = meaningfulWords(candidate);
+  if (meaningful.length === 0) return "verify";
+
+  // Path 2 is designed for single-word candidates ("stoic", "aroused").
+  // For multi-word candidates we still classify on the first meaningful word
+  // as a best-effort — the caller's existing short-phrase gate (in
+  // isTransientEmotionStem) supplements this for ≤4-word phrases.
+  const first = meaningful[0];
+  const stem = approxStem(first);
+
+  // Step 1: Goldberg whitelist. If either the raw word or its approx stem
+  // is in GOLDBERG_100, auto-accept. This path also wins over any NRC hit
+  // so words like "calculating"/"dominant"/"charming" which live in both
+  // lexicons resolve to accept.
+  if (GOLDBERG_100.has(first) || GOLDBERG_100.has(stem)) {
+    return "accept";
+  }
+
+  // Step 2: NRC emotion gate. If the candidate is in NRC but not in
+  // Goldberg, it is probably a transient affect state. Refine the decision
+  // using NRC-VAD arousal when available.
+  const inNrc = NRC_EMOTION.has(first) || NRC_EMOTION.has(stem);
+  if (inNrc) {
+    const vadEntry = NRC_VAD.get(first) || NRC_VAD.get(stem);
+    if (vadEntry && typeof vadEntry.arousal === "number") {
+      // Moderate-to-high arousal = temporary state. Reject outright.
+      if (vadEntry.arousal >= TRAIT_AROUSAL_REJECT_THRESHOLD) return "reject";
+      // Low-arousal emotion words: unusual for a state word to be low-
+      // arousal, but if it is (e.g. "weary" at ~0.32, "bored" at ~0.22,
+      // "satisfied" at ~0.38), defer to the verifier.
+      return "verify";
+    }
+    // NRC hit with no VAD coverage. Default to reject — NRC-tagged words
+    // are overwhelmingly affect states, and Path 1's canonical dedup won't
+    // have a chance to salvage them anyway at this stage.
+    return "reject";
+  }
+
+  // Step 3: Unknown to both lexicons. Per the Path 2 spec, err on the side
+  // of keeping the candidate and let downstream verification (Path 1 /
+  // Path 3) decide.
+  return "verify";
+}
+
 async function upsertTrait(settings, { characterId, category, content, sourceChat }) {
   const p = getPool(settings);
   if (!content || !String(content).trim()) return null;
@@ -301,8 +388,17 @@ async function upsertTrait(settings, { characterId, category, content, sourceCha
   // it does anyway on long ingests; this is the write-side safety net.
   // Only applies to the `personality` category — a skill, background, or
   // physical entry that happens to contain an emotion word is fine.
-  if (cat === "personality" && isTransientEmotionStem(cleaned)) {
-    return null;
+  //
+  // Two-layer gate:
+  //   (1) Lexicon-first classifier (Path 2): GOLDBERG_100 whitelist +
+  //       NRC_EMOTION / NRC_VAD blocklist. Runs BEFORE embedding/LLM cost.
+  //   (2) TRAIT_STATE_STEMS + multi-word phrase rule. Kept as a safety net
+  //       behind the lexicon path so we don't regress coverage while we
+  //       tune the lexicons; the hardcoded set supersedes it long term.
+  if (cat === "personality") {
+    const disposition = classifyDisposition(cleaned, cat);
+    if (disposition === "reject") return null;
+    if (isTransientEmotionStem(cleaned)) return null;
   }
 
   // Fuzzy pre-check: catch duplicates the exact-normalized unique index
@@ -379,6 +475,38 @@ async function getTraitsForCharacter(settings, characterId) {
     [characterId],
   );
   return rows;
+}
+
+// Per-character summary embedding = mean-pool of all dispositional trait
+// embeddings for that character (personality category only, per the research
+// report §5 Path 4). Recomputed on trait insert/delete; the call from
+// upsertTrait is wired once Path 1 lands the actual per-trait embedding
+// writes. Until then the column is populated via the /recompute-character-
+// summaries admin route, which is a no-op per row until any traits have a
+// non-null embedding.
+//
+// pgvector's AVG(vector) returns the element-wise mean, which for cosine
+// similarity is equivalent to centroid direction after L2 normalization.
+// If no trait has an embedding yet, AVG returns NULL and we reset the
+// character row's summary_embedding to NULL so the HNSW index doesn't
+// retain stale vectors after a trait purge.
+async function recomputeCharacterSummary(settings, characterId) {
+  const p = getPool(settings);
+  const { rows } = await p.query(
+    `SELECT AVG(embedding) AS avg_embedding
+     FROM traits
+     WHERE character_id = $1
+       AND embedding IS NOT NULL
+       AND category = 'personality'`,
+    [characterId],
+  );
+  const avg = rows[0]?.avg_embedding ?? null;
+  await p.query(
+    `UPDATE characters SET summary_embedding = $2, updated_at = NOW()
+     WHERE id = $1`,
+    [characterId, avg],
+  );
+  return avg;
 }
 
 // ── Story arcs and event chains ────────────────────────────────
@@ -1446,7 +1574,7 @@ async function closePool() {
 module.exports = {
   getPool, initSchema, slugify,
   upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
-  upsertTrait, getTraitsForCharacter,
+  upsertTrait, classifyDisposition, getTraitsForCharacter, recomputeCharacterSummary,
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads, upsertItem,
   upsertStoryArc, linkEventToArc, createEventChain,

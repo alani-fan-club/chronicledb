@@ -665,6 +665,30 @@ async function init(router) {
     }
   });
 
+  // ── Character summary-embedding rollup ───────────────────────
+  // Admin endpoint: iterate every character and rebuild its
+  // `summary_embedding` as the mean-pool of its personality-trait
+  // embeddings. Safe to run repeatedly. Intended to be fired after a
+  // one-shot backfill once traits have real contextual embeddings
+  // (Path 1). Per-row updates are no-ops until any trait embeddings
+  // exist, at which point the aggregate starts populating.
+
+  router.post("/recompute-character-summaries", async (req, res) => {
+    try {
+      const p = db.getPool(settings);
+      const { rows } = await p.query("SELECT id FROM characters");
+      let updated = 0;
+      for (const row of rows) {
+        await db.recomputeCharacterSummary(settings, row.id);
+        updated++;
+      }
+      res.json({ updated });
+    } catch (err) {
+      console.error("[ChronicleDB] Recompute summaries error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Character cards (all ST character PNGs) ──────────────────
 
   router.get("/character-cards", async (req, res) => {

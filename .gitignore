@@ -7,14 +7,11 @@ dist/
 chronicledb.config.json
 server-plugin/.settings-cache.json
 
-# Per-user corpus, eval questions, and generated bundles — these contain
-# chat/character content and should never be committed. Use the .example
-# files in each directory as a template.
-eval/.local-corpus.json
-eval/questions.json
-eval/questions.json.bak
-eval/test_bundle.json
-eval/results/
+# Local-only eval harness + testing data. Scrubbed from history; never
+# re-commit. Includes the retrieval eval scripts, the arc-builder grid
+# sweep harness, questions, corpus, results, and any generated bundles.
+eval/
+scripts/eval-arcs.js
 /tmp/haiku-bundle/
 /tmp/haiku-split/
 /tmp/haiku-results/

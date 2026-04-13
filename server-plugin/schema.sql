@@ -229,11 +229,20 @@ CREATE TABLE IF NOT EXISTS traits (
     content      TEXT NOT NULL,
     confidence   REAL DEFAULT 0.8,
     source_chat  TEXT,
-    created_at   TIMESTAMPTZ DEFAULT NOW()
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    normalized_content TEXT GENERATED ALWAYS AS
+      (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED
 );
 
+-- Case/punctuation variants (Awed / awed / Awe-struck / Awestruck) collapse
+-- via the generated normalized_content column. upsertTrait uses ON CONFLICT
+-- against this unique index to dedup on write.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS normalized_content TEXT
+  GENERATED ALWAYS AS (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED;
 CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
 CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_traits_unique_norm
+  ON traits (character_id, category, normalized_content);
 
 -- ── Items (key objects with owners, powers, significance) ──────
 

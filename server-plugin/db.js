@@ -211,19 +211,33 @@ async function upsertWorldState(settings, { key, value, reason, chatId }) {
 
 async function upsertTrait(settings, { characterId, category, content, sourceChat }) {
   const p = getPool(settings);
-  // Dedupe: check if same content exists for same character+category
-  const { rows: existing } = await p.query(
-    `SELECT id FROM traits WHERE character_id = $1 AND category = $2 AND content = $3`,
-    [characterId, category, content],
-  );
-  if (existing.length > 0) return existing[0].id;
-
+  if (!content || !String(content).trim()) return null;
+  // Dedup is enforced by the unique index on
+  // (character_id, category, normalized_content) where normalized_content
+  // is a generated column: lower(content) with non-alphanumerics stripped.
+  // That collapses case/punctuation variants ("Awed"/"awed"/"awe-struck"/
+  // "Awestruck") into one row. ON CONFLICT DO NOTHING + RETURNING id
+  // gives us back the inserted id when new, empty when it was a dupe;
+  // we then fetch the existing id via the same normalized key.
   const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-  await p.query(
-    `INSERT INTO traits (id, character_id, category, content, source_chat) VALUES ($1, $2, $3, $4, $5)`,
-    [id, characterId, category || "personality", content, sourceChat || ""],
+  const cat = category || "personality";
+  const { rows: inserted } = await p.query(
+    `INSERT INTO traits (id, character_id, category, content, source_chat)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (character_id, category, normalized_content) DO NOTHING
+     RETURNING id`,
+    [id, characterId, cat, content, sourceChat || ""],
   );
-  return id;
+  if (inserted.length > 0) return inserted[0].id;
+  // Dupe: fetch the existing id via the same normalized key.
+  const { rows: existing } = await p.query(
+    `SELECT id FROM traits
+     WHERE character_id = $1 AND category = $2
+       AND normalized_content = regexp_replace(lower($3), '[^a-z0-9]', '', 'g')
+     LIMIT 1`,
+    [characterId, cat, content],
+  );
+  return existing[0]?.id ?? null;
 }
 
 async function getTraitsForCharacter(settings, characterId) {

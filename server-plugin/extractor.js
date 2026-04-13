@@ -53,9 +53,10 @@ Extract:
    graph filters at query time, not extraction time.
 
    For each character, also extract:
-   - **aliases**: alternate forms of the name. E.g., "Alex Reynolds" might also be
-     called "Protagonist", "Alex", "Al", "Night Captain". List all forms
-     you've seen in this passage or know from earlier context.
+   - **aliases**: alternate forms of the name. E.g., a character named "Alex
+     Reynolds" might also be called "Alex", "Reynolds", "Al", or an epithet
+     like "the Night Captain". List all forms you've seen in this passage
+     or know from earlier context.
 
    Two SEPARATE buckets must be emitted per character. The distinction is
    structural — the output schema has two different fields and they go to
@@ -121,11 +122,11 @@ Extract:
          * Trait: "stoic"
            evidence_sentence: "He did not flinch when the blade
              grazed his cheek, and his expression never changed."
-         * Trait: "former yakuza captain"
-           evidence_sentence: "Protagonist served as a captain under
-             Faction for six years before the 1988 incident."
+         * Trait: "former military captain"
+           evidence_sentence: "She served as a captain under the
+             Northern Regiment for six years before the armistice."
          * Trait: "protective of children"
-           evidence_sentence: "She stepped between the child and the
+           evidence_sentence: "He stepped between the child and the
              gunman without hesitation."
        Each of those is one sentence, drawn from the passage,
        descriptive or quoted, and specifically justifies the trait.
@@ -169,9 +170,9 @@ Extract:
    character.
 
    Example of permissive extraction:
-   A passage mentions "the bartender the bartender set down a drink" — extract the bartender as a
-   character even though she has one line. Extract "the doorman the doorman" even if
-   he's only named in passing.
+   A passage mentions "the bartender set down a drink" — extract the bartender
+   as a character even if she has one line. Extract "the doorman" even if he
+   is only named in passing.
 2. **Relationships** — how characters feel about each other (sentiment -1.0 to 1.0, intensity 0-1, evidence)
 3. **Events** — things that happened, with significance. For each event, also
    capture **source_quote**: the most distinctive 1-2 sentences from the

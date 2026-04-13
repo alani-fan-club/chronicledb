@@ -56,63 +56,95 @@ Extract:
    - **aliases**: alternate forms of the name. E.g., "Alex Reynolds" might also be
      called "Protagonist", "Alex", "Al", "Night Captain". List all forms
      you've seen in this passage or know from earlier context.
-   - **traits**: **dispositional** properties — things the character IS over
-     the long run, not what they're feeling right now. This distinction is
-     the most common extraction failure, so read the rules carefully:
 
-     A trait is INNATE, STABLE, and PERSISTENT. It would still be true of
-     the character tomorrow, next week, in a completely different scene.
-     It is something another character in the story would describe as
-     "just who they are".
+   Two SEPARATE buckets must be emitted per character. The distinction is
+   structural — the output schema has two different fields and they go to
+   two different tables. Do NOT conflate them.
 
-     **DO NOT emit as traits**:
-       * Emotional states or moods (angry, sad, happy, amused, annoyed,
-         besotted, aroused, awed, baffled, bemused, charmed, astonished,
-         frustrated, afraid, nervous, excited, content, distressed,
-         curious at the moment, etc). These belong in
-         context_snapshot.emotional_tone, NOT here.
-       * Reactions to one scene (annoyed at staff, calm but firm, cold
-         conviction, appreciative of the gift). Reactions aren't traits.
-       * Situational descriptors that only apply right now (soaked from
-         the rain, limping, out of breath).
-       * Gerunds / participles describing what they're doing
-         (calculating the odds, charming the guard). Use the dispositional
-         adjective if the character IS habitually that way.
-       * Momentary physical states (aroused, trembling, flushed, crying).
-       * Single-scene philosophies dressed up as values ("annihilation
-         over submission" — phrase-of-the-moment, not a life-long credo
-         unless the narrator literally says so).
+   ── persistent_traits ───────────────────────────────────────────────
+   Innate, STABLE, dispositional properties. Something that would still
+   be true of the character tomorrow, next week, in a different scene.
+   Something another character would describe as "just who they are".
+   This bucket feeds the long-term trait index and is user-visible, so
+   noise pollutes it permanently.
 
-     **DO emit as traits**:
-       * Persistent personality dispositions: stoic, cunning, protective,
-         impulsive, analytical, loyal, jealous (the permanent-disposition
-         kind), reserved, charismatic, paranoid, cynical.
-       * Long-term skills: knife fighting, leadership, piano, forgery,
-         combat proficiency, field medicine.
-       * Background facts: former yakuza captain, raised in an orphanage,
-         lost left eye in prison, speaks three languages.
-       * Persistent physical features: facial marker on the jaw, mismatched
-         eyes, tattoo sleeve.
-       * Faction / allegiance: Faction family, Hidden Leaf ANBU.
+   DO emit here (positive examples):
+     * Analytical — persistent cognitive disposition, still true in
+       any scene.
+     * Calculating — stable trait of how they approach problems.
+     * Stoic — long-run emotional regulation pattern.
 
-     TRAIT FORMAT RULES:
-     * Use the **canonical adjective / noun form**, not the gerund or past
-       tense. "charming" (not "charmed" or "charms"), "observant" (not "was
-       observant" or "observing"), "resourceful" (not "is resourceful").
-     * **Single word when possible**, short phrase only when necessary.
-       "stoic" not "generally stoic and reserved".
+   DO NOT emit here (negative examples — these belong in scene_state):
+     * Adoring — momentary reaction to the person in front of them.
+     * Amused — one-scene affect, will not survive to tomorrow.
+     * Awed — transient reaction to a specific sight or reveal.
+
+   Other kinds of things that BELONG in persistent_traits:
+     * Personality dispositions: cunning, protective, impulsive, loyal,
+       jealous (the permanent-disposition kind), reserved, charismatic,
+       paranoid, cynical.
+     * Long-term skills: knife fighting, leadership, piano, forgery,
+       combat proficiency, field medicine.
+     * Background facts: former yakuza captain, raised in an orphanage,
+       lost left eye in prison, speaks three languages.
+     * Persistent physical features: facial marker on the jaw, mismatched
+       eyes, tattoo sleeve.
+     * Faction / allegiance: Faction family, Hidden Leaf ANBU.
+
+   persistent_traits FORMAT RULES:
+     * Use the **canonical adjective / noun form**, not the gerund or
+       past tense. "charming" (not "charmed" or "charms"), "observant"
+       (not "was observant" or "observing").
+     * **Single word when possible.** "stoic" not "generally stoic and
+       reserved".
      * **Do not emit morphological variants** of a trait you've already
        listed. If you're about to write "charmed", check whether you
        already wrote "charming" — if so, drop it.
      * **Lowercase** unless it's a proper noun. "stoic", not "Stoic".
      * **No redundant qualifiers** like "somewhat", "very", "extremely",
        "always" unless they change the meaning.
-     * Each trait is **one fact** — don't emit "brave, loyal, and protective"
-       as a single trait; that's three separate entries.
+     * Each entry is **one fact** — don't emit "brave, loyal, and
+       protective" as a single row; that's three separate entries.
      * **Bias STRONGLY toward not emitting.** If you're unsure whether
-       something is a trait or a mood, it's a mood — skip it. The trait
-       list is user-visible and noise pollutes it. Emit 3-5 very confident
+       something is a trait or a mood, it's a mood — put it in
+       scene_state or drop it. Emit 3-5 very confident persistent
        traits per character per batch rather than 15 maybe-traits.
+
+   ── scene_state ─────────────────────────────────────────────────────
+   How the character is feeling / behaving IN THIS SCENE ONLY. Momentary
+   reactions, moods, arousal level, situational descriptors. NOT a trait.
+   These entries NEVER land in the trait table; at most they roll up into
+   context_snapshot.emotional_tone for this batch.
+
+   DO emit here (positive examples):
+     * Amused — a one-scene reaction to something funny happening now.
+     * Besotted — a current infatuation state, not a life-long trait.
+     * Annoyed at staff — a situational reaction bound to this scene.
+
+   DO NOT emit here (negative examples — these belong in persistent_traits):
+     * Analytical — cognitive style, stable across scenes.
+     * Calculating — dispositional, not a one-scene mood.
+     * Stoic — regulation pattern, not a current feeling.
+
+   Other things that BELONG in scene_state:
+     * Moods: adoring, awestruck, charmed, bemused, astonished, afraid,
+       nervous, excited, content, distressed, frustrated.
+     * Reactions to one scene: calm but firm, cold conviction,
+       appreciative of the gift, curious at the moment.
+     * Situational descriptors that only apply right now: soaked from
+       the rain, limping, out of breath.
+     * Gerunds / participles describing what they're doing: calculating
+       the odds, charming the guard. (If the character IS habitually
+       that way, use the dispositional adjective in persistent_traits
+       instead — NOT both.)
+     * Momentary physical states: aroused, trembling, flushed, crying.
+     * Single-scene philosophies dressed up as values ("annihilation
+       over submission" — phrase-of-the-moment, not a life-long credo
+       unless the narrator literally says so).
+
+   scene_state is short free-text; no category required. Keep entries
+   brief. Omit entirely if the scene has no notable affect for this
+   character.
 
    Example of permissive extraction:
    A passage mentions "the bartender the bartender set down a drink" — extract the bartender as a
@@ -150,8 +182,13 @@ Return ONLY valid JSON:
   "characters": [{
     "name": "",
     "aliases": [],
-    "traits": [
+    "persistent_traits": [
       { "category": "personality | skill | background | physical | faction", "content": "" }
+    ],
+    "scene_state": [
+      "amused",
+      "besotted",
+      "annoyed at staff"
     ],
     "role": "protagonist/antagonist/ally/npc/mentor/etc",
     "status": "active/injured/missing/dead/etc",
@@ -458,9 +495,52 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
   const safeChat = chatId || "";
   const msgIdx = messageIndex ?? null;
 
-  // Characters + traits
+  // Characters + persistent_traits.
+  //
+  // The extractor prompt emits two separate buckets per character:
+  //   - persistent_traits: dispositional, multi-scene. Feeds the trait table.
+  //   - scene_state: momentary moods / reactions. NEVER lands in traits;
+  //     rolled into context_snapshot.emotional_tone below if a snapshot
+  //     is being emitted this batch.
+  //
+  // Backward compat: older prompts (and mid-batch drift from the current
+  // one) emitted a single `traits` field that mixed both. If we see that
+  // field and no `persistent_traits`, treat it as persistent_traits and
+  // warn once per character.
+  //
+  // Collect scene_state across all characters on the first pass so the
+  // context_snapshot writer below can consume them without re-walking
+  // the characters array.
+  const sceneStateFragments = [];
   for (const char of (extraction.characters || [])) {
-    const description = (char.traits || []).map((t) => t.content).join("; ");
+    let persistentTraits = char.persistent_traits;
+    if (!Array.isArray(persistentTraits) || persistentTraits.length === 0) {
+      if (Array.isArray(char.traits) && char.traits.length > 0) {
+        console.warn(
+          `[ChronicleDB] extraction for "${char.name || "(unnamed)"}" used legacy 'traits' field; treating as persistent_traits`,
+        );
+        persistentTraits = char.traits;
+      } else {
+        persistentTraits = [];
+      }
+    }
+
+    // Normalize scene_state entries to plain strings. The LLM may emit
+    // either bare strings or objects ({ content } / { state }); accept
+    // both shapes so mid-batch drift doesn't drop affect.
+    const rawSceneState = Array.isArray(char.scene_state) ? char.scene_state : [];
+    const sceneState = rawSceneState
+      .map((s) => {
+        if (typeof s === "string") return s.trim();
+        if (s && typeof s === "object") return (s.content || s.state || s.text || "").toString().trim();
+        return "";
+      })
+      .filter(Boolean);
+    if (sceneState.length > 0 && char.name) {
+      sceneStateFragments.push(`${char.name}: ${sceneState.join(", ")}`);
+    }
+
+    const description = persistentTraits.map((t) => (t && t.content) || "").filter(Boolean).join("; ");
     await db.upsertCharacter(settings, {
       name: char.name,
       aliases: char.aliases || [],
@@ -475,8 +555,8 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         [charId, char.role || "", char.status || "", char.significance || 3],
       );
     }
-    for (const trait of (char.traits || [])) {
-      if (trait.content) {
+    for (const trait of persistentTraits) {
+      if (trait && trait.content) {
         await db.upsertTrait(settings, {
           characterId: charId,
           category: trait.category || "personality",
@@ -617,17 +697,25 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
 
   // Context snapshot + present_at. The retriever's "Current Scene" section
   // reads present_at, so without these writes that section is always empty.
+  //
+  // scene_state from the characters pass is folded into emotional_tone here
+  // — but ONLY when a context_snapshot is actually being emitted for this
+  // batch. If the extractor didn't emit a snapshot, scene_state is dropped
+  // (the research report explicitly says not to invent a new table for it).
   if (extraction.context_snapshot) {
     const snap = extraction.context_snapshot;
     const wsSnap = {};
     for (const ws of (extraction.world_state || [])) wsSnap[ws.key] = ws.value;
+    const baseTone = (snap.emotional_tone || "").toString().trim();
+    const sceneStateTone = sceneStateFragments.join("; ");
+    const mergedTone = [baseTone, sceneStateTone].filter(Boolean).join(" | ");
     await db.insertContextSnapshot(settings, {
       chatId: safeChat,
       messageIndex: msgIdx ?? 0,
       summary: snap.summary || "",
       locationName: snap.location || null,
       presentChars: snap.present_characters || [],
-      emotionalTone: snap.emotional_tone || "",
+      emotionalTone: mergedTone,
       worldStateSnapshot: wsSnap,
     });
 

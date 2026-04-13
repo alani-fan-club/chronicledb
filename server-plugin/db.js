@@ -663,32 +663,37 @@ async function getWorldState(settings, chatIds) {
  * N-hop recursive traversal from a starting character.
  * Finds all connected entities within `depth` hops through any edge type.
  */
-async function traverseFromCharacter(settings, characterName, depth = 3) {
+async function traverseFromCharacter(settings, characterName, depth = 3, overrideChatIds) {
   const p = getPool(settings);
   const startId = slugify(characterName);
 
-  // Get list of chat IDs that belong to this character.
-  // Primary source: ingestion_status table. Fallback: session_id prefix
-  // match in feels_about (for data ingested before tracking existed).
-  const { rows: chats } = await p.query(
-    `SELECT chat_file FROM ingestion_status WHERE character_name = $1 AND status = 'done'`,
-    [characterName],
-  );
-  let chatIds = chats.map((c) => c.chat_file.replace(".jsonl", ""));
-
-  // Fallback: find session_ids that start with the character name
-  // (ST chat files are named "Character Name - date.jsonl")
-  if (chatIds.length === 0) {
-    const { rows: sessions } = await p.query(
-      `SELECT DISTINCT session_id FROM feels_about WHERE session_id LIKE $1
-       UNION
-       SELECT DISTINCT chat_id FROM events WHERE chat_id LIKE $1`,
-      [`${characterName}%`],
+  // If the caller provided an explicit chat scope (e.g. the mindmap is
+  // filtering to the current chat), use it directly. Otherwise fall back to
+  // discovering every chat this character has appeared in, which is the
+  // "show me everything about X" behavior the standalone mindmap page wants.
+  let chatIds;
+  if (Array.isArray(overrideChatIds) && overrideChatIds.length > 0) {
+    chatIds = overrideChatIds;
+  } else {
+    const { rows: chats } = await p.query(
+      `SELECT chat_file FROM ingestion_status WHERE character_name = $1 AND status = 'done'`,
+      [characterName],
     );
-    chatIds = sessions.map((s) => s.session_id).filter(Boolean);
+    chatIds = chats.map((c) => c.chat_file.replace(".jsonl", ""));
+
+    // Fallback: find session_ids that start with the character name
+    // (ST chat files are named "Character Name - date.jsonl")
+    if (chatIds.length === 0) {
+      const { rows: sessions } = await p.query(
+        `SELECT DISTINCT session_id FROM feels_about WHERE session_id LIKE $1
+         UNION
+         SELECT DISTINCT chat_id FROM events WHERE chat_id LIKE $1`,
+        [`${characterName}%`],
+      );
+      chatIds = sessions.map((s) => s.session_id).filter(Boolean);
+    }
   }
 
-  // If still nothing, return empty
   if (chatIds.length === 0) {
     return { nodes: [], edges: [] };
   }
@@ -910,16 +915,27 @@ async function traverseFromCharacter(settings, characterName, depth = 3) {
   return { nodes, edges };
 }
 
-async function getGraphData(settings, { scope, character }) {
+async function getGraphData(settings, { scope, character, chatIds }) {
   const p = getPool(settings);
   const nodes = [];
   const edges = [];
   const connectedIds = new Set();
 
-  // All edge types
-  const { rows: rels } = await p.query(
-    `SELECT fa.from_char, fa.to_char, fa.sentiment, fa.intensity, fa.description FROM feels_about fa`,
-  );
+  // When chatIds is provided, every edge query is filtered by chat scope.
+  // Tables that carry chat id directly: events.chat_id, feels_about.session_id,
+  // plot_threads.chat_id, story_arcs.chat_id. Tables without one (participated_in,
+  // plot_thread_characters, arc_events, event_chains, items) are scoped
+  // indirectly by joining an in-scope table and only keeping rows whose
+  // foreign ids are in the resulting set.
+  const scoped = Array.isArray(chatIds) && chatIds.length > 0;
+
+  // feels_about: direct scope via session_id
+  const relsSql = scoped
+    ? `SELECT from_char, to_char, sentiment, intensity, description
+       FROM feels_about WHERE session_id = ANY($1::text[])`
+    : `SELECT from_char, to_char, sentiment, intensity, description FROM feels_about`;
+  const relsParams = scoped ? [chatIds] : [];
+  const { rows: rels } = await p.query(relsSql, relsParams);
   for (const r of rels) {
     connectedIds.add(r.from_char);
     connectedIds.add(r.to_char);
@@ -932,9 +948,26 @@ async function getGraphData(settings, { scope, character }) {
     });
   }
 
-  const { rows: parts } = await p.query(
-    `SELECT character_id, event_id, role FROM participated_in`,
-  );
+  // Collect the set of in-scope event ids once so every edge type keyed on
+  // event_id can filter against it without an extra round-trip per query.
+  let inScopeEventIds = null;
+  if (scoped) {
+    const { rows: evs } = await p.query(
+      `SELECT id FROM events WHERE chat_id = ANY($1::text[])`,
+      [chatIds],
+    );
+    inScopeEventIds = new Set(evs.map((r) => r.id));
+  }
+  const eventInScope = (id) => !scoped || inScopeEventIds.has(id);
+
+  // participated_in: scope indirectly via events.chat_id join
+  const partsSql = scoped
+    ? `SELECT pi.character_id, pi.event_id, pi.role
+       FROM participated_in pi
+       JOIN events e ON e.id = pi.event_id
+       WHERE e.chat_id = ANY($1::text[])`
+    : `SELECT character_id, event_id, role FROM participated_in`;
+  const { rows: parts } = await p.query(partsSql, scoped ? [chatIds] : []);
   for (const pi of parts) {
     connectedIds.add(pi.character_id);
     connectedIds.add(pi.event_id);
@@ -946,11 +979,20 @@ async function getGraphData(settings, { scope, character }) {
     });
   }
 
-  // Items: OWNED by characters + LOCATED_AT locations
-  const { rows: itemOwners } = await p.query(
-    `SELECT id, name, owner_id, location_id FROM items WHERE owner_id IS NOT NULL OR location_id IS NOT NULL`,
-  );
+  // Items: no chat_id column — include only if an in-scope character owns
+  // them (via connectedIds filled above). When unscoped, keep the old
+  // behavior of showing all items with an owner/location.
+  const itemSql = scoped
+    ? `SELECT i.id, i.name, i.owner_id, i.location_id
+       FROM items i
+       WHERE (i.owner_id = ANY($1::text[]) OR i.location_id IS NOT NULL)
+         AND (i.owner_id IS NOT NULL OR i.location_id IS NOT NULL)`
+    : `SELECT id, name, owner_id, location_id FROM items
+       WHERE owner_id IS NOT NULL OR location_id IS NOT NULL`;
+  const itemParams = scoped ? [[...connectedIds]] : [];
+  const { rows: itemOwners } = await p.query(itemSql, itemParams);
   for (const it of itemOwners) {
+    if (scoped && it.owner_id && !connectedIds.has(it.owner_id)) continue;
     connectedIds.add(it.id);
     if (it.owner_id) {
       connectedIds.add(it.owner_id);
@@ -972,10 +1014,12 @@ async function getGraphData(settings, { scope, character }) {
     }
   }
 
-  // Events at locations
-  const { rows: evtLocs } = await p.query(
-    `SELECT id, location_id FROM events WHERE location_id IS NOT NULL`,
-  );
+  // Events at locations: directly scoped by events.chat_id
+  const evtLocSql = scoped
+    ? `SELECT id, location_id FROM events
+       WHERE location_id IS NOT NULL AND chat_id = ANY($1::text[])`
+    : `SELECT id, location_id FROM events WHERE location_id IS NOT NULL`;
+  const { rows: evtLocs } = await p.query(evtLocSql, scoped ? [chatIds] : []);
   for (const e of evtLocs) {
     connectedIds.add(e.id);
     connectedIds.add(e.location_id);
@@ -987,10 +1031,14 @@ async function getGraphData(settings, { scope, character }) {
     });
   }
 
-  // Plot threads: linked to characters
-  const { rows: plotChars } = await p.query(
-    `SELECT plot_id, character_id FROM plot_thread_characters`,
-  );
+  // Plot thread characters: plot_threads has chat_id so join to it
+  const plotSql = scoped
+    ? `SELECT ptc.plot_id, ptc.character_id
+       FROM plot_thread_characters ptc
+       JOIN plot_threads pt ON pt.id = ptc.plot_id
+       WHERE pt.chat_id = ANY($1::text[])`
+    : `SELECT plot_id, character_id FROM plot_thread_characters`;
+  const { rows: plotChars } = await p.query(plotSql, scoped ? [chatIds] : []);
   for (const pc of plotChars) {
     connectedIds.add(pc.plot_id);
     connectedIds.add(pc.character_id);
@@ -1002,10 +1050,14 @@ async function getGraphData(settings, { scope, character }) {
     });
   }
 
-  // Story arcs: linked to their member events
-  const { rows: arcEvents } = await p.query(
-    `SELECT ae.arc_id, ae.event_id, ae.is_anchor FROM arc_events ae`,
-  );
+  // Story arc events: story_arcs has chat_id
+  const arcSql = scoped
+    ? `SELECT ae.arc_id, ae.event_id, ae.is_anchor
+       FROM arc_events ae
+       JOIN story_arcs sa ON sa.id = ae.arc_id
+       WHERE sa.chat_id = ANY($1::text[])`
+    : `SELECT ae.arc_id, ae.event_id, ae.is_anchor FROM arc_events ae`;
+  const { rows: arcEvents } = await p.query(arcSql, scoped ? [chatIds] : []);
   for (const ae of arcEvents) {
     connectedIds.add(ae.arc_id);
     connectedIds.add(ae.event_id);
@@ -1019,11 +1071,12 @@ async function getGraphData(settings, { scope, character }) {
     });
   }
 
-  // Event chains: causal links between events
+  // Event chains: scope by requiring both endpoints to be in-scope events.
   const { rows: chains } = await p.query(
     `SELECT from_event_id, to_event_id, chain_type, description FROM event_chains`,
   );
   for (const c of chains) {
+    if (!eventInScope(c.from_event_id) || !eventInScope(c.to_event_id)) continue;
     connectedIds.add(c.from_event_id);
     connectedIds.add(c.to_event_id);
     edges.push({
@@ -1085,9 +1138,37 @@ async function saveCharacterMemoryConfig(settings, { characterName, sessionMode,
 
 // ── Character panel queries ────────────────────────────────────
 
-async function getCharacterPanelStats(settings, characterName) {
+async function getCharacterPanelStats(settings, characterName, chatId) {
   const p = getPool(settings);
   const charId = slugify(characterName);
+  // When chatId is provided, every count is scoped to that chat. traits.source_chat
+  // and feels_about.session_id carry chat scope directly; participated_in is
+  // scoped via events.chat_id join. Legacy rows with NULL chat are dropped
+  // under scoped mode — they're cross-chat contamination from the old
+  // pipeline and surfacing them is exactly what the user reported.
+  if (chatId) {
+    const { rows } = await p.query(
+      `SELECT
+         (SELECT COUNT(*) FROM participated_in pi
+            JOIN events e ON e.id = pi.event_id
+            WHERE pi.character_id = $1 AND e.chat_id = $2)::int AS events,
+         (SELECT COUNT(*) FROM traits
+            WHERE character_id = $1 AND source_chat = $2)::int AS traits,
+         (SELECT COUNT(*) FROM feels_about
+            WHERE (from_char = $1 OR to_char = $1) AND session_id = $2)::int AS relationships,
+         (SELECT MAX(e.message_index) FROM events e
+            JOIN participated_in pi ON pi.event_id = e.id
+            WHERE pi.character_id = $1 AND e.chat_id = $2) AS last_seen_turn`,
+      [charId, chatId],
+    );
+    const r = rows[0] || {};
+    return {
+      events: r.events || 0,
+      traits: r.traits || 0,
+      relationships: r.relationships || 0,
+      lastSeenTurn: r.last_seen_turn == null ? null : Number(r.last_seen_turn),
+    };
+  }
   const { rows } = await p.query(
     `SELECT
        (SELECT COUNT(*) FROM participated_in WHERE character_id = $1)::int AS events,
@@ -1107,19 +1188,25 @@ async function getCharacterPanelStats(settings, characterName) {
   };
 }
 
-async function getCharacterRecentEvents(settings, characterName, limit) {
+async function getCharacterRecentEvents(settings, characterName, limit, chatId) {
   const p = getPool(settings);
   const charId = slugify(characterName);
   const lim = Math.max(1, Math.min(20, parseInt(limit, 10) || 5));
-  const { rows } = await p.query(
-    `SELECT e.id, e.summary, e.source_text, e.message_index, e.significance, e.chat_id
-     FROM events e
-     JOIN participated_in pi ON pi.event_id = e.id
-     WHERE pi.character_id = $1
-     ORDER BY e.message_index DESC NULLS LAST, e.timestamp DESC
-     LIMIT $2`,
-    [charId, lim],
-  );
+  const sql = chatId
+    ? `SELECT e.id, e.summary, e.source_text, e.message_index, e.significance, e.chat_id
+       FROM events e
+       JOIN participated_in pi ON pi.event_id = e.id
+       WHERE pi.character_id = $1 AND e.chat_id = $3
+       ORDER BY e.message_index DESC NULLS LAST, e.timestamp DESC
+       LIMIT $2`
+    : `SELECT e.id, e.summary, e.source_text, e.message_index, e.significance, e.chat_id
+       FROM events e
+       JOIN participated_in pi ON pi.event_id = e.id
+       WHERE pi.character_id = $1
+       ORDER BY e.message_index DESC NULLS LAST, e.timestamp DESC
+       LIMIT $2`;
+  const params = chatId ? [charId, lim, chatId] : [charId, lim];
+  const { rows } = await p.query(sql, params);
   return rows.map((r) => ({
     id: r.id,
     summary: r.summary,
@@ -1130,11 +1217,28 @@ async function getCharacterRecentEvents(settings, characterName, limit) {
   }));
 }
 
-async function getCharacterOutboundRelationships(settings, characterName) {
+async function getCharacterOutboundRelationships(settings, characterName, chatId) {
   const p = getPool(settings);
   const charId = slugify(characterName);
-  // Collapses per-session rows into a single "latest" sentiment per target
-  // so the panel stays compact even for characters with many chats.
+  // When scoped, pin directly to the session_id so only this-chat feelings
+  // show. Unscoped still collapses via DISTINCT ON so the panel stays
+  // compact across multi-chat characters.
+  if (chatId) {
+    const { rows } = await p.query(
+      `SELECT c.name AS to_name, f.sentiment, f.intensity, f.description, f.updated_at
+       FROM feels_about f
+       JOIN characters c ON c.id = f.to_char
+       WHERE f.from_char = $1 AND f.session_id = $2
+       ORDER BY f.updated_at DESC`,
+      [charId, chatId],
+    );
+    return rows.map((r) => ({
+      toName: r.to_name,
+      sentiment: Number(r.sentiment) || 0,
+      intensity: Number(r.intensity) || 0,
+      description: r.description || "",
+    }));
+  }
   const { rows } = await p.query(
     `SELECT DISTINCT ON (f.to_char)
             c.name AS to_name, f.sentiment, f.intensity, f.description, f.updated_at

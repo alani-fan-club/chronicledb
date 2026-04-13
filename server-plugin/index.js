@@ -493,19 +493,45 @@ async function init(router) {
     }
   });
 
+  // ── All-chats list for the mind map filter dropdown ─────────
+
+  router.get("/chats", async (req, res) => {
+    try {
+      const p = db.getPool(settings);
+      const { rows } = await p.query(
+        `SELECT DISTINCT chat_file AS chat_id, character_name, ingested_at
+         FROM ingestion_status
+         WHERE status = 'done'
+         ORDER BY ingested_at DESC NULLS LAST, chat_file`,
+      );
+      res.json(rows.map((r) => ({
+        chatId: (r.chat_id || "").replace(/\.jsonl$/, ""),
+        character: r.character_name,
+        label: `${r.character_name} — ${(r.chat_id || "").replace(/\.jsonl$/, "")}`,
+      })));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Graph data for mind map ──────────────────────────────────
 
   router.get("/graph", async (req, res) => {
     try {
       const scope = req.query.scope || "global";
       const depth = parseInt(req.query.depth) || 3;
+      // Accept chat_id as single value or comma-separated list. When set,
+      // every edge query filters to the given chat(s); characters and
+      // locations reached by those edges still render as nodes.
+      const chatIds = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
+        ? req.query.chat_id.split(",").map((s) => s.trim()).filter(Boolean)
+        : null;
       let data;
 
       if (scope === "character" && req.query.character) {
-        // N-hop recursive traversal from a character
-        data = await db.traverseFromCharacter(settings, req.query.character, depth);
+        data = await db.traverseFromCharacter(settings, req.query.character, depth, chatIds);
       } else {
-        data = await db.getGraphData(settings, { scope, character: req.query.character });
+        data = await db.getGraphData(settings, { scope, character: req.query.character, chatIds });
       }
       res.json(data);
     } catch (err) {
@@ -548,7 +574,10 @@ async function init(router) {
     try {
       const name = req.query.name;
       if (!name) return res.status(400).json({ error: "name required" });
-      const stats = await db.getCharacterPanelStats(settings, name);
+      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
+        ? req.query.chat_id
+        : null;
+      const stats = await db.getCharacterPanelStats(settings, name, chatId);
       res.json(stats);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -560,7 +589,10 @@ async function init(router) {
       const name = req.query.name;
       if (!name) return res.status(400).json({ error: "name required" });
       const limit = parseInt(req.query.limit, 10) || 5;
-      const events = await db.getCharacterRecentEvents(settings, name, limit);
+      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
+        ? req.query.chat_id
+        : null;
+      const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
       res.json(events);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -571,7 +603,10 @@ async function init(router) {
     try {
       const name = req.query.name;
       if (!name) return res.status(400).json({ error: "name required" });
-      const rels = await db.getCharacterOutboundRelationships(settings, name);
+      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
+        ? req.query.chat_id
+        : null;
+      const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
       res.json(rels);
     } catch (err) {
       res.status(500).json({ error: err.message });

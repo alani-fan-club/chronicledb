@@ -436,12 +436,15 @@ function initCytoscape() {
 
 // ── Data loading ────────────────────────────────────────────────
 
+let activeChatFilter = "";
+
 async function loadGraphData(scope = "global", params = {}) {
   showLoading(true);
   try {
     const url = new URL(`${API_BASE}/graph`, window.location.origin);
     url.searchParams.set("scope", scope);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
+    if (activeChatFilter) url.searchParams.set("chat_id", activeChatFilter);
 
     const res = await fetch(url, fetchOpts);
     if (!res.ok) throw new Error(`API error: ${res.status}`);
@@ -453,6 +456,34 @@ async function loadGraphData(scope = "global", params = {}) {
   } finally {
     showLoading(false);
   }
+}
+
+// Populate the chat filter dropdown from /chats. User can pick a single chat
+// to scope every subsequent /graph query; "" means unscoped (all chats).
+async function loadChatFilterOptions() {
+  const select = document.getElementById("chat-filter");
+  if (!select) return;
+  try {
+    const res = await fetch(`${API_BASE}/chats`, fetchOpts);
+    if (!res.ok) return;
+    const chats = await res.json();
+    for (const chat of chats) {
+      const opt = document.createElement("option");
+      opt.value = chat.chatId || chat.id || chat.filename || "";
+      opt.textContent = chat.label || chat.chatId || chat.filename || "(unnamed)";
+      select.appendChild(opt);
+    }
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to load chat filter options:", err);
+  }
+  select.addEventListener("change", async () => {
+    activeChatFilter = select.value;
+    if (activeCharacter) {
+      await loadGraphData("character", { character: activeCharacter, depth: 3 });
+    } else {
+      await loadGraphData("global");
+    }
+  });
 }
 
 function renderGraph(data) {
@@ -1033,5 +1064,6 @@ function initToolbar() {
   // Await sidebar load first so avatarFileByName is populated before the
   // graph renders — otherwise the first layout fires off 404s.
   await loadCharacterSidebar();
+  await loadChatFilterOptions();
   await loadGraphData("global");
 })();

@@ -781,11 +781,19 @@ async function refreshCharacterPanel() {
   relsEl.html('<span class="chronicle-hint">Loading…</span>');
 
   const encodedName = encodeURIComponent(name);
+  // Scope to the currently-open chat so cross-chat contamination doesn't
+  // bleed into the panel. When no chat is open (character page, new chat
+  // selector), fall through unscoped — the server returns global counts.
+  let chatQs = "";
+  try {
+    const ctx = getContext();
+    if (ctx && ctx.chatId) chatQs = `&chat_id=${encodeURIComponent(String(ctx.chatId))}`;
+  } catch { /* no context → unscoped */ }
   try {
     const [statsRes, eventsRes, relsRes, configRes] = await Promise.all([
-      fetch(`${PLUGIN_BASE}/character-stats?name=${encodedName}`, { headers: getRequestHeaders() }),
-      fetch(`${PLUGIN_BASE}/character-recent-events?name=${encodedName}&limit=5`, { headers: getRequestHeaders() }),
-      fetch(`${PLUGIN_BASE}/character-relationships?name=${encodedName}`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/character-stats?name=${encodedName}${chatQs}`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/character-recent-events?name=${encodedName}&limit=5${chatQs}`, { headers: getRequestHeaders() }),
+      fetch(`${PLUGIN_BASE}/character-relationships?name=${encodedName}${chatQs}`, { headers: getRequestHeaders() }),
       fetch(`${PLUGIN_BASE}/character-memory-config?name=${encodedName}`, { headers: getRequestHeaders() }),
     ]);
 

@@ -556,10 +556,22 @@ async function init(router) {
     try {
       const p = db.getPool(settings);
       const charId = db.slugify(req.params.name);
-      const { rows } = await p.query(
-        `SELECT category, content FROM traits WHERE character_id = $1 ORDER BY category, content`,
-        [charId],
-      );
+      // Accept chat_id as a filter so the standalone mindmap detail panel
+      // can scope character traits to the currently-selected chat filter.
+      // Unscoped (no chat_id) still returns all traits for the character —
+      // the "show everything about X" fallback behavior the page defaults to.
+      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
+        ? req.query.chat_id
+        : null;
+      const sql = chatId
+        ? `SELECT category, content, source_chat FROM traits
+           WHERE character_id = $1 AND source_chat = $2
+           ORDER BY category, content`
+        : `SELECT category, content, source_chat FROM traits
+           WHERE character_id = $1
+           ORDER BY category, content`;
+      const params = chatId ? [charId, chatId] : [charId];
+      const { rows } = await p.query(sql, params);
       res.json(rows);
     } catch (err) {
       res.status(500).json({ error: err.message });

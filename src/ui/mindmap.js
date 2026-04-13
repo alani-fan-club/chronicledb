@@ -460,24 +460,38 @@ async function loadGraphData(scope = "global", params = {}) {
 
 // Populate the chat filter dropdown from /chats. User can pick a single chat
 // to scope every subsequent /graph query; "" means unscoped (all chats).
+// Default selection is the most recent chat (remembered via localStorage)
+// so opening the mindmap auto-scopes to the chat the user is actively
+// working in. "All chats" stays available as an explicit opt-out.
 async function loadChatFilterOptions() {
   const select = document.getElementById("chat-filter");
   if (!select) return;
+  let chats = [];
   try {
     const res = await fetch(`${API_BASE}/chats`, fetchOpts);
-    if (!res.ok) return;
-    const chats = await res.json();
-    for (const chat of chats) {
-      const opt = document.createElement("option");
-      opt.value = chat.chatId || chat.id || chat.filename || "";
-      opt.textContent = chat.label || chat.chatId || chat.filename || "(unnamed)";
-      select.appendChild(opt);
-    }
+    if (res.ok) chats = await res.json();
   } catch (err) {
     console.warn("[ChronicleDB] Failed to load chat filter options:", err);
   }
+  for (const chat of chats) {
+    const opt = document.createElement("option");
+    opt.value = chat.chatId || chat.id || chat.filename || "";
+    opt.textContent = chat.label || chat.chatId || chat.filename || "(unnamed)";
+    select.appendChild(opt);
+  }
+
+  const remembered = localStorage.getItem("chronicledb_chat_filter");
+  const validValues = new Set(Array.from(select.options).map((o) => o.value));
+  if (remembered !== null && validValues.has(remembered)) {
+    select.value = remembered;
+  } else if (chats.length > 0) {
+    select.value = chats[0].chatId || chats[0].id || chats[0].filename || "";
+  }
+  activeChatFilter = select.value;
+
   select.addEventListener("change", async () => {
     activeChatFilter = select.value;
+    localStorage.setItem("chronicledb_chat_filter", activeChatFilter);
     if (activeCharacter) {
       await loadGraphData("character", { character: activeCharacter, depth: 3 });
     } else {
@@ -838,7 +852,9 @@ async function showDetailPanel(data) {
   // ── Traits section (character nodes only) ──────────────────────
   if (data.type === "character") {
     try {
-      const res = await fetch(`${API_BASE}/character/${encodeURIComponent(title)}/traits`, fetchOpts);
+      const traitUrl = new URL(`${API_BASE}/character/${encodeURIComponent(title)}/traits`, window.location.origin);
+      if (activeChatFilter) traitUrl.searchParams.set("chat_id", activeChatFilter);
+      const res = await fetch(traitUrl, fetchOpts);
       if (res.ok) {
         const traits = await res.json();
         if (traits.length > 0) {

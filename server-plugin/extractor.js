@@ -548,6 +548,141 @@ Situating sentences:`;
   });
 }
 
+// Path 4: one-shot LLM arc naming. Called by arc-builder.js once per
+// surviving community after Louvain + modularity/density gating. Returns a
+// short title + 1-sentence description derived from the spine event and the
+// first ~12 members in chronological order. Throws on any failure so the
+// caller can fall back to the templated title.
+async function nameStoryArc(settings, args) {
+  const {
+    characterName,
+    spineEventSummary,
+    memberEvents,
+    importance,
+  } = args || {};
+
+  const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
+  // arcNamingModel overrides extractionModel if set; Flash Lite is cheap and
+  // plenty for a 3-7 word naming task.
+  const model = (settings.arcNamingModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
+  const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
+
+  if (!apiKey) {
+    const err = new Error("nameStoryArc: settings missing apiKey");
+    throw err;
+  }
+  if (!Array.isArray(memberEvents) || memberEvents.length === 0) {
+    throw new Error("nameStoryArc: memberEvents must be non-empty");
+  }
+
+  // Truncate the member list to 12. For a 40-event cluster, showing all of
+  // them blows up tokens and doesn't help the LLM pick a name — the first 12
+  // chronologically give it the setup + early beats, which is enough to
+  // extrapolate what the arc is "about". The spine event is always among the
+  // members passed in from the caller.
+  const MAX_MEMBERS_IN_PROMPT = 12;
+  const trimmedMembers = memberEvents.slice(0, MAX_MEMBERS_IN_PROMPT);
+
+  // Truncate each member summary to 200 chars so total prompt input stays
+  // ≤~3k chars even with 12 members.
+  const MAX_SUMMARY_CHARS = 200;
+  const spineId =
+    typeof spineEventSummary === "string" && spineEventSummary.trim().length > 0
+      ? spineEventSummary.trim().slice(0, MAX_SUMMARY_CHARS)
+      : null;
+  const memberLines = trimmedMembers.map((m, i) => {
+    const sum = (m.summary || "").trim().slice(0, MAX_SUMMARY_CHARS);
+    const tag = spineId && sum === spineId ? "   ← spine event" : "";
+    return `${i + 1}. [turn ${m.messageIndex ?? "?"}] ${sum}${tag}`;
+  });
+  // Fallback: if none of the members matched the spine string exactly (can
+  // happen when the spine was also truncated to 200 chars), annotate whichever
+  // member is the spine by matching messageIndex if possible — but since the
+  // caller passes members in chronological order including the spine, and the
+  // prompt spec says "1. ...   ← spine event" only if it happens to be
+  // chronologically first, it's fine to leave unmarked otherwise.
+
+  const safeImportance =
+    typeof importance === "number" && Number.isFinite(importance)
+      ? Math.max(1, Math.min(5, Math.round(importance)))
+      : 3;
+
+  const safeCharacter =
+    typeof characterName === "string" && characterName.trim().length > 0
+      ? characterName.trim()
+      : "the protagonist";
+
+  const prompt = `You are naming a narrative arc inferred from a roleplay chat.
+
+Protagonist: ${safeCharacter}
+Arc importance: ${safeImportance}/5
+
+The arc groups these events in chronological order:
+${memberLines.join("\n")}
+
+Produce:
+- A concise arc title (3-7 words, no quotes, no "Arc" suffix, no articles)
+- A one-sentence description (≤30 words) of what this arc is about
+
+Respond with strict JSON, no preamble, no markdown fence:
+{"title": "...", "description": "..."}`;
+
+  return withExponentialBackoff(async () => {
+    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        // 512 rather than 60: Gemini 2.5 models sometimes consume output
+        // tokens on internal thinking before emitting visible text. Same
+        // lesson as Path 3's verifyTraitPair headroom bump. 150 and 256
+        // both truncated real-data responses mid-field on the Protagonist
+        // smoke test; 512 gives enough headroom to never re-hit that.
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 512,
+          responseMimeType: "application/json",
+        },
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      const err = new Error(`Arc naming LLM error ${res.status}: ${body}`);
+      err.status = res.status;
+      throw err;
+    }
+    const data = await res.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    let title = "";
+    let description = "";
+    try {
+      const parsed = JSON.parse(text);
+      title = typeof parsed?.title === "string" ? parsed.title.trim() : "";
+      description = typeof parsed?.description === "string" ? parsed.description.trim() : "";
+    } catch {
+      // Tolerate stray markdown fence despite responseMimeType.
+      try {
+        const stripped = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "");
+        const parsed = JSON.parse(stripped);
+        title = typeof parsed?.title === "string" ? parsed.title.trim() : "";
+        description = typeof parsed?.description === "string" ? parsed.description.trim() : "";
+      } catch {
+        // Truncated JSON — best-effort extract via regex so we don't lose
+        // the whole arc to a mid-field cutoff. Gemini occasionally hits the
+        // maxOutputTokens cap even after the bump; taking whatever title we
+        // got beats falling through to the generic template.
+        const titleMatch = text.match(/"title"\s*:\s*"([^"]*)"/);
+        const descMatch = text.match(/"description"\s*:\s*"([^"]*)"/);
+        if (titleMatch) title = titleMatch[1].trim();
+        if (descMatch) description = descMatch[1].trim();
+      }
+    }
+    if (!title) throw new Error(`nameStoryArc: could not extract title from "${text.slice(0, 80)}"`);
+    if (!description) description = ""; // title-only is acceptable; arc still gets a real name
+    return { title, description };
+  });
+}
+
 const CHUNK_CHAR_TARGET = 2000;
 const CHUNK_CHAR_OVERLAP = 400;
 
@@ -994,6 +1129,7 @@ module.exports = {
   embedBatch,
   generateSituatingBlurb,
   verifyTraitPair,
+  nameStoryArc,
   chunkText,
   extractDialogueQuotes,
   withExponentialBackoff,

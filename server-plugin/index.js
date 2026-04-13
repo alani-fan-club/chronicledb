@@ -452,12 +452,17 @@ async function init(router) {
       // over the full chat's events via Louvain community detection on a
       // weighted event graph. Non-fatal — ingest succeeds even if clustering
       // fails. See RESEARCH_ARCS.md §5 Path 1 and arc-builder.js.
+      //
+      // Path 4: `nameArcs: true` opts this call site into LLM-generated arc
+      // titles + descriptions (gated on per-cluster density; low-coherence
+      // clusters still get the templated name). Eval harnesses leave this
+      // off so grid sweeps don't pay the LLM cost per iteration.
       try {
         const { rebuildArcsForChat } = require("./arc-builder");
-        const { builtArcs, prunedArcs, totalEvents, modularityQ } =
-          await rebuildArcsForChat(settings, chatId);
+        const { builtArcs, prunedArcs, totalEvents, modularityQ, namedArcs, templatedArcs } =
+          await rebuildArcsForChat(settings, chatId, { nameArcs: true });
         console.log(
-          `[ChronicleDB] Arc rebuild for ${chatId}: ${builtArcs} built, ${prunedArcs} pruned, Q=${(modularityQ ?? 0).toFixed(3)}, N=${totalEvents}`,
+          `[ChronicleDB] Arc rebuild for ${chatId}: ${builtArcs} built (${namedArcs ?? 0} LLM-named, ${templatedArcs ?? 0} templated), ${prunedArcs} pruned, Q=${(modularityQ ?? 0).toFixed(3)}, N=${totalEvents}`,
         );
       } catch (err) {
         console.warn(`[ChronicleDB] Arc rebuild failed for ${chatId}:`, err.message);

@@ -98,13 +98,18 @@ async function getMaxMessageIndex(pool, chatIds) {
 }
 
 /**
- * Vector similarity search on memory_embeddings, scoped to chatIds
- * PLUS any globally-ingested lorebook chunks. Lorebook entries live
- * under synthetic chat_id `"lorebook:<name>"` — they are world-info
- * facts and belong in retrieval regardless of which chat is active,
- * which is why the filter OR-matches the `lorebook:%` pattern alongside
- * the scoped chat list. COALESCE on raw_text falls back to content for
+ * Vector similarity search on memory_embeddings, scoped to chatIds.
+ * Returns the top-K most-similar content snippets. Uses pgvector <=> op
+ * on the HNSW index. COALESCE on raw_text falls back to content for
  * rows predating the raw_text column.
+ *
+ * Lorebook scoping note: lorebook chunks live under synthetic chat_id
+ * `"lorebook:<name>"`. Caller must put those ids in `chatIds` if it
+ * wants lorebook hits. A previous version OR-matched `lorebook:%`
+ * globally; that caused cross-chat pollution (a yakuza-themed lorebook
+ * leaked into a post-apocalyptic chat). Reverted to strict scoping —
+ * per-character lorebook association is the correct fix and lives at
+ * a higher layer.
  */
 async function vectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
   const ids = normalizeChatIds(chatIds);
@@ -114,7 +119,7 @@ async function vectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
             context_prefix, message_index, node_type,
             1 - (embedding <=> $1::vector) as similarity
      FROM memory_embeddings
-     WHERE (chat_id = ANY($2::text[]) OR chat_id LIKE 'lorebook:%')
+     WHERE chat_id = ANY($2::text[])
      ORDER BY embedding <=> $1::vector
      LIMIT $3`,
     [JSON.stringify(queryEmbedding), ids, limit],
@@ -129,8 +134,8 @@ async function vectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
  * matching terms, which is materially better than slicing the first N
  * chars of raw_text.
  *
- * Same lorebook-scope extension as vectorSearch: globally-ingested
- * world-info entries surface here too regardless of active chat.
+ * Strictly chat-scoped — see the vectorSearch comment for the lorebook
+ * scoping history.
  */
 async function lexicalSearch(pool, chatIds, query, limit = 5) {
   const ids = normalizeChatIds(chatIds);
@@ -145,7 +150,7 @@ async function lexicalSearch(pool, chatIds, query, limit = 5) {
                         'MaxWords=150, MinWords=30, MaxFragments=5, FragmentDelimiter=" ... "') as raw_text,
             ts_rank(tsv, to_tsquery('english', $1)) as rank
      FROM memory_embeddings
-     WHERE (chat_id = ANY($2::text[]) OR chat_id LIKE 'lorebook:%')
+     WHERE chat_id = ANY($2::text[])
        AND tsv @@ to_tsquery('english', $1)
      ORDER BY rank DESC
      LIMIT $3`,

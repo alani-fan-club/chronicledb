@@ -89,18 +89,20 @@
         <label for="chronicle_extractionApiType">API type:</label>
         <select id="chronicle_extractionApiType" class="text_pole">
           <option value="gemini">Gemini</option>
+          <option value="vertex">Vertex AI (Express key)</option>
           <option value="openai">OpenAI-compatible</option>
         </select>
       </div>
 
       <!-- Embedding model -->
       <h4>Embedding model</h4>
-      <p class="chronicle-hint">Converts memories into vectors for semantic search. Gemini and any OpenAI-compatible endpoint are both supported (OpenAI proper, Mistral, Voyage, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, ...). The schema is fixed at 768 dimensions — pick a 768-dim model, or one that supports a dimensions parameter (OpenAI's text-embedding-3-small / 3-large do).</p>
+      <p class="chronicle-hint">Converts memories into vectors for semantic search. Gemini, Vertex AI (Express mode), and any OpenAI-compatible endpoint are supported (OpenAI proper, Mistral, Voyage, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, ...). The schema is fixed at 768 dimensions — pick a 768-dim model, or one that supports a dimensions parameter (OpenAI's text-embedding-3-small / 3-large and Vertex's text-embedding-004 / 005 do).</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
           <label for="chronicle_embeddingApiType">API type:</label>
           <select id="chronicle_embeddingApiType" class="text_pole">
             <option value="gemini">Gemini</option>
+            <option value="vertex">Vertex AI (Express key)</option>
             <option value="openai">OpenAI-compatible</option>
           </select>
         </div>

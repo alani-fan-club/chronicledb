@@ -310,7 +310,7 @@ Parallel roleplays with the same character must not bleed into each other. Every
 
 - A SillyTavern install with server plugins enabled (running at least once so `config.yaml` exists)
 - Node.js 18 or newer
-- An API key for the extraction LLM (Gemini is the default and cheapest — see "LLM keys" below)
+- An API key for the extraction LLM (Gemini is the default and cheapest — see "LLM keys" below). Vertex AI Express-mode API keys and any OpenAI-compatible endpoint also work; pick the provider in the **API type** dropdown.
 - A PostgreSQL 14+ database with the **pgvector** extension. You have two options for this:
 
 #### Option A — Use a free hosted Postgres (easiest, no local install)
@@ -528,9 +528,9 @@ Settings are pushed from the ST UI via `POST /settings` and cached to `.settings
 - `enabled` — master switch.
 - `pgHost`, `pgPort`, `pgDatabase`, `pgUser`, `pgPassword` — Postgres credentials.
 - `stDataRoot` — absolute path to the ST data directory (used by `/chats` and `/ingest-chat` to find chat files).
-- `extractionApiType` — `"gemini"` or `"openai"` (any OpenAI-compatible endpoint also works).
-- `extractionApiUrl`, `extractionApiKey`, `extractionModel` — the extraction LLM. Default model is `gemini-2.5-flash-lite`.
-- `embeddingApiType` — `"gemini"` (default) or `"openai"`. Embeddings can be served from any OpenAI-compatible `/embeddings` endpoint: OpenAI proper, Azure OpenAI, Mistral, Voyage, Cohere, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, etc. The plugin sends `{model, input, dimensions}` and reads `data[].embedding`.
+- `extractionApiType` — `"gemini"` (default), `"vertex"` (Vertex AI Express-mode API keys against `aiplatform.googleapis.com`; the key rides on `?key=` instead of the `x-goog-api-key` header that Vertex rejects), or `"openai"` (any OpenAI-compatible `/chat/completions` endpoint).
+- `extractionApiUrl`, `extractionApiKey`, `extractionModel` — the extraction LLM. Default model is `gemini-2.5-flash-lite`. For `"vertex"`, point `extractionApiUrl` at `https://aiplatform.googleapis.com/v1/publishers/google` (the default) or your own regional endpoint.
+- `embeddingApiType` — `"gemini"` (default), `"vertex"`, or `"openai"`. Vertex embeddings go through `:predict` with `outputDimensionality` so a default install hits the schema's 768-dim constraint with `text-embedding-004`. OpenAI-compatible `/embeddings` endpoints send `{model, input, dimensions}` and read `data[].embedding` (works with OpenAI proper, Azure OpenAI, Mistral, Voyage, Cohere, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, etc.).
 - `embeddingApiKey`, `embeddingApiUrl`, `embeddingModel`, `embeddingDimension` — generic embedding settings. If `embeddingApiKey` is blank the plugin falls back to `geminiApiKey` (which itself falls back to `extractionApiKey` for the gemini path) so users on the legacy field set don't have to re-enter their key. Schema is fixed at `vector(768)` so embeddingDimension must be 768 — pick a model that produces 768-dim output (Gemini's `gemini-embedding-2-preview`, OpenAI's `text-embedding-3-small` with `dimensions: 768`, or `nomic-embed-text` natively).
 - `geminiApiKey`, `geminiEmbeddingModel`, `geminiEmbeddingDimension` — legacy gemini-prefixed settings. Still honored for backward compat; new installs should prefer the generic `embedding*` names above.
 - `extractEveryN` — fire extraction every N AI replies (default 1).

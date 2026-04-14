@@ -267,7 +267,7 @@ ${msgBlock}
 
 JSON:`;
 
-  const apiType = (settings.extractionApiType || "gemini").trim();
+  const apiType = (settings.extractionApiType || "gemini").trim().toLowerCase();
   const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
   const model = (settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
@@ -291,12 +291,20 @@ JSON:`;
       return data.choices?.[0]?.message?.content;
     });
   } else {
+    // Covers both "gemini" (generativelanguage.googleapis.com) and "vertex"
+    // (aiplatform.googleapis.com Express-mode). Base URL and auth method
+    // differ — Vertex Express rejects the x-goog-api-key header and wants
+    // the key as a ?key= query-param — so googleAuth() picks the right
+    // shape per apiType. The `role: "user"` field is valid on both paths;
+    // Gemini API tolerates contents without it, so adding it unconditionally
+    // is safe and keeps the two arms identical.
+    const auth = googleAuth(apiType, apiKey);
     content = await withExponentialBackoff(async () => {
-      const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+      const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        headers: { "Content-Type": "application/json", ...auth.headers },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.1,
             // Gemini's documented upper bound is 65536 EXCLUSIVE — so the
@@ -311,7 +319,7 @@ JSON:`;
           },
         }),
       });
-      if (!res.ok) throw new Error(`Gemini extraction error: ${res.status} ${await res.text()}`);
+      if (!res.ok) throw new Error(`${apiType} extraction error: ${res.status} ${await res.text()}`);
       const data = await res.json();
       const candidate = data.candidates?.[0];
       if (candidate?.finishReason && candidate.finishReason !== "STOP") {
@@ -346,10 +354,28 @@ function parseResponse(raw) {
 
 const GEMINI_EMBED_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const OPENAI_EMBED_BASE = "https://api.openai.com/v1";
+// Vertex Express-mode API keys authenticate against aiplatform.googleapis.com
+// directly, no project/region URL path and no OAuth bearer. Real region-scoped
+// Vertex (aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/…)
+// needs OAuth and isn't supported by the ?key= auth flow; users on a full
+// Vertex project should override apiBase via embeddingApiUrl / extractionApiUrl.
+const VERTEX_BASE = "https://aiplatform.googleapis.com/v1/publishers/google";
+
+// Gemini API and Vertex Express share the :generateContent / :embedContent /
+// :predict surface area but differ on where the key goes: Gemini accepts
+// x-goog-api-key header; Vertex Express rejects it and wants ?key= on the
+// URL. This helper centralizes that so every call site can just spread
+// auth.headers into its headers and append auth.query to its URL.
+function googleAuth(apiType, apiKey) {
+  if (apiType === "vertex") {
+    return { query: `?key=${encodeURIComponent(apiKey)}`, headers: {} };
+  }
+  return { query: "", headers: { "x-goog-api-key": apiKey } };
+}
 
 // Resolves the embedding provider config from settings with full backward
 // compat. Settings precedence:
-//   1. embeddingApiType — explicit "gemini" | "openai" (default "gemini")
+//   1. embeddingApiType — explicit "gemini" | "openai" | "vertex" (default "gemini")
 //   2. embeddingApiKey / embeddingApiUrl / embeddingModel / embeddingDimension
 //      — generic names, take precedence if set
 //   3. geminiApiKey / geminiEmbeddingModel / geminiEmbeddingApiUrl /
@@ -357,8 +383,9 @@ const OPENAI_EMBED_BASE = "https://api.openai.com/v1";
 //      fallback when the generic ones aren't set
 //
 // The default model and base URL key off apiType so a user who flips just
-// the dropdown to "openai" without filling other fields gets sensible
-// OpenAI defaults (text-embedding-3-small + the official OpenAI base).
+// the dropdown to a new provider gets sensible defaults (OpenAI's
+// text-embedding-3-small + api.openai.com; Vertex's text-embedding-004 +
+// aiplatform.googleapis.com/v1/publishers/google).
 function embeddingConfig(settings) {
   const apiType = (settings.embeddingApiType || "gemini").trim().toLowerCase();
   const dimension =
@@ -374,6 +401,20 @@ function embeddingConfig(settings) {
       dimension,
       model: (settings.embeddingModel || "text-embedding-3-small").trim(),
       apiBase: (settings.embeddingApiUrl || OPENAI_EMBED_BASE).trim(),
+    };
+  }
+  if (apiType === "vertex") {
+    return {
+      apiType: "vertex",
+      apiKey,
+      dimension,
+      // text-embedding-004 is Vertex's current default 768-dim model and
+      // honors the `outputDimensionality` parameter under `parameters`,
+      // so a default install hits the schema without user intervention.
+      model: (settings.embeddingModel || settings.geminiEmbeddingModel ||
+        "text-embedding-004").trim(),
+      apiBase: (settings.embeddingApiUrl || settings.geminiEmbeddingApiUrl ||
+        VERTEX_BASE).trim(),
     };
   }
   return {
@@ -403,9 +444,10 @@ async function embedBatch(settings, texts) {
   const out = new Array(texts.length);
   for (let start = 0; start < texts.length; start += EMBED_BATCH_CAP) {
     const slice = texts.slice(start, start + EMBED_BATCH_CAP);
-    const vecs = cfg.apiType === "openai"
-      ? await openaiEmbedBatch(cfg, slice)
-      : await geminiEmbedBatch(cfg, slice);
+    let vecs;
+    if (cfg.apiType === "openai") vecs = await openaiEmbedBatch(cfg, slice);
+    else if (cfg.apiType === "vertex") vecs = await vertexEmbedBatch(cfg, slice);
+    else vecs = await geminiEmbedBatch(cfg, slice);
     if (vecs.length !== slice.length) {
       throw new Error(`${cfg.apiType} embedBatch returned ${vecs.length} vectors for ${slice.length} inputs`);
     }
@@ -484,6 +526,66 @@ async function openaiEmbedBatch(cfg, slice) {
   });
 }
 
+// Vertex AI embeddings use a :predict endpoint with a different request/
+// response shape than Gemini's :batchEmbedContents. One :predict call takes
+// multiple instances, so the ingest loop batches into this function at the
+// same EMBED_BATCH_CAP (100) — safely under Vertex's per-request limits
+// across the text-embedding-* family. `task_type` is snake_case in Vertex's
+// :predict text-embeddings shape; `outputDimensionality` under `parameters`
+// is honored by text-embedding-004 / 005 for native truncation to 768.
+async function vertexEmbedBatch(cfg, slice) {
+  const body = {
+    instances: slice.map((text) => ({
+      task_type: "SEMANTIC_SIMILARITY",
+      content: text,
+    })),
+    parameters: { outputDimensionality: cfg.dimension },
+  };
+
+  const data = await withExponentialBackoff(async () => {
+    const res = await fetch(
+      `${cfg.apiBase}/models/${cfg.model}:predict?key=${encodeURIComponent(cfg.apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    );
+    if (!res.ok) {
+      const respBody = await res.text();
+      const err = new Error(`Vertex embed error ${res.status}: ${respBody}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  });
+
+  // Vertex returns predictions: [{embeddings: {values: [...], statistics: {...}}}, ...]
+  // in the same order as instances. Defensive on the values vs embeddings
+  // shape because a couple of multimodal variants return `embeddings` as
+  // the array directly rather than nested under `.values`.
+  const preds = data.predictions || [];
+  return preds.map((p) => {
+    const values = p.embeddings?.values || p.embeddings;
+    if (!Array.isArray(values)) {
+      throw new Error(
+        `Vertex embed: prediction missing embeddings.values (got ${JSON.stringify(p).slice(0, 120)})`,
+      );
+    }
+    // Mirror openaiEmbedBatch's defensive dim check. Without this, a user
+    // who picks a non-768-dim model (e.g. multimodalembedding@001 at 1408)
+    // would hit an opaque pgvector dimension error on insert instead of a
+    // readable message pointing at the model choice.
+    if (values.length !== cfg.dimension) {
+      throw new Error(
+        `Vertex embeddings returned ${values.length}-dim vector but the schema requires ${cfg.dimension}. ` +
+        `Pick a model that produces ${cfg.dimension}-dim output — text-embedding-004 / 005 default to 768 and honor outputDimensionality.`,
+      );
+    }
+    return values;
+  });
+}
+
 // Singular embed entry point. Used by retrieval (per-query embed) and
 // lorebook ingest (per-entry embed). Branches on api type the same way
 // embedBatch does.
@@ -492,6 +594,10 @@ async function embed(settings, text) {
   if (!cfg.apiKey) throw new Error(`embed: ${cfg.apiType} embedding API key is missing`);
   if (cfg.apiType === "openai") {
     const [vec] = await openaiEmbedBatch(cfg, [text]);
+    return vec;
+  }
+  if (cfg.apiType === "vertex") {
+    const [vec] = await vertexEmbedBatch(cfg, [text]);
     return vec;
   }
   return withExponentialBackoff(async () => {
@@ -533,6 +639,8 @@ async function verifyTraitPair(settings, args) {
   const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
   const model = (settings.verifierModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
+  const apiType = (settings.extractionApiType || "gemini").trim().toLowerCase();
+  const auth = googleAuth(apiType, apiKey);
 
   if (!apiKey) {
     const err = new Error("verifyTraitPair: settings missing apiKey");
@@ -567,11 +675,11 @@ Rules:
 Answer:`;
 
   return withExponentialBackoff(async () => {
-    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+    const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      headers: { "Content-Type": "application/json", ...auth.headers },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
         // 32 rather than 8: Gemini 2.5 models sometimes consume output
         // tokens on internal thinking before emitting visible text, and
         // a prior bug silently zeroed out the eval judge with a tight
@@ -605,6 +713,8 @@ async function generateSituatingBlurb(settings, { chatTitle, surroundingContext,
   // through contextModel (if user had it set) → extractionModel → hardcoded.
   const model = (settings.contextModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
+  const apiType = (settings.extractionApiType || "gemini").trim().toLowerCase();
+  const auth = googleAuth(apiType, apiKey);
 
   const prompt = `You are situating a passage from a roleplay chat for a search index.
 Given the chat title, surrounding context, and the target passage, write 1-2 short sentences placing this passage in the larger story: who is involved, where, and what is happening at this moment. No preamble, no quotes around the answer, no markdown — just the sentences.
@@ -620,11 +730,11 @@ ${(message || "").slice(0, 3000)}
 Situating sentences:`;
 
   return withExponentialBackoff(async () => {
-    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+    const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      headers: { "Content-Type": "application/json", ...auth.headers },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
       }),
     });
@@ -659,6 +769,8 @@ async function nameStoryArc(settings, args) {
   // plenty for a 3-7 word naming task.
   const model = (settings.arcNamingModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
+  const apiType = (settings.extractionApiType || "gemini").trim().toLowerCase();
+  const auth = googleAuth(apiType, apiKey);
 
   // Path 5: pick the level-appropriate naming idiom. Super-arcs span the
   // most events and want broad, story-arc-of-arcs titles; episodes are
@@ -741,11 +853,11 @@ Respond with strict JSON, no preamble, no markdown fence:
 {"title": "...", "description": "..."}`;
 
   return withExponentialBackoff(async () => {
-    const res = await fetch(`${apiUrl}/models/${model}:generateContent`, {
+    const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      headers: { "Content-Type": "application/json", ...auth.headers },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
         // 512 rather than 60: Gemini 2.5 models sometimes consume output
         // tokens on internal thinking before emitting visible text. Same
         // lesson as Path 3's verifyTraitPair headroom bump. 150 and 256

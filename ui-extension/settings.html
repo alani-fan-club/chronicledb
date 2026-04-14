@@ -95,16 +95,33 @@
 
       <!-- Embedding model -->
       <h4>Embedding model</h4>
-      <p class="chronicle-hint">Converts memories into vectors for semantic search. Gemini-only for now; reuses the memory model's API key.</p>
+      <p class="chronicle-hint">Converts memories into vectors for semantic search. Gemini and any OpenAI-compatible endpoint are both supported (OpenAI proper, Mistral, Voyage, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, ...). The schema is fixed at 768 dimensions — pick a 768-dim model, or one that supports a dimensions parameter (OpenAI's text-embedding-3-small / 3-large do).</p>
       <div class="chronicle-setting-row">
         <div class="chronicle-setting">
-          <label for="chronicle_geminiEmbeddingModel">Model:</label>
-          <input type="text" id="chronicle_geminiEmbeddingModel" class="text_pole" placeholder="e.g. gemini-embedding-2-preview">
+          <label for="chronicle_embeddingApiType">API type:</label>
+          <select id="chronicle_embeddingApiType" class="text_pole">
+            <option value="gemini">Gemini</option>
+            <option value="openai">OpenAI-compatible</option>
+          </select>
         </div>
         <div class="chronicle-setting">
-          <label for="chronicle_geminiEmbeddingDimension">Dimension:</label>
-          <input type="number" id="chronicle_geminiEmbeddingDimension" class="text_pole" placeholder="768" min="128" max="3072">
+          <label for="chronicle_embeddingDimension">Dimension:</label>
+          <input type="number" id="chronicle_embeddingDimension" class="text_pole" placeholder="768" min="128" max="3072" value="768">
         </div>
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingModel">Model:</label>
+          <input type="text" id="chronicle_embeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview or text-embedding-3-small">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingApiUrl">API URL (optional):</label>
+          <input type="text" id="chronicle_embeddingApiUrl" class="text_pole" placeholder="leave blank for the provider default">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_embeddingApiKey">API key (leave blank to reuse the memory model's key):</label>
+        <input type="password" id="chronicle_embeddingApiKey" class="text_pole" placeholder="sk-... or AIza...">
       </div>
 
       <hr>

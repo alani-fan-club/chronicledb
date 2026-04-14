@@ -36,6 +36,16 @@ const DEFAULT_SETTINGS = {
   geminiApiKey: "",
   geminiEmbeddingModel: "",
   geminiEmbeddingDimension: 768,
+  // Embedding provider (Gemini or OpenAI-compatible). The plugin's embed()
+  // and embedBatch() helpers branch on embeddingApiType. Generic fields
+  // (embeddingApiKey/Url/Model/Dimension) take precedence over the legacy
+  // gemini-prefixed names; both are kept for backward compat with users who
+  // upgraded from a build that only knew about Gemini embeddings.
+  embeddingApiType: "gemini",
+  embeddingApiKey: "",
+  embeddingApiUrl: "",
+  embeddingModel: "",
+  embeddingDimension: 768,
   extractEveryN: 1,
   // When true, extraction fires automatically after every generation so
   // memory builds live as you chat. When false, only the manual "Ingest"
@@ -279,12 +289,16 @@ function bindSettings(settings) {
   }
 
   // These keys must match what server-plugin/extractor.js actually reads.
+  // The new generic embedding* fields take precedence over the legacy
+  // gemini* names; both are kept in DEFAULT_SETTINGS for backward compat.
   for (const field of [
     "extractionApiUrl",
     "extractionApiKey",
     "extractionModel",
     "geminiApiKey",
-    "geminiEmbeddingModel",
+    "embeddingApiKey",
+    "embeddingApiUrl",
+    "embeddingModel",
   ]) {
     $(`#chronicle_${field}`).val(settings[field]).on("input", function () {
       settings[field] = $(this).val();
@@ -292,15 +306,19 @@ function bindSettings(settings) {
     });
   }
 
-  // Provider type select
+  // Provider type selects (extraction + embedding)
   $("#chronicle_extractionApiType").val(settings.extractionApiType).on("change", function () {
     settings.extractionApiType = $(this).val();
     saveAndSync(settings);
   });
+  $("#chronicle_embeddingApiType").val(settings.embeddingApiType || "gemini").on("change", function () {
+    settings.embeddingApiType = $(this).val();
+    saveAndSync(settings);
+  });
 
-  // Embedding dimension (numeric)
-  $("#chronicle_geminiEmbeddingDimension").val(settings.geminiEmbeddingDimension).on("input", function () {
-    settings.geminiEmbeddingDimension = parseInt($(this).val()) || 768;
+  // Embedding dimension (numeric, generic name)
+  $("#chronicle_embeddingDimension").val(settings.embeddingDimension || 768).on("input", function () {
+    settings.embeddingDimension = parseInt($(this).val()) || 768;
     saveAndSync(settings);
   });
 

@@ -345,79 +345,163 @@ function parseResponse(raw) {
 }
 
 const GEMINI_EMBED_BASE = "https://generativelanguage.googleapis.com/v1beta";
+const OPENAI_EMBED_BASE = "https://api.openai.com/v1";
 
+// Resolves the embedding provider config from settings with full backward
+// compat. Settings precedence:
+//   1. embeddingApiType — explicit "gemini" | "openai" (default "gemini")
+//   2. embeddingApiKey / embeddingApiUrl / embeddingModel / embeddingDimension
+//      — generic names, take precedence if set
+//   3. geminiApiKey / geminiEmbeddingModel / geminiEmbeddingApiUrl /
+//      geminiEmbeddingDimension — legacy gemini-prefixed names, used as
+//      fallback when the generic ones aren't set
+//
+// The default model and base URL key off apiType so a user who flips just
+// the dropdown to "openai" without filling other fields gets sensible
+// OpenAI defaults (text-embedding-3-small + the official OpenAI base).
 function embeddingConfig(settings) {
+  const apiType = (settings.embeddingApiType || "gemini").trim().toLowerCase();
+  const dimension =
+    settings.embeddingDimension ||
+    settings.geminiEmbeddingDimension ||
+    768;
+  const apiKey =
+    (settings.embeddingApiKey || settings.geminiApiKey || "").trim();
+  if (apiType === "openai") {
+    return {
+      apiType: "openai",
+      apiKey,
+      dimension,
+      model: (settings.embeddingModel || "text-embedding-3-small").trim(),
+      apiBase: (settings.embeddingApiUrl || OPENAI_EMBED_BASE).trim(),
+    };
+  }
   return {
-    model: (settings.geminiEmbeddingModel || "gemini-embedding-2-preview").trim(),
-    apiKey: (settings.geminiApiKey || "").trim(),
-    dimension: settings.geminiEmbeddingDimension || 768,
-    apiBase: (settings.geminiEmbeddingApiUrl || GEMINI_EMBED_BASE).trim(),
+    apiType: "gemini",
+    apiKey,
+    dimension,
+    model:
+      (settings.embeddingModel || settings.geminiEmbeddingModel ||
+        "gemini-embedding-2-preview").trim(),
+    apiBase:
+      (settings.embeddingApiUrl || settings.geminiEmbeddingApiUrl ||
+        GEMINI_EMBED_BASE).trim(),
   };
 }
 
-// Gemini's batchEmbedContents accepts up to 100 inputs per call. Keep batches
-// under that; ingest hits this hardest on long chats where per-message
-// sequential HTTP dominates ingest wall time.
+// Gemini's batchEmbedContents accepts up to 100 inputs per call. OpenAI's
+// /embeddings endpoint accepts up to 2048 inputs per request, but 100 is
+// also fine there — keeping the cap unified means the same ingest loop
+// produces the same wall-time profile across providers.
 const EMBED_BATCH_CAP = 100;
 
 async function embedBatch(settings, texts) {
   if (!Array.isArray(texts) || texts.length === 0) return [];
-  const { model, apiKey, dimension, apiBase } = embeddingConfig(settings);
+  const cfg = embeddingConfig(settings);
+  if (!cfg.apiKey) throw new Error(`embedBatch: ${cfg.apiType} embedding API key is missing`);
 
   const out = new Array(texts.length);
   for (let start = 0; start < texts.length; start += EMBED_BATCH_CAP) {
     const slice = texts.slice(start, start + EMBED_BATCH_CAP);
-    // Each sub-request MUST include the model field per Gemini spec. The
-    // model string needs the "models/" prefix when nested; the outer path
-    // already uses ":batchEmbedContents" on the top-level model.
-    const requests = slice.map((text) => ({
-      model: `models/${model}`,
-      content: { parts: [{ text }] },
-      taskType: "SEMANTIC_SIMILARITY",
-      outputDimensionality: dimension,
-    }));
-
-    const data = await withExponentialBackoff(async () => {
-      const res = await fetch(`${apiBase}/models/${model}:batchEmbedContents`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-        body: JSON.stringify({ requests }),
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        // Surface status on the Error so defaultIsRetriable can key off it
-        // without regexing the message.
-        const err = new Error(`Gemini batchEmbed error ${res.status}: ${body}`);
-        err.status = res.status;
-        throw err;
-      }
-      return res.json();
-    });
-
-    const embeddings = data.embeddings || [];
-    if (embeddings.length !== slice.length) {
-      throw new Error(`Gemini batchEmbed returned ${embeddings.length} vectors for ${slice.length} inputs`);
+    const vecs = cfg.apiType === "openai"
+      ? await openaiEmbedBatch(cfg, slice)
+      : await geminiEmbedBatch(cfg, slice);
+    if (vecs.length !== slice.length) {
+      throw new Error(`${cfg.apiType} embedBatch returned ${vecs.length} vectors for ${slice.length} inputs`);
     }
-    for (let i = 0; i < embeddings.length; i++) {
-      out[start + i] = embeddings[i].values;
+    for (let i = 0; i < vecs.length; i++) {
+      out[start + i] = vecs[i];
     }
   }
   return out;
 }
 
-// Kept on the singular embedContent endpoint (not batch) so retrieval and
-// lorebook paths keep their exact prior behavior. Batch is opt-in via
-// embedBatch(), which the ingest loops use explicitly.
-async function embed(settings, text) {
-  const { model, apiKey, dimension, apiBase } = embeddingConfig(settings);
-  return withExponentialBackoff(async () => {
-    const res = await fetch(`${apiBase}/models/${model}:embedContent`, {
+async function geminiEmbedBatch(cfg, slice) {
+  // Each sub-request MUST include the model field per Gemini spec. The
+  // model string needs the "models/" prefix when nested; the outer path
+  // already uses ":batchEmbedContents" on the top-level model.
+  const requests = slice.map((text) => ({
+    model: `models/${cfg.model}`,
+    content: { parts: [{ text }] },
+    taskType: "SEMANTIC_SIMILARITY",
+    outputDimensionality: cfg.dimension,
+  }));
+
+  const data = await withExponentialBackoff(async () => {
+    const res = await fetch(`${cfg.apiBase}/models/${cfg.model}:batchEmbedContents`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.apiKey },
+      body: JSON.stringify({ requests }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      const err = new Error(`Gemini batchEmbed error ${res.status}: ${body}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  });
+  return (data.embeddings || []).map((e) => e.values);
+}
+
+async function openaiEmbedBatch(cfg, slice) {
+  // OpenAI-compatible /embeddings accepts an `input` array. The `dimensions`
+  // field is supported by OpenAI's text-embedding-3-* and silently ignored
+  // by everyone else. Passing it ensures the response matches the schema's
+  // 768-dim columns when the user picks an OpenAI 3.x model.
+  const data = await withExponentialBackoff(async () => {
+    const res = await fetch(`${cfg.apiBase}/embeddings`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        input: slice,
+        dimensions: cfg.dimension,
+      }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      const err = new Error(`OpenAI embeddings error ${res.status}: ${body}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.json();
+  });
+  // OpenAI returns data: [{embedding: [...], index: 0}, ...]. The order
+  // is documented to match the input order, but we sort by index defensively.
+  const items = (data.data || []).slice().sort((a, b) => (a.index || 0) - (b.index || 0));
+  return items.map((it) => {
+    if (it.embedding && it.embedding.length !== cfg.dimension) {
+      throw new Error(
+        `OpenAI embeddings returned ${it.embedding.length}-dim vector but the schema requires ${cfg.dimension}. ` +
+        `Pick a model that produces ${cfg.dimension}-dim output, or one that supports the dimensions parameter (OpenAI's text-embedding-3-small / text-embedding-3-large do).`,
+      );
+    }
+    return it.embedding;
+  });
+}
+
+// Singular embed entry point. Used by retrieval (per-query embed) and
+// lorebook ingest (per-entry embed). Branches on api type the same way
+// embedBatch does.
+async function embed(settings, text) {
+  const cfg = embeddingConfig(settings);
+  if (!cfg.apiKey) throw new Error(`embed: ${cfg.apiType} embedding API key is missing`);
+  if (cfg.apiType === "openai") {
+    const [vec] = await openaiEmbedBatch(cfg, [text]);
+    return vec;
+  }
+  return withExponentialBackoff(async () => {
+    const res = await fetch(`${cfg.apiBase}/models/${cfg.model}:embedContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.apiKey },
       body: JSON.stringify({
         content: { parts: [{ text }] },
         taskType: "SEMANTIC_SIMILARITY",
-        outputDimensionality: dimension,
+        outputDimensionality: cfg.dimension,
       }),
     });
     if (!res.ok) {

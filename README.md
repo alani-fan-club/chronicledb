@@ -528,10 +528,11 @@ Settings are pushed from the ST UI via `POST /settings` and cached to `.settings
 - `enabled` — master switch.
 - `pgHost`, `pgPort`, `pgDatabase`, `pgUser`, `pgPassword` — Postgres credentials.
 - `stDataRoot` — absolute path to the ST data directory (used by `/chats` and `/ingest-chat` to find chat files).
-- `extractionApiType` — `"gemini"` or `"openai"`.
+- `extractionApiType` — `"gemini"` or `"openai"` (any OpenAI-compatible endpoint also works).
 - `extractionApiUrl`, `extractionApiKey`, `extractionModel` — the extraction LLM. Default model is `gemini-2.5-flash-lite`.
-- `geminiApiKey` — embedder API key (shared with `extractionApiKey` in practice).
-- `geminiEmbeddingModel`, `geminiEmbeddingDimension` — defaults are `gemini-embedding-2-preview` at 768.
+- `embeddingApiType` — `"gemini"` (default) or `"openai"`. Embeddings can be served from any OpenAI-compatible `/embeddings` endpoint: OpenAI proper, Azure OpenAI, Mistral, Voyage, Cohere, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, etc. The plugin sends `{model, input, dimensions}` and reads `data[].embedding`.
+- `embeddingApiKey`, `embeddingApiUrl`, `embeddingModel`, `embeddingDimension` — generic embedding settings. If `embeddingApiKey` is blank the plugin falls back to `geminiApiKey` (which itself falls back to `extractionApiKey` for the gemini path) so users on the legacy field set don't have to re-enter their key. Schema is fixed at `vector(768)` so embeddingDimension must be 768 — pick a model that produces 768-dim output (Gemini's `gemini-embedding-2-preview`, OpenAI's `text-embedding-3-small` with `dimensions: 768`, or `nomic-embed-text` natively).
+- `geminiApiKey`, `geminiEmbeddingModel`, `geminiEmbeddingDimension` — legacy gemini-prefixed settings. Still honored for backward compat; new installs should prefer the generic `embedding*` names above.
 - `extractEveryN` — fire extraction every N AI replies (default 1).
 - `extractionBatchSize` — messages per extraction call on the bulk path (default 10).
 - `extractionConcurrency` — parallel extraction calls per group on the bulk path (default 1).

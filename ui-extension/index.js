@@ -163,6 +163,42 @@ let isExtracting = false;
     await triggerExtraction();
   });
 
+  // Swipe cleanup: when the user changes the active swipe on a message we
+  // already extracted, the previous swipe's events / quotes / embeddings are
+  // stale and need to be torn down before the new swipe's extraction runs.
+  // Otherwise the DB keeps both, and retrieval surfaces content the user
+  // explicitly discarded. We POST /clear-message-extractions then wait for
+  // the next GENERATION_ENDED to re-extract. ST emits MESSAGE_SWIPED with
+  // the message index as a number (script.js:8581, 8781:
+  //   await eventSource.emit(event_types.MESSAGE_SWIPED, (chat.length - 1))
+  // ) so the typeof === "number" branch is the live path; the fallback is
+  // defensive in case a future ST version changes the signature.
+  if (event_types.MESSAGE_SWIPED) {
+    eventSource.on(event_types.MESSAGE_SWIPED, async (messageIdOrIdx) => {
+      if (!settings.enabled) return;
+      if (!settings.autoIngest) return;
+      if (settings.sessionMode === "readonly") return;
+      try {
+        const ctx = getContext();
+        const messageIndex = typeof messageIdOrIdx === "number"
+          ? messageIdOrIdx
+          : (ctx.chat?.length ?? 0) - 1;
+        const chatId = String(ctx.chatId || "");
+        if (!chatId) return;
+        const res = await fetch(`${PLUGIN_BASE}/clear-message-extractions`, {
+          method: "POST",
+          headers: getRequestHeaders(),
+          body: JSON.stringify({ chatId, messageIndex }),
+        });
+        if (!res.ok) {
+          console.warn(`[ChronicleDB] swipe cleanup failed: ${res.status}`);
+        }
+      } catch (err) {
+        console.warn("[ChronicleDB] swipe cleanup error:", err);
+      }
+    });
+  }
+
   // Before generation starts → retrieve and inject memories
   eventSource.on(event_types.GENERATION_STARTED, async () => {
     if (!settings.enabled) return;
@@ -188,13 +224,23 @@ async function triggerExtraction() {
     const userName = ctx.name1;
     const chatId = ctx.chatId;
 
-    // Get last N messages for extraction batch
-    const batchSize = 10;
+    // Get last N messages for extraction batch.
+    // Single-message batches in the live path so the swipe cleanup hook
+    // below can DELETE by (chat_id, message_index) surgically. The previous
+    // 10-message batch made cleanup either leaky (stale events from
+    // discarded swipes lingered) or aggressive (cleanup deleted neighboring
+    // canonical messages too). Cross-message context is rebuilt at full
+    // /ingest-chat time, which still uses 10-message batches.
+    const batchSize = 1;
     const recentMessages = chat.slice(-batchSize).map((m) => ({
       name: m.name,
       is_user: m.is_user,
       is_system: m.is_system || false,
-      mes: m.mes,
+      // ST sometimes leaves m.mes pointing at swipe 0 while swipe_id is N>0.
+      // Normalize the same way /ingest-chat does at server-plugin/index.js:513
+      // so live extract reliably ingests the user's actively-selected reply,
+      // not whichever swipe happened to be in m.mes at GENERATION_ENDED time.
+      mes: m.swipe_id !== undefined && m.swipes?.[m.swipe_id] ? m.swipes[m.swipe_id] : m.mes,
       send_date: m.send_date,
     }));
 

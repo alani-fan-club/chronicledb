@@ -324,6 +324,73 @@ async function init(router) {
     }
   });
 
+  // ── Swipe cleanup endpoint ───────────────────────────────────
+  // Called by the UI extension when the user changes the active swipe on an
+  // already-extracted message. Without this, every swipe-right leaves the
+  // previous swipe's events / quotes / embeddings in the DB forever.
+  //
+  // Caveats:
+  //  - Traits don't carry message_index, so a swipe that introduces or
+  //    removes traits will leave stale traits behind. The trait dedup
+  //    pipeline (lexicon gate + canonical-row kNN) means most stale traits
+  //    eventually get re-merged or rejected on the next extraction, but
+  //    pure noise-traits from a discarded swipe will linger. Tagging traits
+  //    with a source (chat_id, message_index) is a separate follow-up.
+  //  - arc_events.event_id has ON DELETE CASCADE (schema.sql:234), so the
+  //    rows referencing events we delete here are cleaned up automatically
+  //    by the events DELETE below. event_chains.from_event_id /
+  //    to_event_id are also CASCADE (schema.sql:243-244).
+  //  - participated_in.event_id does NOT have ON DELETE CASCADE
+  //    (schema.sql:124), so we have to clear those rows by hand before
+  //    deleting events — same pattern as the manual reingest scripts.
+  //  - The next /extract for the new active swipe will rewrite events with
+  //    new content-addressed ids, so re-extraction is the rebuild step.
+  router.post("/clear-message-extractions", async (req, res) => {
+    try {
+      const { chatId, messageIndex } = req.body;
+      if (!chatId || typeof messageIndex !== "number") {
+        return res.status(400).json({ error: "chatId and messageIndex required" });
+      }
+      const pool = db.getPool(settings);
+      // Order matters: participated_in references events.id without ON
+      // DELETE CASCADE, so we have to clear those rows before deleting the
+      // events themselves (same pattern the manual reingest scripts use).
+      await pool.query(
+        `DELETE FROM participated_in
+         WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
+        [chatId, messageIndex],
+      );
+      const eventsRes = await pool.query(
+        `DELETE FROM events WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      );
+      const memRes = await pool.query(
+        `DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      );
+      const quoteRes = await pool.query(
+        `DELETE FROM dialogue_quotes WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      );
+      const snapRes = await pool.query(
+        `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      );
+      res.json({
+        ok: true,
+        deleted: {
+          events: eventsRes.rowCount,
+          memory_embeddings: memRes.rowCount,
+          dialogue_quotes: quoteRes.rowCount,
+          context_snapshots: snapRes.rowCount,
+        },
+      });
+    } catch (err) {
+      console.error("[ChronicleDB] /clear-message-extractions error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ── Retrieval endpoint ───────────────────────────────────────
   // Called by UI ext before GENERATION_STARTED
 

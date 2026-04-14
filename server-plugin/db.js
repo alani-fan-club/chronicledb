@@ -1607,26 +1607,57 @@ async function getGraphData(settings, { scope, character, chatIds }) {
     });
   }
 
-  // Hydrate all nodes
+  // Hydrate all nodes. CRITICAL: explicit SELECT lists, never `SELECT *`.
+  // characters.summary_embedding and events.embedding are 768-float vector
+  // columns. With `SELECT *` they ship as ~11 KB per row in the JSON
+  // payload, which on a real chat (800+ nodes) blows the response up to
+  // ~10 MB and crashes the mindmap browser tab before the layout runs.
+  // The mindmap UI never reads the embedding bytes — it only needs the
+  // human-readable columns for tooltips / labels / coloring — so we just
+  // omit them here.
   if (connectedIds.size > 0) {
     const idArray = [...connectedIds];
 
-    const { rows: chars } = await p.query(`SELECT * FROM characters WHERE id = ANY($1)`, [idArray]);
+    const { rows: chars } = await p.query(
+      `SELECT id, name, aliases, description, faction, role, status, significance, first_seen, created_at, updated_at
+       FROM characters WHERE id = ANY($1)`,
+      [idArray],
+    );
     for (const c of chars) nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
 
-    const { rows: locs } = await p.query(`SELECT * FROM locations WHERE id = ANY($1)`, [idArray]);
+    const { rows: locs } = await p.query(
+      `SELECT id, name, description, importance, current_state, parent_location, created_at
+       FROM locations WHERE id = ANY($1)`,
+      [idArray],
+    );
     for (const l of locs) nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
 
-    const { rows: evts } = await p.query(`SELECT * FROM events WHERE id = ANY($1)`, [idArray]);
+    const { rows: evts } = await p.query(
+      `SELECT id, summary, source_text, significance, message_index, location_id, chat_id, timestamp, tier, condensed_summary, is_major
+       FROM events WHERE id = ANY($1)`,
+      [idArray],
+    );
     for (const e of evts) nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
 
-    const { rows: its } = await p.query(`SELECT * FROM items WHERE id = ANY($1)`, [idArray]);
+    const { rows: its } = await p.query(
+      `SELECT id, name, description, powers, significance, owner_id, location_id, status, created_at, chat_id
+       FROM items WHERE id = ANY($1)`,
+      [idArray],
+    );
     for (const i of its) nodes.push({ id: i.id, label: i.name, type: "item", metadata: i });
 
-    const { rows: pts } = await p.query(`SELECT * FROM plot_threads WHERE id = ANY($1)`, [idArray]);
+    const { rows: pts } = await p.query(
+      `SELECT id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance, created_at, updated_at
+       FROM plot_threads WHERE id = ANY($1)`,
+      [idArray],
+    );
     for (const pt of pts) nodes.push({ id: pt.id, label: pt.title, type: "plot_thread", metadata: pt });
 
-    const { rows: arcs } = await p.query(`SELECT * FROM story_arcs WHERE id = ANY($1)`, [idArray]);
+    const { rows: arcs } = await p.query(
+      `SELECT id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id, source, parent_arc_id, hierarchy_level, created_at, updated_at
+       FROM story_arcs WHERE id = ANY($1)`,
+      [idArray],
+    );
     for (const arc of arcs) nodes.push({ id: arc.id, label: arc.title, type: "story_arc", metadata: arc });
   }
 

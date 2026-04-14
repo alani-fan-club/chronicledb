@@ -183,11 +183,15 @@ async function upsertFact(settings, { content, domain, confidence, characterScop
   for (const charName of (characterScope || [])) {
     const charId = slugify(charName);
     await upsertCharacter(settings, { name: charName });
+    // H3: chat_id is now part of the uniqueness key via
+    // knows_char_fact_chat_uniq, so identity is per-chat and we can
+    // simply DO NOTHING on conflict. The old (character_id, fact_id)
+    // key with a COALESCE-preserving UPDATE clobbered multi-chat rows
+    // into a single row holding only the first chat_id.
     await p.query(
       `INSERT INTO knows (character_id, fact_id, source, chat_id)
        VALUES ($1, $2, 'discovered', $3)
-       ON CONFLICT (character_id, fact_id) DO UPDATE SET
-         chat_id = COALESCE(knows.chat_id, EXCLUDED.chat_id)`,
+       ON CONFLICT ON CONSTRAINT knows_char_fact_chat_uniq DO NOTHING`,
       [charId, id, chatId || null],
     );
   }
@@ -402,7 +406,21 @@ const TRAIT_VERIFY_COSINE = 0.80;
 
 // Process-local cache for Path 3 verifier decisions. Key is
 // `${canonical_id}::${normalized_candidate}`. Cleared on restart.
+//
+// M13: bounded by TRAIT_VERIFY_CACHE_MAX so a long-running process
+// ingesting many chats can't grow the Map without bound. On insert,
+// if the Map is at capacity we drop the oldest entry (Map preserves
+// insertion order), which is a cheap approximate LRU for the
+// write-only cache.
+const TRAIT_VERIFY_CACHE_MAX = 1000;
 const traitVerifyCache = new Map();
+function setTraitVerifyCache(key, val) {
+  if (traitVerifyCache.size >= TRAIT_VERIFY_CACHE_MAX) {
+    const first = traitVerifyCache.keys().next().value;
+    if (first !== undefined) traitVerifyCache.delete(first);
+  }
+  traitVerifyCache.set(key, val);
+}
 
 async function upsertTrait(
   settings,
@@ -612,7 +630,7 @@ async function upsertTrait(
           existingEvidence: "",
           cosine: topHit.cos,
         });
-        traitVerifyCache.set(cacheKey, decision);
+        setTraitVerifyCache(cacheKey, decision);
       } catch (err) {
         console.warn(`[ChronicleDB] trait verifier failed (${err.message}); falling through to NEW_CANONICAL`);
         decision = "KEEP_DISTINCT";
@@ -822,13 +840,18 @@ async function getRecentSnapshots(settings, chatId, limit) {
 async function upsertPlotThread(settings, { chatId, title, description, threadType, involvedChars, plantedAt, resolvedAt, importance }) {
   const p = getPool(settings);
   const plotId = contentId("plot", `${chatId || ""}|${title}`);
+  // H2: resolved_at uses COALESCE(old, new) so first resolution sticks.
+  // The extractor passes resolvedAt=null on pending re-emits, and the
+  // old `resolved_at = EXCLUDED.resolved_at` unresolved threads every
+  // time they were re-surfaced. First resolution wins; a later pending
+  // re-emit can't clobber it back to NULL.
   await p.query(
     `INSERT INTO plot_threads (id, chat_id, thread_type, title, description, involved_chars, planted_at, resolved_at, importance)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (id) DO UPDATE SET
        thread_type = EXCLUDED.thread_type,
        description = EXCLUDED.description,
-       resolved_at = EXCLUDED.resolved_at,
+       resolved_at = COALESCE(plot_threads.resolved_at, EXCLUDED.resolved_at),
        importance = EXCLUDED.importance,
        updated_at = NOW()`,
     [plotId, chatId, threadType || "pending", title, description || "", involvedChars || [], plantedAt || null, resolvedAt || null, importance || 3],
@@ -1075,11 +1098,30 @@ async function getRelationships(settings, characters, chatIds) {
 
 async function getKnowledgeBoundaries(settings, characters, chatIds) {
   // Two queries total (not 2*N) — REVIEW §5a N+1 collapse.
-  // Scope facts by chat via memory_embeddings.chat_id when chatIds is
-  // provided so e.g. ChatB's secrets don't leak into Protagonist's retrieval.
-  // Lorebook facts (worldbuilding/setting/background) are intentionally
-  // excluded from the "doesNotKnow" set and remain globally visible via
-  // their own retrieval path — 'lore' domain is left off.
+  //
+  // ── C2 fix ────────────────────────────────────────────────────
+  // Previous scoping went through
+  //   `f.id IN (SELECT node_id FROM memory_embeddings
+  //             WHERE node_type = 'fact' AND chat_id = ANY($2))`
+  // but nothing ever writes memory_embeddings rows with
+  // node_type='fact' — upsertFact writes facts + knows and never
+  // embeds. So both arrays came back empty on every scoped call and
+  // the Character Knowledge Boundaries section was silently dead.
+  //
+  // Now we scope by `knows.chat_id` directly. The extractor stamps
+  // chat_id on `knows` at write time and idx_knows_chat supports the
+  // lookup. For `doesNotKnow`, since `facts` is global-scoped, we
+  // restrict the candidate fact set to secrets/backstory that at
+  // least one OTHER character in the same chat knows — "secrets in
+  // play in this chat that the target doesn't know yet". Tradeoff:
+  // a secret that no one in the chat knows yet is invisible, which
+  // matches the intent (only surface secrets that are actually
+  // narratively in play).
+  //
+  // Note: the shared retrieval-core.js copy of this function is the
+  // one actually called by retriever.js. This in-db.js copy is kept
+  // consistent so any direct caller (tests, admin tooling) sees the
+  // same fixed behavior.
   if (!characters || characters.length === 0) return [];
   const p = getPool(settings);
   const scoped = Array.isArray(chatIds) && chatIds.length > 0;
@@ -1087,11 +1129,8 @@ async function getKnowledgeBoundaries(settings, characters, chatIds) {
   const nameById = new Map();
   characters.forEach((n, i) => nameById.set(charIds[i], n));
 
-  // `known` — one query, all characters, chat-scoped via the facts'
-  // embedding rows. Returns character_id + content; group in JS.
-  const knownChatFilter = scoped
-    ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
-    : "";
+  // `known` — one query, all characters, scoped via knows.chat_id.
+  const knownChatFilter = scoped ? ` AND k.chat_id = ANY($2::text[])` : "";
   const knownParams = scoped ? [charIds, chatIds] : [charIds];
   const { rows: knownRows } = await p.query(
     `SELECT DISTINCT k.character_id, f.content
@@ -1101,19 +1140,25 @@ async function getKnowledgeBoundaries(settings, characters, chatIds) {
   );
 
   // `doesNotKnow` — one query; cross product of the character list and
-  // secret/backstory facts, minus what's already in `knows`. UNNEST gives
-  // us one row per (character × fact) in-SQL; the anti-join is indexed.
-  const unknownChatFilter = scoped
-    ? ` AND f.id IN (SELECT node_id FROM memory_embeddings WHERE node_type = 'fact' AND chat_id = ANY($2::text[]))`
+  // secret/backstory facts that at least one other character in the
+  // same chat knows, minus what the target already knows. The EXISTS
+  // clause is what replaces the dead memory_embeddings filter; when
+  // unscoped we fall back to the old "all secrets/backstory" shape.
+  const unknownExists = scoped
+    ? ` AND EXISTS (
+           SELECT 1 FROM knows other_k
+           WHERE other_k.fact_id = f.id
+             AND other_k.chat_id = ANY($2::text[])
+         )`
     : "";
   const { rows: unknownRows } = await p.query(
-    `SELECT c_param AS character_id, f.content
-     FROM UNNEST($1::text[]) AS c_param
+    `SELECT DISTINCT target.c_param AS character_id, f.content
+     FROM UNNEST($1::text[]) AS target(c_param)
      CROSS JOIN facts f
      WHERE f.domain IN ('secret', 'backstory')
        AND NOT EXISTS (
-         SELECT 1 FROM knows k WHERE k.character_id = c_param AND k.fact_id = f.id
-       )${unknownChatFilter}`,
+         SELECT 1 FROM knows k WHERE k.character_id = target.c_param AND k.fact_id = f.id
+       )${unknownExists}`,
     knownParams,
   );
 
@@ -1292,6 +1337,7 @@ async function traverseFromCharacter(settings, characterName, depth = 3, overrid
 
   // Hydrate the node IDs into full objects
   const nodes = [];
+  const edges = [];
   const charIds = rows.filter((r) => r.node_type === "character").map((r) => r.node_id);
   const factIds = rows.filter((r) => r.node_type === "fact").map((r) => r.node_id);
   const eventIds = rows.filter((r) => r.node_type === "event").map((r) => r.node_id);
@@ -1300,147 +1346,174 @@ async function traverseFromCharacter(settings, characterName, depth = 3, overrid
   const plotIds = rows.filter((r) => r.node_type === "plot_thread").map((r) => r.node_id);
   const arcIds = rows.filter((r) => r.node_type === "story_arc").map((r) => r.node_id);
 
-  if (charIds.length > 0) {
-    const { rows: chars } = await p.query(`SELECT * FROM characters WHERE id = ANY($1)`, [charIds]);
-    for (const c of chars) nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
-  }
-  if (factIds.length > 0) {
-    const { rows: fs } = await p.query(`SELECT * FROM facts WHERE id = ANY($1)`, [factIds]);
-    for (const f of fs) nodes.push({ id: f.id, label: (f.content || "").slice(0, 60), type: "fact", metadata: f });
-  }
-  if (eventIds.length > 0) {
-    const { rows: es } = await p.query(`SELECT * FROM events WHERE id = ANY($1)`, [eventIds]);
-    for (const e of es) nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
-  }
-  if (locIds.length > 0) {
-    const { rows: ls } = await p.query(`SELECT * FROM locations WHERE id = ANY($1)`, [locIds]);
-    for (const l of ls) nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
-  }
-  if (itemIds.length > 0) {
-    const { rows: its } = await p.query(`SELECT * FROM items WHERE id = ANY($1)`, [itemIds]);
-    for (const i of its) nodes.push({ id: i.id, label: i.name, type: "item", metadata: i });
-  }
-  if (plotIds.length > 0) {
-    const { rows: pts } = await p.query(`SELECT * FROM plot_threads WHERE id = ANY($1)`, [plotIds]);
-    for (const pt of pts) nodes.push({ id: pt.id, label: pt.title, type: "plot_thread", metadata: pt });
-  }
-  if (arcIds.length > 0) {
-    const { rows: arcs } = await p.query(`SELECT * FROM story_arcs WHERE id = ANY($1)`, [arcIds]);
-    for (const arc of arcs) nodes.push({ id: arc.id, label: arc.title, type: "story_arc", metadata: arc });
-  }
+  // M7: every post-CTE query depends only on the id arrays above, not
+  // on any earlier hydration/edge result, so they can all run on the
+  // pg pool concurrently instead of serializing over a single
+  // connection. The empty-guard `.length > 0` checks are kept so empty
+  // arrays still short-circuit; guarded calls resolve to an empty
+  // rowset without touching the pool. Order inside `nodes`/`edges`
+  // does not matter to the mindmap consumer.
+  const EMPTY = Promise.resolve({ rows: [] });
 
-  // Get edges between discovered nodes — scoped to this character's chats
-  const edges = [];
+  const [
+    charsRes,
+    factsRes,
+    eventsRes,
+    locsRes,
+    itemNodesRes,
+    plotsRes,
+    arcsRes,
+    relsRes,
+    knowsRes,
+    partRowsRes,
+    elocsRes,
+    itemEdgesRes,
+    plotEdgesRes,
+    arcEdgesRes,
+    chainsRes,
+  ] = await Promise.all([
+    // Node hydration.
+    charIds.length > 0
+      ? p.query(`SELECT * FROM characters WHERE id = ANY($1)`, [charIds])
+      : EMPTY,
+    factIds.length > 0
+      ? p.query(`SELECT * FROM facts WHERE id = ANY($1)`, [factIds])
+      : EMPTY,
+    eventIds.length > 0
+      ? p.query(`SELECT * FROM events WHERE id = ANY($1)`, [eventIds])
+      : EMPTY,
+    locIds.length > 0
+      ? p.query(`SELECT * FROM locations WHERE id = ANY($1)`, [locIds])
+      : EMPTY,
+    itemIds.length > 0
+      ? p.query(`SELECT * FROM items WHERE id = ANY($1)`, [itemIds])
+      : EMPTY,
+    plotIds.length > 0
+      ? p.query(`SELECT * FROM plot_threads WHERE id = ANY($1)`, [plotIds])
+      : EMPTY,
+    arcIds.length > 0
+      ? p.query(`SELECT * FROM story_arcs WHERE id = ANY($1)`, [arcIds])
+      : EMPTY,
+    // Edge queries scoped by (charIds, factIds, ..., chatIds).
+    charIds.length > 0
+      ? p.query(
+          `SELECT from_char as source, to_char as target, sentiment, intensity, description
+           FROM feels_about
+           WHERE from_char = ANY($1) AND to_char = ANY($1) AND session_id = ANY($2)`,
+          [charIds, chatIds],
+        )
+      : EMPTY,
+    charIds.length > 0 && factIds.length > 0
+      ? p.query(
+          `SELECT character_id, fact_id FROM knows WHERE character_id = ANY($1) AND fact_id = ANY($2)`,
+          [charIds, factIds],
+        )
+      : EMPTY,
+    charIds.length > 0 && eventIds.length > 0
+      ? p.query(
+          `SELECT pi.character_id, pi.event_id, pi.role
+           FROM participated_in pi
+           JOIN events e ON e.id = pi.event_id
+           WHERE pi.character_id = ANY($1) AND pi.event_id = ANY($2) AND e.chat_id = ANY($3)`,
+          [charIds, eventIds, chatIds],
+        )
+      : EMPTY,
+    eventIds.length > 0 && locIds.length > 0
+      ? p.query(
+          `SELECT id, location_id FROM events WHERE id = ANY($1) AND location_id = ANY($2)`,
+          [eventIds, locIds],
+        )
+      : EMPTY,
+    itemIds.length > 0
+      ? p.query(
+          `SELECT id, owner_id, location_id FROM items WHERE id = ANY($1)`,
+          [itemIds],
+        )
+      : EMPTY,
+    plotIds.length > 0 && charIds.length > 0
+      ? p.query(
+          `SELECT plot_id, character_id FROM plot_thread_characters WHERE plot_id = ANY($1) AND character_id = ANY($2)`,
+          [plotIds, charIds],
+        )
+      : EMPTY,
+    arcIds.length > 0 && eventIds.length > 0
+      ? p.query(
+          `SELECT arc_id, event_id, is_anchor FROM arc_events WHERE arc_id = ANY($1) AND event_id = ANY($2)`,
+          [arcIds, eventIds],
+        )
+      : EMPTY,
+    eventIds.length > 0
+      ? p.query(
+          `SELECT ec.from_event_id, ec.to_event_id, ec.chain_type, ec.description
+           FROM event_chains ec
+           JOIN events e ON e.id = ec.from_event_id
+           WHERE ec.from_event_id = ANY($1) AND ec.to_event_id = ANY($1) AND e.chat_id = ANY($2)`,
+          [eventIds, chatIds],
+        )
+      : EMPTY,
+  ]);
 
-  if (charIds.length > 0) {
-    const { rows: rels } = await p.query(
-      `SELECT from_char as source, to_char as target, sentiment, intensity, description
-       FROM feels_about
-       WHERE from_char = ANY($1) AND to_char = ANY($1) AND session_id = ANY($2)`,
-      [charIds, chatIds],
-    );
-    for (const r of rels) {
-      edges.push({ id: `fa-${r.source}-${r.target}`, source: r.source, target: r.target,
-        type: "FEELS_ABOUT", label: r.description || "",
-        sentiment: parseFloat(r.sentiment) || 0, intensity: parseFloat(r.intensity) || 0.5 });
-    }
+  for (const c of charsRes.rows) nodes.push({ id: c.id, label: c.name, type: "character", metadata: c });
+  for (const f of factsRes.rows) nodes.push({ id: f.id, label: (f.content || "").slice(0, 60), type: "fact", metadata: f });
+  for (const e of eventsRes.rows) nodes.push({ id: e.id, label: (e.summary || "").slice(0, 60), type: "event", metadata: e });
+  for (const l of locsRes.rows) nodes.push({ id: l.id, label: l.name, type: "location", metadata: l });
+  for (const i of itemNodesRes.rows) nodes.push({ id: i.id, label: i.name, type: "item", metadata: i });
+  for (const pt of plotsRes.rows) nodes.push({ id: pt.id, label: pt.title, type: "plot_thread", metadata: pt });
+  for (const arc of arcsRes.rows) nodes.push({ id: arc.id, label: arc.title, type: "story_arc", metadata: arc });
+
+  for (const r of relsRes.rows) {
+    edges.push({ id: `fa-${r.source}-${r.target}`, source: r.source, target: r.target,
+      type: "FEELS_ABOUT", label: r.description || "",
+      sentiment: parseFloat(r.sentiment) || 0, intensity: parseFloat(r.intensity) || 0.5 });
   }
-
-  if (charIds.length > 0 && factIds.length > 0) {
-    const { rows: kn } = await p.query(
-      `SELECT character_id, fact_id FROM knows WHERE character_id = ANY($1) AND fact_id = ANY($2)`,
-      [charIds, factIds],
-    );
-    for (const k of kn) {
-      edges.push({ id: `kn-${k.character_id}-${k.fact_id}`, source: k.character_id, target: k.fact_id,
-        type: "KNOWS", label: "knows", sentiment: 0, intensity: 0.3 });
-    }
+  for (const k of knowsRes.rows) {
+    edges.push({ id: `kn-${k.character_id}-${k.fact_id}`, source: k.character_id, target: k.fact_id,
+      type: "KNOWS", label: "knows", sentiment: 0, intensity: 0.3 });
   }
-
-  if (charIds.length > 0 && eventIds.length > 0) {
-    const { rows: partRows } = await p.query(
-      `SELECT pi.character_id, pi.event_id, pi.role
-       FROM participated_in pi
-       JOIN events e ON e.id = pi.event_id
-       WHERE pi.character_id = ANY($1) AND pi.event_id = ANY($2) AND e.chat_id = ANY($3)`,
-      [charIds, eventIds, chatIds],
-    );
-    for (const pr of partRows) {
-      edges.push({ id: `pi-${pr.character_id}-${pr.event_id}`, source: pr.character_id, target: pr.event_id,
-        type: "PARTICIPATED_IN", label: pr.role || "participated", sentiment: 0, intensity: 0.5 });
-    }
+  for (const pr of partRowsRes.rows) {
+    edges.push({ id: `pi-${pr.character_id}-${pr.event_id}`, source: pr.character_id, target: pr.event_id,
+      type: "PARTICIPATED_IN", label: pr.role || "participated", sentiment: 0, intensity: 0.5 });
   }
-
-  // Event location edges
-  if (eventIds.length > 0 && locIds.length > 0) {
-    const { rows: elocs } = await p.query(
-      `SELECT id, location_id FROM events WHERE id = ANY($1) AND location_id = ANY($2)`,
-      [eventIds, locIds],
-    );
-    for (const e of elocs) {
-      edges.push({ id: `at-${e.id}-${e.location_id}`, source: e.id, target: e.location_id,
-        type: "OCCURRED_AT", label: "at", sentiment: 0, intensity: 0.3 });
-    }
+  for (const e of elocsRes.rows) {
+    edges.push({ id: `at-${e.id}-${e.location_id}`, source: e.id, target: e.location_id,
+      type: "OCCURRED_AT", label: "at", sentiment: 0, intensity: 0.3 });
   }
-
-  // Item ownership
-  if (itemIds.length > 0) {
-    const { rows: its } = await p.query(
-      `SELECT id, owner_id, location_id FROM items WHERE id = ANY($1)`, [itemIds],
-    );
-    for (const it of its) {
-      if (it.owner_id) edges.push({ id: `own-${it.owner_id}-${it.id}`, source: it.owner_id, target: it.id,
-        type: "OWNS", label: "owns", sentiment: 0, intensity: 0.4 });
-      if (it.location_id) edges.push({ id: `at-${it.id}-${it.location_id}`, source: it.id, target: it.location_id,
-        type: "LOCATED_AT", label: "located at", sentiment: 0, intensity: 0.3 });
-    }
+  for (const it of itemEdgesRes.rows) {
+    if (it.owner_id) edges.push({ id: `own-${it.owner_id}-${it.id}`, source: it.owner_id, target: it.id,
+      type: "OWNS", label: "owns", sentiment: 0, intensity: 0.4 });
+    if (it.location_id) edges.push({ id: `at-${it.id}-${it.location_id}`, source: it.id, target: it.location_id,
+      type: "LOCATED_AT", label: "located at", sentiment: 0, intensity: 0.3 });
   }
-
-  // Plot thread links
-  if (plotIds.length > 0 && charIds.length > 0) {
-    const { rows: pts } = await p.query(
-      `SELECT plot_id, character_id FROM plot_thread_characters WHERE plot_id = ANY($1) AND character_id = ANY($2)`,
-      [plotIds, charIds],
-    );
-    for (const pt of pts) {
-      edges.push({ id: `pt-${pt.character_id}-${pt.plot_id}`, source: pt.character_id, target: pt.plot_id,
-        type: "INVOLVED_IN", label: "involved in", sentiment: 0, intensity: 0.4 });
-    }
+  for (const pt of plotEdgesRes.rows) {
+    edges.push({ id: `pt-${pt.character_id}-${pt.plot_id}`, source: pt.character_id, target: pt.plot_id,
+      type: "INVOLVED_IN", label: "involved in", sentiment: 0, intensity: 0.4 });
   }
-
-  // Arc containment
-  if (arcIds.length > 0 && eventIds.length > 0) {
-    const { rows: aes } = await p.query(
-      `SELECT arc_id, event_id, is_anchor FROM arc_events WHERE arc_id = ANY($1) AND event_id = ANY($2)`,
-      [arcIds, eventIds],
-    );
-    for (const ae of aes) {
-      edges.push({ id: `ae-${ae.arc_id}-${ae.event_id}`, source: ae.arc_id, target: ae.event_id,
-        type: "CONTAINS_EVENT", label: ae.is_anchor ? "anchor" : "contains",
-        sentiment: 0, intensity: ae.is_anchor ? 0.9 : 0.5, isAnchor: ae.is_anchor });
-    }
+  for (const ae of arcEdgesRes.rows) {
+    edges.push({ id: `ae-${ae.arc_id}-${ae.event_id}`, source: ae.arc_id, target: ae.event_id,
+      type: "CONTAINS_EVENT", label: ae.is_anchor ? "anchor" : "contains",
+      sentiment: 0, intensity: ae.is_anchor ? 0.9 : 0.5, isAnchor: ae.is_anchor });
   }
-
-  // Event chains
-  if (eventIds.length > 0) {
-    const { rows: chs } = await p.query(
-      `SELECT ec.from_event_id, ec.to_event_id, ec.chain_type, ec.description
-       FROM event_chains ec
-       JOIN events e ON e.id = ec.from_event_id
-       WHERE ec.from_event_id = ANY($1) AND ec.to_event_id = ANY($1) AND e.chat_id = ANY($2)`,
-      [eventIds, chatIds],
-    );
-    for (const c of chs) {
-      edges.push({ id: `ch-${c.from_event_id}-${c.to_event_id}`, source: c.from_event_id, target: c.to_event_id,
-        type: "CAUSED", label: c.chain_type || "caused", description: c.description,
-        sentiment: 0, intensity: 0.7 });
-    }
+  for (const c of chainsRes.rows) {
+    edges.push({ id: `ch-${c.from_event_id}-${c.to_event_id}`, source: c.from_event_id, target: c.to_event_id,
+      type: "CAUSED", label: c.chain_type || "caused", description: c.description,
+      sentiment: 0, intensity: 0.7 });
   }
 
   return { nodes, edges };
 }
 
 async function getGraphData(settings, { scope, character, chatIds }) {
+  // H5a: global traversal without a chat filter previously SELECTed
+  // every row in every graph table and produced multi-MB payloads for
+  // users with many chats — the mindmap tab would hit the browser
+  // message limit before the layout engine ran. Global is only
+  // meaningful when scoped to at least one chat, so bail early.
+  // /graph must include a chat_id query param; see index.js::/graph
+  // handler (owned by another agent) for the route-side change.
+  if (scope === "global" && (!Array.isArray(chatIds) || chatIds.length === 0)) {
+    return { nodes: [], edges: [] };
+  }
+
   const p = getPool(settings);
   const nodes = [];
   const edges = [];

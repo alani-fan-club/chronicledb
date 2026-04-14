@@ -474,14 +474,13 @@ async function detectMentionedCharacters(pool, chatIds, query, cache) {
     if (cache) {
       cache.chatId = primaryChat;
       cache.entries = entries;
-      // Default 5-minute TTL if the caller didn't preset one. Eval's
-      // singleton caller leaves expiresAt unset and relies on process
-      // lifetime; ST sets its own.
-      if (typeof cache.expiresAt !== "number") {
-        cache.expiresAt = now + 5 * 60 * 1000;
-      } else {
-        cache.expiresAt = now + 5 * 60 * 1000;
-      }
+      // M9: TTL refresh is unconditional — both branches of the
+      // previous `if (typeof cache.expiresAt !== "number")` set the
+      // same value, so the conditional was a no-op. Default 5-minute
+      // window for every caller; the stale-check at function top
+      // still honors a caller-supplied expiresAt if they overwrite it
+      // after we return.
+      cache.expiresAt = now + 5 * 60 * 1000;
     }
   } else {
     entries = cache.entries;
@@ -707,10 +706,36 @@ async function getRecentEvents(pool, chatIds, limit = 8) {
  * order. Characters with no facts still get an entry with empty arrays
  * so formatMemoryBlock can skip them cleanly.
  *
- * Scoping: facts are filtered to those present in memory_embeddings
- * for the given chats, so secrets from other chats don't leak across.
- * The NOT-know set for 'secret'/'backstory' is computed globally then
- * likewise scoped.
+ * ── Scoping history (C2 fix) ───────────────────────────────────
+ * The previous implementation filtered facts via
+ *   `f.id IN (SELECT node_id FROM memory_embeddings
+ *             WHERE chat_id = ANY($2) AND node_type = 'fact')`
+ * But nothing in the extractor ever writes a memory_embeddings row
+ * with node_type='fact' — upsertFact writes to `facts` + `knows` and
+ * never embeds. So the subquery matched zero rows on every call and
+ * BOTH arrays came back empty; the "Character Knowledge Boundaries"
+ * section of the rendered memory block has been silently empty since
+ * the chat-scoping migration.
+ *
+ * Current shape:
+ *   - `knows` is filtered by `knows.chat_id` directly. The extractor
+ *     stamps `knows.chat_id` at write time (upsertFact carries the
+ *     chat through), and the `idx_knows_chat` index supports it.
+ *     Legacy rows pre-migration have NULL chat_id and intentionally
+ *     drop out under scoped mode — they'd otherwise leak cross-chat.
+ *   - `doesNotKnow` is harder because `facts` is global-scoped (no
+ *     chat_id on the row). The old subquery was trying to answer
+ *     "secrets/backstory facts visible in this chat that this
+ *     character does NOT know". We rebuild that scope by constraining
+ *     the candidate fact set to facts that at least one OTHER
+ *     character in the same chat *does* know (via knows.chat_id).
+ *     This is closer to the original intent — "secrets within the
+ *     chat" — than a global fact dump would be, and still matches
+ *     only facts that are actually in play in the scoped chats.
+ *     Tradeoff: a secret that no one in the chat has learned yet is
+ *     invisible. Acceptable; the surface of "what the POV character
+ *     doesn't know" only matters once the fact has entered the
+ *     narrative somewhere.
  */
 async function getKnowledgeBoundaries(pool, chatIds, characters) {
   if (!characters || characters.length === 0) return [];
@@ -721,34 +746,33 @@ async function getKnowledgeBoundaries(pool, chatIds, characters) {
   const nameById = new Map();
   characters.forEach((n, i) => nameById.set(charIds[i], n));
 
-  // Single query for `knows` across all characters, chat-scoped via a
-  // memory_embeddings join. GROUP BY implicit via ARRAY_AGG-in-JS.
+  // `knows`: filter directly by knows.chat_id. One query, all characters.
   const { rows: knownRows } = await pool.query(
     `SELECT DISTINCT k.character_id, f.content
      FROM knows k
      JOIN facts f ON f.id = k.fact_id
      WHERE k.character_id = ANY($1::text[])
-       AND f.id IN (
-         SELECT node_id FROM memory_embeddings
-         WHERE chat_id = ANY($2::text[]) AND node_type = 'fact'
-       )`,
+       AND k.chat_id = ANY($2::text[])`,
     [charIds, ids],
   );
-  // Single query for `doesNotKnow`: secrets/backstory NOT linked via
-  // `knows` to the character, joined per-character via a cross product.
-  // Postgres's anti-join rewrites this efficiently against the knows PK.
+  // `doesNotKnow`: for each target character, secret/backstory facts
+  // that SOMEONE ELSE in the same chat knows but the target doesn't.
+  // The inner EXISTS scopes the fact to this chat via knows.chat_id;
+  // the NOT EXISTS is the per-character anti-join.
   const { rows: unknownRows } = await pool.query(
-    `SELECT c_param AS character_id, f.content
-     FROM UNNEST($1::text[]) AS c_param
+    `SELECT DISTINCT target.c_param AS character_id, f.content
+     FROM UNNEST($1::text[]) AS target(c_param)
      CROSS JOIN facts f
      WHERE f.domain IN ('secret', 'backstory')
-       AND f.id IN (
-         SELECT node_id FROM memory_embeddings
-         WHERE chat_id = ANY($2::text[]) AND node_type = 'fact'
+       AND EXISTS (
+         SELECT 1 FROM knows other_k
+         WHERE other_k.fact_id = f.id
+           AND other_k.chat_id = ANY($2::text[])
        )
        AND NOT EXISTS (
          SELECT 1 FROM knows k
-         WHERE k.character_id = c_param AND k.fact_id = f.id
+         WHERE k.character_id = target.c_param
+           AND k.fact_id = f.id
        )`,
     [charIds, ids],
   );
@@ -1095,16 +1119,28 @@ const SECTION_REGISTRY = [
  * Data-driven formatter. Walks SECTION_REGISTRY in order, collects
  * non-null results, wraps in the ChronicleDB Memory Context delimiters,
  * then truncates to `maxChars` if oversized (tail marker preserved).
+ *
+ * M8: the previous truncation path just `slice(0, maxChars) +
+ * "\n[...truncated]"`, which chopped the closing
+ * `[/ChronicleDB Memory Context]` delimiter off any oversize block.
+ * Any downstream parser looking for the close marker (the injected
+ * system prompt slot, debug panels, diff tools) would fail silently.
+ * We now always emit both the truncation marker AND the close
+ * delimiter, budgeting the space they consume out of `maxChars`.
  */
+const MEMORY_BLOCK_CLOSE = "\n\n[/ChronicleDB Memory Context]";
+const MEMORY_BLOCK_TRUNC_MARKER = "\n[...truncated]";
+
 function formatMemoryBlock(result, maxChars) {
   const sections = [];
   for (const section of SECTION_REGISTRY) {
     const rendered = section.build(result);
     if (rendered) sections.push(rendered);
   }
-  const block = `[ChronicleDB Memory Context]\n\n${sections.join("\n\n")}\n\n[/ChronicleDB Memory Context]`;
+  const block = `[ChronicleDB Memory Context]\n\n${sections.join("\n\n")}${MEMORY_BLOCK_CLOSE}`;
   if (block.length > maxChars) {
-    return block.slice(0, maxChars) + "\n[...truncated]";
+    const headroom = maxChars - MEMORY_BLOCK_CLOSE.length - MEMORY_BLOCK_TRUNC_MARKER.length;
+    return block.slice(0, Math.max(0, headroom)) + MEMORY_BLOCK_TRUNC_MARKER + MEMORY_BLOCK_CLOSE;
   }
   return block;
 }

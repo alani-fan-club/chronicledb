@@ -111,12 +111,33 @@ CREATE TABLE IF NOT EXISTS knows (
     learned_at  TIMESTAMPTZ DEFAULT NOW(),
     source      TEXT DEFAULT 'witnessed',
     chat_id     TEXT,
-    UNIQUE(character_id, fact_id)
+    CONSTRAINT knows_char_fact_chat_uniq UNIQUE (character_id, fact_id, chat_id)
 );
 
 ALTER TABLE knows ADD COLUMN IF NOT EXISTS chat_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_knows_fact ON knows (fact_id);
 CREATE INDEX IF NOT EXISTS idx_knows_chat ON knows (chat_id);
+
+-- H3 migration: widen the UNIQUE from (character_id, fact_id) to
+-- (character_id, fact_id, chat_id). The old auto-named constraint lived
+-- at `knows_character_id_fact_id_key`; the new one is explicitly named
+-- knows_char_fact_chat_uniq so upsertFact's ON CONFLICT can target it.
+--
+-- We do NOT wrap this in a DO $$ ... END $$; block because the naive
+-- schema loader in db.js::initSchema strips `--` comments then splits
+-- the file on `;`, which would shatter a DO block mid-statement. The
+-- loader's per-statement try/catch swallows "already exists" errors,
+-- so ADD CONSTRAINT is idempotent across reboots once the new one is
+-- on the table. DROP CONSTRAINT IF EXISTS is idempotent on its own.
+--
+-- Why this matters: with the old (character_id, fact_id) key, a fact
+-- learned by the same character in two different chats could only
+-- store one chat_id (upsertFact's COALESCE kept the earlier one),
+-- which made the C2 fix in getKnowledgeBoundaries silently drop
+-- multi-chat facts from the second chat's view.
+ALTER TABLE knows DROP CONSTRAINT IF EXISTS knows_character_id_fact_id_key;
+ALTER TABLE knows ADD CONSTRAINT knows_char_fact_chat_uniq
+    UNIQUE (character_id, fact_id, chat_id);
 
 CREATE TABLE IF NOT EXISTS participated_in (
     id           SERIAL PRIMARY KEY,
@@ -127,6 +148,12 @@ CREATE TABLE IF NOT EXISTS participated_in (
 );
 
 CREATE INDEX IF NOT EXISTS idx_participated_event ON participated_in (event_id);
+-- M3: participated_in queries that filter by character_id (used by
+-- clearCharacterMemories and getCharacterPanelStats event-count
+-- rollups) previously had to walk the whole table. The (event_id)
+-- index above only helps the reverse direction.
+CREATE INDEX IF NOT EXISTS idx_participated_character
+    ON participated_in (character_id);
 
 CREATE TABLE IF NOT EXISTS present_at (
     id           SERIAL PRIMARY KEY,
@@ -382,6 +409,12 @@ CREATE INDEX IF NOT EXISTS idx_embed_hnsw
     ON memory_embeddings USING hnsw (embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_embed_chat_type
     ON memory_embeddings (chat_id, node_type);
+-- M1: supports /clear-message-extractions swipe cleanup, which deletes
+-- memory_embeddings rows by (chat_id, message_index) when the user
+-- regenerates a message. Without this index the cleanup scans the
+-- whole table per swipe.
+CREATE INDEX IF NOT EXISTS idx_embed_chat_msg
+    ON memory_embeddings (chat_id, message_index);
 
 -- Ensure raw_text column exists on existing deployments
 ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS raw_text TEXT;
@@ -411,6 +444,12 @@ CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_tsv
     ON dialogue_quotes USING GIN (to_tsvector('english', quote));
 CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_trgm
     ON dialogue_quotes USING GIN (quote gin_trgm_ops);
+-- M2: supports /clear-message-extractions swipe cleanup, which
+-- deletes dialogue_quotes by (chat_id, message_index) when the user
+-- regenerates a message. Without this index the cleanup scans the
+-- whole table per swipe.
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_chat_msg
+    ON dialogue_quotes (chat_id, message_index);
 
 -- ── Session & config tables ────────────────────────────────────
 

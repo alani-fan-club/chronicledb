@@ -1011,6 +1011,20 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         [charId, char.role || "", char.status || "", char.significance || 3],
       );
     }
+    // M6: parallelize the per-character trait upserts. upsertTrait's hot
+    // path is fuzzy-match SELECT + embed RPC + kNN SELECT + INSERT per
+    // trait — 2-3 s each serialized is 30-45 s for a 15-trait character.
+    // Scope is deliberately narrow: only traits WITHIN one character fan
+    // out; the outer characters loop stays serial so we don't multiply
+    // the LLM-call burst across N characters at once. Note that upsertTrait
+    // on the MERGE / NEW_CANONICAL branches invokes recomputeCharacterSummary
+    // internally; with N parallel traits on one character we'll recompute
+    // the summary up to N times in this burst. That's wasteful-but-correct
+    // and is explicitly out of scope for this fix (the review flagged it
+    // as a separate medium to debounce). traitVerifyCache writes are
+    // single-threaded-Node safe (Map.set is atomic); in the worst case two
+    // parallel calls race on the same trait pair and both fire the verifier.
+    const traitPromises = [];
     for (const trait of persistentTraits) {
       if (trait && trait.content) {
         // Path 1: pass characterName + evidence_sentence so upsertTrait
@@ -1020,17 +1034,20 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         // omitted it), upsertTrait falls back to `${name} is ${content}`.
         // sourceMessageIndex pins this trait to the message it came from
         // so /clear-message-extractions can clean it up on swipe.
-        await db.upsertTrait(settings, {
-          characterId: charId,
-          characterName: char.name,
-          category: trait.category || "personality",
-          content: trait.content,
-          evidenceSentence: trait.evidence_sentence || "",
-          sourceChat: safeChat,
-          sourceMessageIndex: msgIdx,
-        });
+        traitPromises.push(
+          db.upsertTrait(settings, {
+            characterId: charId,
+            characterName: char.name,
+            category: trait.category || "personality",
+            content: trait.content,
+            evidenceSentence: trait.evidence_sentence || "",
+            sourceChat: safeChat,
+            sourceMessageIndex: msgIdx,
+          }),
+        );
       }
     }
+    if (traitPromises.length > 0) await Promise.all(traitPromises);
     // Legacy: some older prompts stashed traits as `new_facts`.
     for (const fact of (char.new_facts || [])) {
       await db.upsertTrait(settings, {
@@ -1085,15 +1102,29 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
   // graph degenerates into a near-complete topology (Path 1 smoke test
   // caught exactly that failure — 3 arcs at Q=0.076). Failures are
   // swallowed: event writes must not abort on an embed hiccup.
+  //
+  // M5: the UPDATEs used to fire one round-trip per event. An 80-event
+  // extraction batch ate 80 serial UPDATE statements. Collapse to a
+  // single UNNEST-driven UPDATE that joins on (id, emb) pairs built from
+  // two parallel arrays.
   if (insertedEventIds.length > 0) {
     try {
       const vecs = await embedBatch(settings, insertedEventTexts);
-      const p = db.getPool(settings);
+      const idArr = [];
+      const embArr = [];
       for (let i = 0; i < insertedEventIds.length; i++) {
         if (!vecs[i]) continue;
+        idArr.push(insertedEventIds[i]);
+        embArr.push(JSON.stringify(vecs[i]));
+      }
+      if (idArr.length > 0) {
+        const p = db.getPool(settings);
         await p.query(
-          `UPDATE events SET embedding = $1::vector WHERE id = $2`,
-          [JSON.stringify(vecs[i]), insertedEventIds[i]],
+          `UPDATE events AS e
+           SET embedding = v.emb::vector
+           FROM (SELECT UNNEST($1::text[]) AS id, UNNEST($2::text[]) AS emb) AS v
+           WHERE e.id = v.id`,
+          [idArr, embArr],
         );
       }
     } catch (err) {
@@ -1261,7 +1292,20 @@ async function applyMessagesToVectorStore(settings, { messages, chatBatch, batch
   // messages) and generate situating blurbs. Blurbs have to come first
   // because the embed input is `${blurb}\n\n${chunk}` and we want to
   // batch-embed across messages.
-  const tasks = [];
+  //
+  // H4: generateSituatingBlurb is a Gemini round-trip per message (3-8 s
+  // each). The old serial loop ate 30-80 s on a 10-message batch just
+  // waiting on blurbs. Split into three phases so the blurb awaits run
+  // in parallel without disturbing the non-parallelizable work:
+  //   1. Build the per-message records with surroundingContext (pure
+  //      function of `batch` / `allMsgs`, no async dependencies).
+  //   2. Promise.all the blurb calls — all N round-trips fly in parallel.
+  //      Each promise catches its own error to a "" blurb so one failure
+  //      doesn't reject the whole batch (mirrors the old try/catch).
+  //   3. Chunk each message and push tasks in original message order so
+  //      `tasks` and the per-task (messageIndex, chunkIndex) stay
+  //      deterministic.
+  const records = [];
   for (let mi = 0; mi < batch.length; mi++) {
     const m = batch[mi];
     if (!m || m.is_system) continue;
@@ -1279,18 +1323,32 @@ async function applyMessagesToVectorStore(settings, { messages, chatBatch, batch
       .map((mm) => `${mm.name}: ${(mm.mes || "").slice(0, 400)}`)
       .join("\n\n");
 
-    let situating = "";
-    try {
-      situating = await generateSituatingBlurb(settings, {
-        chatTitle: safeChat,
-        surroundingContext,
-        message: text,
-      });
-    } catch (err) {
-      // Situating is a nice-to-have; one failure must not abort embedding.
-      console.warn(`[ChronicleDB] msg ${messageIndex} situating failed: ${err.message}`);
-    }
+    records.push({ m, text, messageIndex, surroundingContext });
+  }
 
+  // Phase 2: fire all blurb round-trips in parallel. Errors are caught
+  // per-promise so one failure degrades to "" (situating is a
+  // nice-to-have; the embed still writes without it) rather than
+  // rejecting the whole Promise.all.
+  const blurbs = await Promise.all(
+    records.map((r) =>
+      generateSituatingBlurb(settings, {
+        chatTitle: safeChat,
+        surroundingContext: r.surroundingContext,
+        message: r.text,
+      }).catch((err) => {
+        console.warn(`[ChronicleDB] msg ${r.messageIndex} situating failed: ${err.message}`);
+        return "";
+      }),
+    ),
+  );
+
+  // Phase 3: chunk + push tasks in order, binding each record to its
+  // corresponding blurb by index.
+  const tasks = [];
+  for (let ri = 0; ri < records.length; ri++) {
+    const { m, messageIndex } = records[ri];
+    const situating = blurbs[ri] || "";
     const chunks = chunkText(m.mes);
     for (let ci = 0; ci < chunks.length; ci++) {
       const chunk = chunks[ci];

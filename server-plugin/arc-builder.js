@@ -734,87 +734,147 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
   const superArcIdByIdx = new Map();
   const arcIdByIdx = new Map();
 
-  // Helper to insert one enriched arc and its arc_events rows.
-  async function insertArcAndEvents({ arc, hierarchyLevel, parentArcId }) {
-    const arcId = await db.upsertStoryArc(settings, {
-      chatId,
-      title: arc.title,
-      description: arc.description || "",
-      arcType: "main",
-      // Ingested chats are by definition complete at rebuild time.
-      status: "resolved",
-      importance: arc.importance,
-      startMsgIdx: arc.startMsgIdx,
-      endMsgIdx: arc.endMsgIdx,
-      spineEventId: arc.spine?.id || null,
-      source: "structural",
-      parentArcId: parentArcId ?? null,
-      hierarchyLevel,
-    });
+  // C1: pool.query acquires-and-releases per call, so a multi-statement
+  // rebuild run on `p.query("BEGIN")` is NOT atomic — BEGIN/DELETE/INSERT/
+  // COMMIT may each land on different connections. Check out one client for
+  // the whole transaction so the rebuild is actually all-or-nothing.
+  //
+  // The INSERTs below used to delegate to db.upsertStoryArc / db.linkEventToArc,
+  // which take `settings` and call `db.getPool(settings).query(...)` — same
+  // pool-level acquire-and-release, so they'd escape this transaction. We
+  // inline their INSERT shapes against `client` here instead. Column lists
+  // mirror upsertStoryArc's INSERT branch and linkEventToArc verbatim
+  // (db.js:768-772 / db.js:779-783) so the schema stays authoritative there;
+  // we can drop the upsertStoryArc UPDATE-on-title-collision branch because
+  // the level-scoped DELETE below runs first and there's nothing to collide
+  // with.
+  //
+  // M4: per-arc linkEventToArc round-trips (1000+ on a real chat) collapse
+  // to one UNNEST INSERT per hierarchy level. We build the (arcId, eventId,
+  // position, isAnchor) tuple list while looping the arc inserts, then fire
+  // one arc_events INSERT per level after the arcs for that level finish.
+  function newArcId() {
+    return `arc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  }
 
+  // Returns the new arcId and pushes the per-member arc_events tuples into
+  // `tupleBuffer`. No INSERT to arc_events happens yet — that's the batched
+  // follow-up call.
+  async function insertArcRow(client, { arc, hierarchyLevel, parentArcId }, tupleBuffer) {
+    const arcId = newArcId();
+    await client.query(
+      `INSERT INTO story_arcs (id, chat_id, title, description, arc_type, status, importance, start_msg_idx, end_msg_idx, spine_event_id, source, parent_arc_id, hierarchy_level)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        arcId,
+        chatId,
+        arc.title,
+        arc.description || "",
+        "main",
+        // Ingested chats are by definition complete at rebuild time.
+        "resolved",
+        arc.importance || 3,
+        arc.startMsgIdx,
+        arc.endMsgIdx,
+        arc.spine?.id || null,
+        "structural",
+        parentArcId ?? null,
+        hierarchyLevel,
+      ],
+    );
+    const spineId = arc.spine?.id || null;
     let pos = 0;
     for (const m of arc.members) {
-      await db.linkEventToArc(settings, {
-        arcId,
-        eventId: m.id,
-        position: pos++,
-        isAnchor: m.id === arc.spine?.id,
-      });
+      tupleBuffer.push([arcId, m.id, pos++, m.id === spineId]);
     }
     return arcId;
   }
 
-  await p.query("BEGIN");
+  // One UNNEST INSERT per level. pg's per-statement parameter cap is 65535,
+  // and UNNEST uses only 4 parameters regardless of row count, so a single
+  // call handles arbitrarily many arc_events rows (Path 5's three levels on
+  // a real chat top out at a couple thousand, well inside this budget).
+  async function flushArcEventTuples(client, tuples) {
+    if (tuples.length === 0) return;
+    const arcIds = new Array(tuples.length);
+    const eventIds = new Array(tuples.length);
+    const positions = new Array(tuples.length);
+    const anchors = new Array(tuples.length);
+    for (let i = 0; i < tuples.length; i++) {
+      arcIds[i] = tuples[i][0];
+      eventIds[i] = tuples[i][1];
+      positions[i] = tuples[i][2];
+      anchors[i] = tuples[i][3];
+    }
+    await client.query(
+      `INSERT INTO arc_events (arc_id, event_id, position, is_anchor)
+       SELECT * FROM UNNEST($1::text[], $2::text[], $3::int[], $4::bool[])
+       ON CONFLICT DO NOTHING`,
+      [arcIds, eventIds, positions, anchors],
+    );
+  }
+
+  const pool = db.getPool(settings);
+  const client = await pool.connect();
   try {
-    await p.query(
+    await client.query("BEGIN");
+    await client.query(
       `DELETE FROM arc_events WHERE arc_id IN (SELECT id FROM story_arcs WHERE chat_id = $1)`,
       [chatId],
     );
-    await p.query(`DELETE FROM story_arcs WHERE chat_id = $1`, [chatId]);
+    await client.query(`DELETE FROM story_arcs WHERE chat_id = $1`, [chatId]);
 
     // Level 0 — super-arcs (parent_arc_id = NULL). Templated titles only;
     // LLM naming for this level would need a different prompt.
+    const superTuples = [];
     for (let i = 0; i < enrichedSuperArcs.length; i++) {
       const arc = enrichedSuperArcs[i];
-      const arcId = await insertArcAndEvents({
-        arc,
-        hierarchyLevel: 0,
-        parentArcId: null,
-      });
+      const arcId = await insertArcRow(
+        client,
+        { arc, hierarchyLevel: 0, parentArcId: null },
+        superTuples,
+      );
       superArcIdByIdx.set(i, arcId);
     }
+    await flushArcEventTuples(client, superTuples);
 
     // Level 1 — arcs (may be LLM-named per opts.nameArcs, templated otherwise).
     // parent_arc_id is resolved from parentIdx → superArcIdByIdx.
+    const arcTuples = [];
     for (let i = 0; i < enrichedArcs.length; i++) {
       const arc = enrichedArcs[i];
       const parentArcId =
         arc.parentIdx !== undefined ? superArcIdByIdx.get(arc.parentIdx) : null;
-      const arcId = await insertArcAndEvents({
-        arc,
-        hierarchyLevel: 1,
-        parentArcId: parentArcId ?? null,
-      });
+      const arcId = await insertArcRow(
+        client,
+        { arc, hierarchyLevel: 1, parentArcId: parentArcId ?? null },
+        arcTuples,
+      );
       arcIdByIdx.set(i, arcId);
     }
+    await flushArcEventTuples(client, arcTuples);
 
     // Level 2 — episodes (templated titles only). parent_arc_id resolves to
     // the level-1 arc, not a level-0 super-arc.
+    const episodeTuples = [];
     for (let i = 0; i < enrichedEpisodes.length; i++) {
       const arc = enrichedEpisodes[i];
       const parentArcId =
         arc.parentIdx !== undefined ? arcIdByIdx.get(arc.parentIdx) : null;
-      await insertArcAndEvents({
-        arc,
-        hierarchyLevel: 2,
-        parentArcId: parentArcId ?? null,
-      });
+      await insertArcRow(
+        client,
+        { arc, hierarchyLevel: 2, parentArcId: parentArcId ?? null },
+        episodeTuples,
+      );
     }
+    await flushArcEventTuples(client, episodeTuples);
 
-    await p.query("COMMIT");
+    await client.query("COMMIT");
   } catch (err) {
-    await p.query("ROLLBACK");
+    try { await client.query("ROLLBACK"); } catch (_) {}
     throw err;
+  } finally {
+    client.release();
   }
 
   return {

@@ -316,27 +316,51 @@ Parallel roleplays with the same character must not bleed into each other. Every
 
 ### Install
 
-These steps assume a fresh clone on a Mac or Linux box with PostgreSQL 17, Node 18+, and SillyTavern already installed. If any of those are missing, install them first.
+**Prerequisites you need to already have installed:**
 
-#### 1. Install the pgvector extension into your Postgres binary
+- SillyTavern (already running at least once so `config.yaml` exists)
+- Node.js 18 or newer
+- PostgreSQL 14 or newer (17 recommended) with the **pgvector** extension installed into the Postgres binary
 
-`CREATE EXTENSION vector` only works if the pgvector extension files are physically present in your Postgres install — by default they aren't. Install them once per Postgres install:
+If any of these are missing, install them first:
+
+| | macOS | Linux (Debian/Ubuntu) |
+|---|---|---|
+| Node 18+ | `brew install node` | follow [nodejs.org packages](https://nodejs.org/en/download/package-manager) |
+| Postgres 17 | `brew install postgresql@17 && brew services start postgresql@17` | `sudo apt-get install postgresql-17` |
+| pgvector | `brew install pgvector` | `sudo apt-get install postgresql-17-pgvector` |
+
+> `pg_trgm` ships with Postgres core and needs no separate install. `pgvector` does not — `CREATE EXTENSION vector` will fail until the binary is on disk.
+
+#### One-shot install (recommended)
+
+Once the prerequisites above are in place, run **one command**:
 
 ```sh
-# macOS via Homebrew
-brew install pgvector
-
-# Debian / Ubuntu
-sudo apt-get install postgresql-17-pgvector
-
-# From source (any platform — pinned commit, builds against your $PG_CONFIG)
-git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git
-cd pgvector && make && sudo make install
+bash <(curl -fsSL https://raw.githubusercontent.com/alani-fan-club/chronicledb/master/install.sh)
 ```
 
-`pg_trgm` ships with Postgres core so no extra binary install is needed.
+The installer is idempotent and walks through everything for you:
 
-#### 2. Create the database and enable extensions
+1. Detects your SillyTavern install (auto-finds the common locations or prompts once)
+2. Verifies Node ≥ 18, Postgres ≥ 14, and pgvector is available
+3. Clones the repo to `~/.chronicledb`
+4. Runs `npm install` inside `server-plugin/` so the plugin's dependencies land
+5. Symlinks the server plugin to `<SillyTavern>/plugins/chronicle-db`
+6. Symlinks the UI extension to `<SillyTavern>/public/scripts/extensions/third-party/chronicle-db` (the **correct** location — not `data/<user>/extensions/`, which is a common wrong guess)
+7. Patches `<SillyTavern>/config.yaml` to set `enableServerPlugins: true`
+8. Creates the `chronicledb` database and enables the `vector` and `pg_trgm` extensions
+
+When it finishes, restart SillyTavern, open **Extensions → ChronicleDB**, paste your Gemini API key, and click **Connect & initialize**. That's it.
+
+Re-running `install.sh` later is safe — it detects existing symlinks, an existing repo clone, and an existing database, and only fixes drift.
+
+#### Manual install (only if the script fails or you want full control)
+
+<details>
+<summary>Click to expand the step-by-step manual install</summary>
+
+##### 1. Create the database and enable extensions
 
 ```sh
 createdb chronicledb
@@ -345,99 +369,79 @@ psql -d chronicledb -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION 
 
 If `createdb` fails on permissions, you may need `sudo -u postgres createdb chronicledb` or to first `CREATE ROLE <you> SUPERUSER` as the postgres user.
 
-#### 3. Clone the repo
+##### 2. Clone the repo
 
 ```sh
-git clone https://github.com/alani-fan-club/chronicledb.git
-cd chronicledb
+git clone https://github.com/alani-fan-club/chronicledb.git ~/.chronicledb
 ```
 
-Pick somewhere outside your SillyTavern tree — you'll symlink in.
+##### 3. Install the plugin's Node dependencies
 
-#### 4. Install the plugin's Node dependencies
-
-The server plugin has its own `package.json` with `graphology`, `graphology-communities-louvain`, `pg`, `pgvector`, and `dotenv`. Without this step the plugin crashes on first `require` with `Cannot find module 'graphology'`.
+The server plugin has its own `package.json` with `graphology`, `graphology-communities-louvain`, `pg`, `pgvector`, and `dotenv`. **Without this step the plugin crashes on first `require`** with `Cannot find module 'graphology'`. The root `package.json` and `shared/package.json` do **not** need installing.
 
 ```sh
-cd server-plugin
+cd ~/.chronicledb/server-plugin
 npm install
-cd ..
 ```
 
-The root `package.json` and `shared/package.json` do **not** need installing — the root one is legacy build infrastructure and `shared/` only declares `type: commonjs` so the require chain works.
+##### 4. Symlink the server plugin into SillyTavern
 
-#### 5. Symlink the server plugin into SillyTavern
-
-ST loads server plugins from `<SillyTavern>/plugins/<plugin-id>/`. The plugin's id comes from `info.id` in `server-plugin/index.js` and is `chronicle-db`, so the symlink target name must be `chronicle-db`:
+ST loads server plugins from `<SillyTavern>/plugins/<plugin-id>/`. The plugin id is `chronicle-db`, so the symlink target name must be exactly `chronicle-db`:
 
 ```sh
-ln -s "$(pwd)/server-plugin" /path/to/SillyTavern/plugins/chronicle-db
+ln -s ~/.chronicledb/server-plugin /path/to/SillyTavern/plugins/chronicle-db
 ```
 
-(Substitute the absolute paths for both sides — relative-path symlinks break ST's plugin loader on some setups.)
+##### 5. Enable server plugins in SillyTavern's config
 
-#### 6. Enable server plugins in SillyTavern's config
-
-Edit `<SillyTavern>/config.yaml` and set:
+Edit `<SillyTavern>/config.yaml`:
 
 ```yaml
 enableServerPlugins: true
-enableServerPluginsAutoUpdate: false  # optional but recommended — stops ST from running `git pull` on the plugin behind your back
+enableServerPluginsAutoUpdate: false  # optional but recommended — stops ST from running `git pull` on the plugin
 ```
 
-#### 7. Symlink the UI extension into SillyTavern
+##### 6. Symlink the UI extension into SillyTavern
 
-The client-side UI extension (settings drawer, character memory panel, mindmap launcher) lives at `ui-extension/`. ST auto-discovers third-party UI extensions from `<SillyTavern>/public/scripts/extensions/third-party/<extension-id>/` on every boot — they show up in the **Extensions** panel for every ST user account once the manifest is in that directory. The extension id is the directory name; ChronicleDB uses `chronicle-db`:
+ST auto-discovers third-party UI extensions from `<SillyTavern>/public/scripts/extensions/third-party/<id>/`:
 
 ```sh
-ln -s "$(pwd)/ui-extension" /path/to/SillyTavern/public/scripts/extensions/third-party/chronicle-db
+ln -s ~/.chronicledb/ui-extension /path/to/SillyTavern/public/scripts/extensions/third-party/chronicle-db
 ```
 
-> **Common pitfall:** do **not** put the symlink under `<SillyTavern>/data/<user>/extensions/` — that directory is for a different category of per-user extension and ST will not auto-load `manifest.json` files from there. If ChronicleDB does not appear in the Extensions panel after restarting ST, this is almost always the reason. Verify with `ls -la <SillyTavern>/public/scripts/extensions/third-party/chronicle-db` — the symlink should resolve to the `ui-extension/` directory of your clone, and that directory should contain `manifest.json`, `index.js`, `style.css`, `character-panel.html`, and `settings.html`.
+> **Common pitfall:** do **not** symlink under `<SillyTavern>/data/<user>/extensions/`. That directory is for a different category of extension and ST will **not** load a `manifest.json` from there. If ChronicleDB does not appear in the Extensions panel after restarting ST, this is the reason 95% of the time. Verify with `ls -la <SillyTavern>/public/scripts/extensions/third-party/chronicle-db` — the symlink should point at `ui-extension/` and that directory should contain `manifest.json`, `index.js`, `style.css`, `character-panel.html`, and `settings.html`.
 
-#### 8. Restart SillyTavern
+##### 7. Restart SillyTavern and configure
 
-```sh
-# kill the existing process if you have one running, then:
-cd /path/to/SillyTavern && node server.js
+Restart ST, open **Extensions → ChronicleDB**, fill in:
+
+- Database panel: host (`localhost`), port (`5432`), database (`chronicledb`), user, password
+- LLM panel: Gemini API key (or any OpenAI-compatible endpoint), extraction model, embedding model
+
+Click **Connect & initialize**. The ST server console should show:
+
+```
+[ChronicleDB] Initializing server plugin...
+[ChronicleDB] Server plugin ready.
+[ChronicleDB] Schema initialized.
+[ChronicleDB] Auto-connected to database.
 ```
 
-On boot, the plugin's `init` runs and looks for a cached settings file at `server-plugin/.settings-cache.json`. First-time installs won't have that file yet, so the plugin will load with no DB connection and wait for you to configure it through the UI.
+Every subsequent ST boot will auto-connect using the cached `.settings-cache.json` file the panel writes for you.
 
-#### 9. Configure and initialize from the ST UI
-
-1. Open SillyTavern in your browser, go to **Extensions** → **ChronicleDB**.
-2. Fill in the database panel — host (`localhost`), port (`5432`), database name (`chronicledb`), user, password.
-3. Fill in the LLM panel — extraction API key, extraction model (default `gemini-2.5-flash-lite`), embedding model (default `gemini-embedding-2-preview`), API URL.
-4. Click **Connect & initialize**. This POSTs to `/api/plugins/chronicle-db/init-db`, runs `db.initSchema` against your fresh database to create every table and index, and flips the `initialized` flag in the settings cache.
-5. Watch the ST server console — you should see:
-
-   ```
-   [ChronicleDB] Initializing server plugin...
-   [ChronicleDB] Server plugin ready.
-   [ChronicleDB] Schema initialized.
-   [ChronicleDB] Auto-connected to database.
-   ```
-
-   Every subsequent ST boot will skip step 9 entirely — the cached `.settings-cache.json` file means the plugin auto-connects on every restart.
-
-#### 10. Verify the install
-
-A couple of cheap sanity checks before you start ingesting real chats:
+##### 8. Verify the install
 
 ```sh
-# Plugin route is mounted under /api/plugins/chronicle-db (your ST may need basic auth — substitute creds)
-curl -s -u <user>:<pass> http://127.0.0.1:8000/api/plugins/chronicle-db/status
+curl -s -u <st-user>:<st-pass> http://127.0.0.1:8000/api/plugins/chronicle-db/status
 # Expected: {"connected":true,"configured":true,"error":null,"initializedAt":"..."}
 
-# Schema actually exists
 psql -d chronicledb -c "\dt"
-# Expected: ~20 tables including characters, events, traits, story_arcs, memory_embeddings, etc.
+# Expected: ~20 tables including characters, events, traits, story_arcs, memory_embeddings
 ```
 
-If `/status` returns `{"connected":false,...}`, check `server-plugin/.settings-cache.json` to see whether the credentials wrote correctly, and look at the ST server log for the `[ChronicleDB]` lines around boot.
+If `/status` returns `{"connected":false,...}`, check `server-plugin/.settings-cache.json` and the ST server log for the `[ChronicleDB]` lines around boot.
 
-Optional but recommended: ingest one short chat manually before turning on `autoIngest`, just to confirm the extraction pipeline works end-to-end with your LLM credentials. The "Build memory from all" button in the per-character memory panel is the simplest way to do this.
+</details>
 
 ### Schema bootstrap
 

@@ -266,7 +266,17 @@ Story arcs used to come from the extraction LLM naming them per batch, which pro
 4. **Prune and link.** Communities with fewer than `MIN_ARC_SIZE = 3` events are dropped. Survivors sort by their first member's `message_index` so arc IDs increment in chat order. For each surviving community the builder picks a spine event, computes a cluster-density proxy, and writes one `story_arcs` row plus one `arc_events` row per member. Parent/child relationships between the three hierarchy levels are written via `parent_arc_id`. The `source` column is set to `"structural"` on the rebuild, distinguishing these rows from any legacy per-batch LLM-named rows.
 5. **Optional LLM naming.** When `nameArcs: true` is passed (as `/ingest-chat` does), each cluster whose density meets `DEFAULT_ARC_NAMING_DENSITY_GATE = 1.5` gets a one-shot `extractor.nameStoryArc` call that takes the spine event plus the first 12 members in chronological order and returns a three-to-seven-word title plus a one-sentence description. Clusters below the density gate get a templated title derived from their spine event. Low-density clusters never blow LLM budget and still end up named.
 
-Retrieval reads level-1 arcs only via the `COALESCE(sa.hierarchy_level, 1) = 1` filter in `fetchArcExpansion`, so the hierarchy is backward compatible: legacy flat rows stay level 1 by default. Rationale and weight tuning history live in `RESEARCH_ARCS.md`.
+Retrieval walks the hierarchy as **event → arc → super-arc**. `fetchArcExpansion` restricts its primary arc-join to `COALESCE(sa.hierarchy_level, 1) = 1` so legacy flat rows stay level 1 by default, then LEFT-joins the parent level-0 row via `sa.parent_arc_id` and surfaces it as a breadcrumb. In the rendered `## Matched Event Passages` section each event hit produces up to three nested lines:
+
+```
+- [turn 260] <event source quote>
+  [super arc: <level-0 title — chat-scale beat>]
+  [arc: <level-1 title> (<status>) — <level-1 description>]
+  [arc prev pos 45] <preceding level-1 sibling summary>
+  [arc next pos 47] <following level-1 sibling summary>
+```
+
+The super-arc line is omitted when a hit's level-1 arc has no parent (either the chat is under `HIERARCHY_MIN_EVENTS` and hierarchy wasn't built, or the row is legacy pre-Path-5). Episodes (level 2) are still intentionally excluded from the default expansion — they exist in the schema for future sibling-walk extensions but the current renderer does not surface them. Templated super-arc titles of the form `"Super Arc: <spine event summary>"` render with the `"Super Arc: "` prefix stripped so the `[super arc: ...]` wrapper doesn't duplicate the label. Level-0 and level-2 titles are templated, not LLM-named — `extractor.nameStoryArc` only runs at level 1 today, so super-arc breadcrumbs are serviceable but ugly until you opt into LLM naming across the full hierarchy. Rationale and weight tuning history live in `RESEARCH_ARCS.md`.
 
 ### Lorebooks (ST World Info)
 

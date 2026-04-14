@@ -296,13 +296,15 @@ async function dialogueQuoteSearch(pool, chatIds, query, limit = 5) {
  * One event may belong to multiple arcs — picks the highest-importance
  * arc per event (first row per event after the ORDER BY).
  *
- * Path 5 hierarchy filter: restricts the arc-join to hierarchy_level=1
- * rows, which are the Path 1 "arc"-tier rows (plus any legacy pre-Path-5
- * rows, whose default hierarchy_level is 1). Super-arcs (level 0) and
- * episodes (level 2) are intentionally excluded from the default ±1
- * expansion path — see RESEARCH_ARCS.md §5 Path 5. Rows with NULL
- * hierarchy_level (should not exist after the ALTER but matched here
- * for forward-compat) are treated as level 1.
+ * Path 5 hierarchy walk: restricts the primary arc-join to
+ * hierarchy_level=1 rows (the "arc"-tier; legacy pre-Path-5 rows default
+ * to 1 too), then LEFT-joins the parent super-arc (level 0) via
+ * `sa.parent_arc_id` so retrieval can render a super-arc breadcrumb
+ * above the arc context. Episodes (level 2) are still excluded from
+ * the default expansion — the renderer surfaces event → arc →
+ * super-arc, not event → episode. Rows with NULL hierarchy_level
+ * (shouldn't exist after the ALTER but matched here for forward-compat)
+ * are treated as level 1.
  */
 async function fetchArcExpansion(pool, eventIds) {
   const result = new Map();
@@ -314,6 +316,8 @@ async function fetchArcExpansion(pool, eventIds) {
        sa.description AS arc_description,
        sa.status AS arc_status,
        sa.importance AS arc_importance,
+       super_sa.title AS super_arc_title,
+       super_sa.description AS super_arc_description,
        ae_hit.position AS hit_position,
        ae_neighbor.position AS neighbor_position,
        e_neighbor.summary AS neighbor_summary,
@@ -321,6 +325,9 @@ async function fetchArcExpansion(pool, eventIds) {
      FROM arc_events ae_hit
      JOIN story_arcs sa ON sa.id = ae_hit.arc_id
        AND COALESCE(sa.hierarchy_level, 1) = 1
+     LEFT JOIN story_arcs super_sa
+       ON super_sa.id = sa.parent_arc_id
+       AND super_sa.hierarchy_level = 0
      LEFT JOIN arc_events ae_neighbor
        ON ae_neighbor.arc_id = ae_hit.arc_id
        AND ae_neighbor.position IN (ae_hit.position - 1, ae_hit.position + 1)
@@ -336,6 +343,8 @@ async function fetchArcExpansion(pool, eventIds) {
         arcTitle: r.arc_title,
         arcDescription: r.arc_description || "",
         arcStatus: r.arc_status || "active",
+        superArcTitle: r.super_arc_title || null,
+        superArcDescription: r.super_arc_description || "",
         hitPosition: r.hit_position,
       };
       result.set(r.event_id, exp);
@@ -938,6 +947,20 @@ const SECTION_REGISTRY = [
           let out = `- ${turn}${(e.source_text || "").replace(/\s+/g, " ").slice(0, SECTION_LIMITS.eventBody)}`;
           const arc = r.arcExpansion && r.arcExpansion.get(e.id);
           if (arc) {
+            // Path 5 breadcrumb: if the level-1 arc has a level-0 parent
+            // super-arc, surface it above the arc line so the model sees
+            // the full hierarchy (event → arc → super-arc). Episodes
+            // (level 2) still aren't walked by default. Strip the
+            // redundant "Super Arc: " / "Arc: " template prefix that
+            // arc-builder.js writes for non-LLM-named rows — the
+            // "[super arc: ...]" wrapper already labels it.
+            if (arc.superArcTitle) {
+              const cleanTitle = arc.superArcTitle.replace(/^(Super Arc: |Arc: |Episode: )/, "");
+              const superDesc = arc.superArcDescription
+                ? ` — ${arc.superArcDescription.slice(0, SECTION_LIMITS.eventArcDesc)}`
+                : "";
+              out += `\n  [super arc: ${cleanTitle}${superDesc}]`;
+            }
             const desc = arc.arcDescription
               ? ` — ${arc.arcDescription.slice(0, SECTION_LIMITS.eventArcDesc)}`
               : "";

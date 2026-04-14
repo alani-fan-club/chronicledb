@@ -29,7 +29,11 @@ function getPool(settings) {
       database: settings.pgDatabase || "chronicledb",
       user: settings.pgUser || process.env.USER,
       password: settings.pgPassword || "",
-      max: 10,
+      // traverseFromCharacter fans out ~15 concurrent queries via Promise.all,
+      // and extractor.js runs parallel upsertTrait per character on top of it.
+      // max:10 was leaving the excess queries queued on the pool; 20 gives
+      // headroom so the common fan-out patterns run unthrottled.
+      max: 20,
     });
   }
   return pool;
@@ -739,7 +743,7 @@ async function getTraitsForCharacter(settings, characterId) {
 // If no trait has an embedding yet, AVG returns NULL and we reset the
 // character row's summary_embedding to NULL so the HNSW index doesn't
 // retain stale vectors after a trait purge.
-async function recomputeCharacterSummary(settings, characterId) {
+async function _recomputeCharacterSummaryImpl(settings, characterId) {
   const p = getPool(settings);
   const { rows } = await p.query(
     `SELECT AVG(embedding) AS avg_embedding
@@ -756,6 +760,36 @@ async function recomputeCharacterSummary(settings, characterId) {
     [characterId, avg],
   );
   return avg;
+}
+
+// Leading + trailing-edge debounce keyed by characterId. The extractor's
+// parallel upsertTrait means N concurrent trait writes for one character
+// would otherwise fire N concurrent AVG queries. Trailing-edge (rather than
+// simple coalesce) is load-bearing: the first run's AVG reads an MVCC
+// snapshot taken before late writers commit, so we need one more run after
+// completion to pick up anything the first run missed. Net: at most 2
+// recomputes per character per burst regardless of N.
+const summaryRecomputeState = new Map();
+
+async function recomputeCharacterSummary(settings, characterId) {
+  const existing = summaryRecomputeState.get(characterId);
+  if (existing) {
+    existing.dirty = true;
+    return existing.inFlight;
+  }
+  const state = { inFlight: null, dirty: false };
+  summaryRecomputeState.set(characterId, state);
+  state.inFlight = (async () => {
+    try {
+      do {
+        state.dirty = false;
+        await _recomputeCharacterSummaryImpl(settings, characterId);
+      } while (state.dirty);
+    } finally {
+      summaryRecomputeState.delete(characterId);
+    }
+  })();
+  return state.inFlight;
 }
 
 // ── Story arcs and event chains ────────────────────────────────

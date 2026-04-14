@@ -230,9 +230,59 @@ async function init(router) {
   const arcRebuildLastCount = new Map(); // chatId -> int
   const arcRebuildInFlight = new Set();  // chatId
 
+  // Per-(chatId, messageIndex) extract mutex. When two /extract calls
+  // land for the same message — typically because the user generated
+  // a swipe, then immediately swiped to regenerate before the first
+  // extract finished — they would otherwise race: the slower one's
+  // INSERTs land last and overwrite the faster one's, regardless of
+  // which is "current". This Map keys an in-flight Promise per
+  // (chatId, messageIndex) so the second call awaits the first to
+  // finish before running its own DELETE+INSERT cycle. Latest writer
+  // (in completion order) wins, which because of the swipe-cleanup
+  // hook always corresponds to the user's currently-active swipe.
+  const extractMutex = new Map(); // key: `${chatId}::${messageIndex}` -> Promise
+
   router.post("/extract", async (req, res) => {
+    const { characterName, userName, messages, chatId, messageIndex } = req.body;
+    const mutexKey = chatId && typeof messageIndex === "number"
+      ? `${chatId}::${messageIndex}`
+      : null;
+    // Wait for any in-flight extract on the same message to finish so
+    // we serialize concurrent writers for the same (chatId, msgIdx).
+    // The key is intentionally per-message: parallel extracts for
+    // different messages still run concurrently.
+    if (mutexKey && extractMutex.has(mutexKey)) {
+      try { await extractMutex.get(mutexKey); } catch { /* prior call's error is its own */ }
+    }
+    let release;
+    if (mutexKey) {
+      const p = new Promise((resolve) => { release = resolve; });
+      extractMutex.set(mutexKey, p);
+    }
     try {
-      const { characterName, userName, messages, chatId, messageIndex } = req.body;
+      // 0. Idempotent: if a previous extract wrote rows for this exact
+      //    (chatId, messageIndex), wipe them before re-extracting. Keeps
+      //    the live path's per-message extraction overwrite-clean even
+      //    when the swipe-cleanup hook hasn't fired yet (or fired late).
+      //    /ingest-chat keeps its own drop-and-rebuild semantics so
+      //    bulk ingests are unaffected.
+      if (mutexKey) {
+        try {
+          const pool = db.getPool(settings);
+          await pool.query(
+            `DELETE FROM participated_in
+             WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
+            [chatId, messageIndex],
+          );
+          await pool.query(`DELETE FROM events           WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await pool.query(`DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await pool.query(`DELETE FROM dialogue_quotes  WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await pool.query(`DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await pool.query(`DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2`, [chatId, messageIndex]);
+        } catch (err) {
+          console.warn(`[ChronicleDB] /extract idempotent pre-clean failed (${err.message}); proceeding anyway`);
+        }
+      }
 
       // 1. Extract structured data from messages.
       const extraction = await extract(settings, { characterName, userName, messages });
@@ -321,6 +371,18 @@ async function init(router) {
       if (!res.headersSent) {
         res.status(500).json({ error: err.message });
       }
+    } finally {
+      // Release the per-message mutex so the next /extract for the same
+      // (chatId, messageIndex) can proceed. Done in `finally` so failures,
+      // background-rebuild errors, and the success path all release.
+      if (mutexKey) {
+        try {
+          if (release) release();
+          // Only delete the entry if it still points at our promise — if a
+          // newer call has already taken over, leave its entry alone.
+          if (extractMutex.get(mutexKey) && release) extractMutex.delete(mutexKey);
+        } catch (_) { /* never block the request on cleanup */ }
+      }
     }
   });
 
@@ -376,6 +438,15 @@ async function init(router) {
         `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
         [chatId, messageIndex],
       );
+      // Trait cleanup: traits now carry source_message_index (added in the
+      // schema migration that introduced this column). Rows pre-dating the
+      // column have NULL and are intentionally skipped — we don't know
+      // which message they came from. Future swipes on the same message
+      // clean up cleanly because new traits are tagged at write time.
+      const traitRes = await pool.query(
+        `DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      );
       res.json({
         ok: true,
         deleted: {
@@ -383,6 +454,7 @@ async function init(router) {
           memory_embeddings: memRes.rowCount,
           dialogue_quotes: quoteRes.rowCount,
           context_snapshots: snapRes.rowCount,
+          traits: traitRes.rowCount,
         },
       });
     } catch (err) {

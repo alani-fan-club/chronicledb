@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS traits (
     content      TEXT NOT NULL,
     confidence   REAL DEFAULT 0.8,
     source_chat  TEXT,
+    source_message_index INT,
     created_at   TIMESTAMPTZ DEFAULT NOW(),
     verified_at  TIMESTAMPTZ,
     embedding    vector(768),
@@ -298,6 +299,18 @@ ALTER TABLE traits ADD COLUMN IF NOT EXISTS merged_count INT DEFAULT 1;
 -- verifier evaluates a candidate against this canonical, regardless of
 -- the MERGE / KEEP_DISTINCT / REJECT_NEW outcome. Observability signal.
 ALTER TABLE traits ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+-- Swipe cleanup support: pin every trait to the (chat_id, message_index)
+-- it was extracted from so /clear-message-extractions can remove the
+-- right rows when a user swipes to regenerate a reply. Without this
+-- column, swipe cleanup leaks traits — the four message-indexed tables
+-- (events, memory_embeddings, dialogue_quotes, context_snapshots) clean
+-- up surgically, but trait rows from a discarded swipe linger.
+-- Nullable: pre-existing rows have NULL and are not affected by swipe
+-- cleanup (we don't know which message they came from).
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS source_message_index INT;
+CREATE INDEX IF NOT EXISTS idx_traits_source_msg
+  ON traits (source_chat, source_message_index)
+  WHERE source_message_index IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
 CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);

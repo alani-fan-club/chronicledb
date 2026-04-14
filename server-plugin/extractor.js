@@ -906,6 +906,8 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         // `${name} is ${content}: ${evidence_sentence}`. When the prompt
         // didn't emit an evidence sentence (older prompts, or the LLM
         // omitted it), upsertTrait falls back to `${name} is ${content}`.
+        // sourceMessageIndex pins this trait to the message it came from
+        // so /clear-message-extractions can clean it up on swipe.
         await db.upsertTrait(settings, {
           characterId: charId,
           characterName: char.name,
@@ -913,6 +915,7 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
           content: trait.content,
           evidenceSentence: trait.evidence_sentence || "",
           sourceChat: safeChat,
+          sourceMessageIndex: msgIdx,
         });
       }
     }
@@ -924,6 +927,7 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         category: "personality",
         content: fact,
         sourceChat: safeChat,
+        sourceMessageIndex: msgIdx,
       });
     }
   }

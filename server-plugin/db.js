@@ -406,7 +406,7 @@ const traitVerifyCache = new Map();
 
 async function upsertTrait(
   settings,
-  { characterId, characterName, category, content, evidenceSentence, sourceChat },
+  { characterId, characterName, category, content, evidenceSentence, sourceChat, sourceMessageIndex },
 ) {
   const p = getPool(settings);
   if (!content || !String(content).trim()) return null;
@@ -550,10 +550,11 @@ async function upsertTrait(
       console.warn(`[ChronicleDB] trait merge UPDATE failed (${err.message})`);
     }
     const mergedId = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const msgIdxParam = Number.isFinite(sourceMessageIndex) ? sourceMessageIndex : null;
     try {
       await p.query(
-        `INSERT INTO traits (id, character_id, category, content, source_chat, embedding, evidence_sentence, canonical_id)
-         VALUES ($1, $2, $3, $4, $5, $6::vector, $7, $8)
+        `INSERT INTO traits (id, character_id, category, content, source_chat, source_message_index, embedding, evidence_sentence, canonical_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8, $9)
          ON CONFLICT (character_id, category, normalized_content) DO NOTHING`,
         [
           mergedId,
@@ -561,6 +562,7 @@ async function upsertTrait(
           cat,
           cleaned,
           sourceChat || "",
+          msgIdxParam,
           embedding ? JSON.stringify(embedding) : null,
           evidence || null,
           topHit.id,
@@ -644,9 +646,10 @@ async function upsertTrait(
   // if we have one, canonical_id = NULL. The existing exact-normalized
   // ON CONFLICT remains as a safety net against races/case variants.
   const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const newCanonMsgIdx = Number.isFinite(sourceMessageIndex) ? sourceMessageIndex : null;
   const { rows: inserted } = await p.query(
-    `INSERT INTO traits (id, character_id, category, content, source_chat, embedding, evidence_sentence)
-     VALUES ($1, $2, $3, $4, $5, $6::vector, $7)
+    `INSERT INTO traits (id, character_id, category, content, source_chat, source_message_index, embedding, evidence_sentence)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8)
      ON CONFLICT (character_id, category, normalized_content) DO NOTHING
      RETURNING id`,
     [
@@ -655,6 +658,7 @@ async function upsertTrait(
       cat,
       cleaned,
       sourceChat || "",
+      newCanonMsgIdx,
       embedding ? JSON.stringify(embedding) : null,
       evidence || null,
     ],

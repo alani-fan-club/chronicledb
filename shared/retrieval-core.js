@@ -98,20 +98,23 @@ async function getMaxMessageIndex(pool, chatIds) {
 }
 
 /**
- * Vector similarity search on memory_embeddings, scoped to chatIds.
- * Returns the top-K most-similar content snippets. Uses pgvector <=> op
- * on the HNSW index. COALESCE on raw_text falls back to content for
+ * Vector similarity search on memory_embeddings, scoped to chatIds
+ * PLUS any globally-ingested lorebook chunks. Lorebook entries live
+ * under synthetic chat_id `"lorebook:<name>"` — they are world-info
+ * facts and belong in retrieval regardless of which chat is active,
+ * which is why the filter OR-matches the `lorebook:%` pattern alongside
+ * the scoped chat list. COALESCE on raw_text falls back to content for
  * rows predating the raw_text column.
  */
 async function vectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
   const ids = normalizeChatIds(chatIds);
   if (!ids) return [];
   const { rows } = await pool.query(
-    `SELECT id, content, COALESCE(raw_text, content) as raw_text,
-            context_prefix, message_index,
+    `SELECT id, chat_id, content, COALESCE(raw_text, content) as raw_text,
+            context_prefix, message_index, node_type,
             1 - (embedding <=> $1::vector) as similarity
      FROM memory_embeddings
-     WHERE chat_id = ANY($2::text[])
+     WHERE (chat_id = ANY($2::text[]) OR chat_id LIKE 'lorebook:%')
      ORDER BY embedding <=> $1::vector
      LIMIT $3`,
     [JSON.stringify(queryEmbedding), ids, limit],
@@ -125,6 +128,9 @@ async function vectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
  * change from REVIEW §2a. ts_headline extracts a fragment centered on
  * matching terms, which is materially better than slicing the first N
  * chars of raw_text.
+ *
+ * Same lorebook-scope extension as vectorSearch: globally-ingested
+ * world-info entries surface here too regardless of active chat.
  */
 async function lexicalSearch(pool, chatIds, query, limit = 5) {
   const ids = normalizeChatIds(chatIds);
@@ -132,14 +138,14 @@ async function lexicalSearch(pool, chatIds, query, limit = 5) {
   const tsquery = buildOrTsquery(query);
   if (!tsquery) return [];
   const { rows } = await pool.query(
-    `SELECT id, content, context_prefix, message_index,
+    `SELECT id, chat_id, content, context_prefix, message_index, node_type,
             ts_headline('english',
                         COALESCE(raw_text, content),
                         to_tsquery('english', $1),
                         'MaxWords=150, MinWords=30, MaxFragments=5, FragmentDelimiter=" ... "') as raw_text,
             ts_rank(tsv, to_tsquery('english', $1)) as rank
      FROM memory_embeddings
-     WHERE chat_id = ANY($2::text[])
+     WHERE (chat_id = ANY($2::text[]) OR chat_id LIKE 'lorebook:%')
        AND tsv @@ to_tsquery('english', $1)
      ORDER BY rank DESC
      LIMIT $3`,

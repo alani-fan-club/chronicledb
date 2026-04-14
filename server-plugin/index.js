@@ -222,6 +222,14 @@ async function init(router) {
   // ── Extraction endpoint ──────────────────────────────────────
   // Called by UI ext after GENERATION_ENDED (async, non-blocking)
 
+  // Per-chat state for the incremental arc-rebuild trigger. Tracks the
+  // event_count value as of the last rebuild and a mutex so concurrent
+  // /extract calls for the same chat can't double-rebuild.
+  // Resets on plugin restart, which is fine — the worst case is the very
+  // first /extract after restart waits a few extra messages to fire.
+  const arcRebuildLastCount = new Map(); // chatId -> int
+  const arcRebuildInFlight = new Set();  // chatId
+
   router.post("/extract", async (req, res) => {
     try {
       const { characterName, userName, messages, chatId, messageIndex } = req.body;
@@ -258,10 +266,61 @@ async function init(router) {
         ctxWindow,
       });
 
+      // Respond to ST immediately — arc rebuild fires async below.
       res.json({ ok: true, extraction });
+
+      // 4. Periodic arc rebuild on the auto-ingest path. Fire ~every N
+      //    new events (default 30, settings.arcRebuildEveryN). Skipped
+      //    when the setting is 0, when chatId is missing, when a previous
+      //    rebuild for the same chat is still in flight, or when the
+      //    chat hasn't accumulated enough new events since the last
+      //    rebuild. Recycled-title snapshot in arc-builder.js means the
+      //    typical incremental rebuild only LLM-names new clusters
+      //    (usually 0-3) instead of all 35, so cost stays bounded.
+      const rebuildEveryN = Number(settings.arcRebuildEveryN ?? 30);
+      if (rebuildEveryN > 0 && chatId && !arcRebuildInFlight.has(chatId)) {
+        try {
+          const pool = db.getPool(settings);
+          const { rows: [{ n }] } = await pool.query(
+            `SELECT COUNT(*)::int AS n FROM events WHERE chat_id = $1`,
+            [chatId],
+          );
+          const lastN = arcRebuildLastCount.get(chatId) || 0;
+          if (n - lastN >= rebuildEveryN) {
+            arcRebuildInFlight.add(chatId);
+            arcRebuildLastCount.set(chatId, n);
+            // Fire and forget — no await. Errors go to the log only.
+            (async () => {
+              try {
+                const { rebuildArcsForChat } = require("./arc-builder");
+                const r = await rebuildArcsForChat(settings, chatId, {
+                  nameArcs: true, nameHierarchy: true,
+                });
+                console.log(
+                  `[ChronicleDB] Incremental arc rebuild for ${chatId}: ` +
+                  `${r.builtArcs} arcs (${r.namedArcs ?? 0} new LLM-named, ${r.recycledArcs ?? 0} recycled), ` +
+                  `${r.superArcs} super (${r.namedSuperArcs ?? 0} new, ${r.recycledSuperArcs ?? 0} recycled), ` +
+                  `${r.episodes} episodes (${r.namedEpisodes ?? 0} new, ${r.recycledEpisodes ?? 0} recycled), ` +
+                  `Q=${(r.modularityQ ?? 0).toFixed(3)}, N=${r.totalEvents}`,
+                );
+              } catch (err) {
+                console.warn(`[ChronicleDB] Incremental arc rebuild failed for ${chatId}: ${err.message}`);
+              } finally {
+                arcRebuildInFlight.delete(chatId);
+              }
+            })();
+          }
+        } catch (err) {
+          // Counting query failed — log and continue, don't break ingest
+          console.warn(`[ChronicleDB] Arc-rebuild counter check failed: ${err.message}`);
+        }
+      }
     } catch (err) {
       console.error("[ChronicleDB] Extraction error:", err);
-      res.status(500).json({ error: err.message });
+      // res.json may have already been sent if we got past step 3 — guard.
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+      }
     }
   });
 

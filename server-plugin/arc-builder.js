@@ -557,14 +557,66 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
   let extractor = null;
   if (willName) extractor = require("./extractor");
 
-  // Inner helper: name one cluster pass. Returns {named, templated}.
-  // Closure captures: extractor, densityGate, protagonistName, settings.
+  // Snapshot existing arc titles by (hierarchy_level, spine_event_id) so
+  // incremental rebuilds can recycle LLM-generated names whose centerpiece
+  // event survived the new clustering. Only rows whose title is NOT a
+  // templated "Arc: ... " / "Super Arc: ... " / "Episode: ..." are worth
+  // recycling — templated titles are free to regenerate. This is the
+  // critical optimization that makes /extract-fired incremental rebuilds
+  // cost ~0 LLM calls instead of ~35 per fire: most spines survive a
+  // 30-message extension, so most clusters reuse their existing title.
+  const recycledTitleMap = new Map(); // key: `${level}::${spine_event_id}` -> {title, description}
+  if (willName) {
+    try {
+      const { rows: existingArcs } = await p.query(
+        `SELECT spine_event_id, title, description, hierarchy_level
+         FROM story_arcs
+         WHERE chat_id = $1
+           AND spine_event_id IS NOT NULL
+           AND title NOT LIKE 'Arc: %'
+           AND title NOT LIKE 'Super Arc: %'
+           AND title NOT LIKE 'Episode: %'`,
+        [chatId],
+      );
+      for (const row of existingArcs) {
+        const level = Number.isFinite(row.hierarchy_level) ? row.hierarchy_level : 1;
+        recycledTitleMap.set(`${level}::${row.spine_event_id}`, {
+          title: row.title,
+          description: row.description || "",
+        });
+      }
+    } catch (err) {
+      console.warn(`[ChronicleDB] Title-recycle snapshot failed (will regenerate everything): ${err.message}`);
+    }
+  }
+  const KIND_TO_LEVEL = { "super arc": 0, "arc": 1, "episode": 2 };
+
+  // Inner helper: name one cluster pass. Returns {named, recycled, templated}.
+  // Closure captures: extractor, densityGate, protagonistName, settings,
+  // recycledTitleMap.
   async function nameClusterPass(clusters, kind) {
-    let n = 0, t = 0;
+    const level = KIND_TO_LEVEL[kind] ?? 1;
+    let n = 0, t = 0, r = 0;
     for (const arc of clusters) {
       if (!(arc.density >= densityGate)) {
         t++;
         continue;
+      }
+      // Title recycling: if the spine event of this cluster was the spine
+      // of an existing LLM-named cluster at the same level, reuse its
+      // title and description rather than firing a fresh LLM call. This
+      // is the entire point of the snapshot above — incremental rebuilds
+      // converge to ~0 incremental LLM calls because spine events are
+      // stable across small chat extensions.
+      const spineId = arc.spine?.id;
+      if (spineId) {
+        const recycled = recycledTitleMap.get(`${level}::${spineId}`);
+        if (recycled) {
+          arc.title = recycled.title;
+          arc.description = recycled.description;
+          r++;
+          continue;
+        }
       }
       try {
         const memberEvents = arc.members.slice(0, 12).map((m) => ({
@@ -588,12 +640,14 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
         t++;
       }
     }
-    return { named: n, templated: t };
+    return { named: n, recycled: r, templated: t };
   }
 
+  let recycledArcs = 0, recycledSuperArcs = 0, recycledEpisodes = 0;
   if (nameArcs && enrichedArcs.length > 0) {
     const r = await nameClusterPass(enrichedArcs, "arc");
     namedArcs = r.named;
+    recycledArcs = r.recycled;
     templatedArcs = r.templated;
   } else {
     templatedArcs = enrichedArcs.length;
@@ -602,6 +656,7 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
   if (nameHierarchy && enrichedSuperArcs.length > 0) {
     const r = await nameClusterPass(enrichedSuperArcs, "super arc");
     namedSuperArcs = r.named;
+    recycledSuperArcs = r.recycled;
     templatedSuperArcs = r.templated;
   } else {
     templatedSuperArcs = enrichedSuperArcs.length;
@@ -610,6 +665,7 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
   if (nameHierarchy && enrichedEpisodes.length > 0) {
     const r = await nameClusterPass(enrichedEpisodes, "episode");
     namedEpisodes = r.named;
+    recycledEpisodes = r.recycled;
     templatedEpisodes = r.templated;
   } else {
     templatedEpisodes = enrichedEpisodes.length;
@@ -767,14 +823,17 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     totalEvents: events.length,
     modularityQ,
     namedArcs,
+    recycledArcs,
     templatedArcs,
     superArcs: enrichedSuperArcs.length,
     episodes: enrichedEpisodes.length,
     modularityQSuper,
     modularityQEpisodes,
     namedSuperArcs,
+    recycledSuperArcs,
     templatedSuperArcs,
     namedEpisodes,
+    recycledEpisodes,
     templatedEpisodes,
   };
 }

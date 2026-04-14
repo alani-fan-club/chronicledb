@@ -146,6 +146,11 @@
           <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="8000" placeholder="3000">
         </div>
       </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_arcRebuildEveryN">Refresh story arcs every N events:</label>
+        <input type="number" id="chronicle_arcRebuildEveryN" class="text_pole" min="0" max="200" placeholder="30">
+        <p class="chronicle-hint">Recomputes the story-arc structure (super-arcs / arcs / episodes) on the auto-ingest path every N new events. Cluster titles are recycled when their centerpiece event is unchanged, so the per-fire LLM cost is near zero on stable partitions. 0 disables — only the manual full-chat ingest will rebuild arcs.</p>
+      </div>
 
       <!-- Memory type toggles -->
       <h4>What to remember</h4>

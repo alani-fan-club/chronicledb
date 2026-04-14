@@ -46,6 +46,12 @@ const DEFAULT_SETTINGS = {
   embeddingApiUrl: "",
   embeddingModel: "",
   embeddingDimension: 768,
+  // Path 5+: incremental arc rebuild on the auto-ingest path. Every N new
+  // events for a chat triggers a non-blocking rebuildArcsForChat() in the
+  // background. The recycled-title snapshot in arc-builder keeps the LLM
+  // cost ~0 per fire on stable partitions (only brand-new clusters get
+  // named). 0 disables incremental rebuild entirely.
+  arcRebuildEveryN: 30,
   extractEveryN: 1,
   // When true, extraction fires automatically after every generation so
   // memory builds live as you chat. When false, only the manual "Ingest"
@@ -329,6 +335,11 @@ function bindSettings(settings) {
   });
 
   // Numeric settings
+  $("#chronicle_arcRebuildEveryN").val(settings.arcRebuildEveryN ?? 30).on("input", function () {
+    const v = parseInt($(this).val());
+    settings.arcRebuildEveryN = Number.isFinite(v) && v >= 0 ? v : 30;
+    saveAndSync(settings);
+  });
   $("#chronicle_extractEveryN").val(settings.extractEveryN).on("input", function () {
     settings.extractEveryN = parseInt($(this).val()) || 1;
     saveAndSync(settings);

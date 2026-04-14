@@ -17,6 +17,27 @@ const { ingestLorebook, listLorebooks } = require("./lorebook");
 const { resolveStDataRoot } = require("./st-paths");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { resolve: pathResolve, dirname: pathDirname } = require("path");
+const { resolve: pathResolveAbs, sep: pathSep } = require("path");
+
+// Path-traversal guard: verify that a user-supplied filename, when joined to
+// `baseDir`, stays inside `baseDir`. Rejects obvious traversal tokens upfront
+// and then confirms the resolved absolute path is a descendant of the
+// resolved absolute base. Throws on any violation; callers catch and return
+// 400 to the HTTP surface.
+function safeResolveUnder(baseDir, userPath) {
+  if (typeof userPath !== "string" || userPath.length === 0) {
+    throw new Error("filename required");
+  }
+  if (userPath.includes("..") || userPath.includes("\0") || userPath.includes("/") || userPath.includes("\\")) {
+    throw new Error(`unsafe filename: "${userPath}"`);
+  }
+  const absBase = pathResolveAbs(baseDir);
+  const absFinal = pathResolveAbs(absBase, userPath);
+  if (!absFinal.startsWith(absBase + pathSep) && absFinal !== absBase) {
+    throw new Error(`path traversal blocked: "${userPath}" resolved outside "${absBase}"`);
+  }
+  return absFinal;
+}
 
 let settings = {};
 // Tracks live DB state so /status can report it without touching the pool.
@@ -230,6 +251,23 @@ async function init(router) {
   const arcRebuildLastCount = new Map(); // chatId -> int
   const arcRebuildInFlight = new Set();  // chatId
 
+  // Bounded eviction. Both maps accumulate one entry per chat_id forever,
+  // so a long-running ST process with many chats grows unboundedly. Cap at
+  // 200 entries and evict the oldest (Map preserves insertion order, so
+  // `keys().next().value` is the least-recently-inserted). Use this wrapper
+  // instead of `arcRebuildLastCount.set(chatId, n)` directly.
+  function setArcRebuildCount(chatId, n) {
+    const MAX = 200;
+    if (arcRebuildLastCount.size >= MAX && !arcRebuildLastCount.has(chatId)) {
+      const first = arcRebuildLastCount.keys().next().value;
+      arcRebuildLastCount.delete(first);
+      // Set.delete(value) is a no-op if the value isn't present, so this is
+      // safe even when the evicted chat has no in-flight rebuild.
+      arcRebuildInFlight.delete(first);
+    }
+    arcRebuildLastCount.set(chatId, n);
+  }
+
   // Per-(chatId, messageIndex) extract mutex. When two /extract calls
   // land for the same message — typically because the user generated
   // a swipe, then immediately swiped to regenerate before the first
@@ -255,9 +293,10 @@ async function init(router) {
       try { await extractMutex.get(mutexKey); } catch { /* prior call's error is its own */ }
     }
     let release;
+    let myPromise = null;
     if (mutexKey) {
-      const p = new Promise((resolve) => { release = resolve; });
-      extractMutex.set(mutexKey, p);
+      myPromise = new Promise((resolve) => { release = resolve; });
+      extractMutex.set(mutexKey, myPromise);
     }
     try {
       // 0. Idempotent: if a previous extract wrote rows for this exact
@@ -338,7 +377,7 @@ async function init(router) {
           const lastN = arcRebuildLastCount.get(chatId) || 0;
           if (n - lastN >= rebuildEveryN) {
             arcRebuildInFlight.add(chatId);
-            arcRebuildLastCount.set(chatId, n);
+            setArcRebuildCount(chatId, n);
             // Fire and forget — no await. Errors go to the log only.
             (async () => {
               try {
@@ -378,9 +417,16 @@ async function init(router) {
       if (mutexKey) {
         try {
           if (release) release();
-          // Only delete the entry if it still points at our promise — if a
-          // newer call has already taken over, leave its entry alone.
-          if (extractMutex.get(mutexKey) && release) extractMutex.delete(mutexKey);
+          // Only delete the entry if it is *identically* our own promise.
+          // The previous check (`extractMutex.get(mutexKey) && release`)
+          // was always true when `release` was truthy, so a stale finally
+          // could delete a newer call's in-flight promise, causing a
+          // third call to skip the mutex entirely and race. Identity
+          // compare to `myPromise` so newer calls keep their own entries
+          // and clean up in their own finally.
+          if (extractMutex.get(mutexKey) === myPromise) {
+            extractMutex.delete(mutexKey);
+          }
         } catch (_) { /* never block the request on cleanup */ }
       }
     }
@@ -599,9 +645,21 @@ async function init(router) {
       if (!characterName || !filename) {
         return res.status(400).json({ error: "characterName and filename required" });
       }
+      // Reject traversal-y characterName up front. The directory-picking
+      // logic below uses a fuzzy `startsWith` match on `characterName`, so
+      // feeding it `../../../../etc` would otherwise try to resolve
+      // outside `chatsBase`. Blocking the raw input is the simplest gate.
+      if (typeof characterName !== "string"
+          || characterName.length === 0
+          || characterName.includes("..")
+          || characterName.includes("\0")
+          || characterName.includes("/")
+          || characterName.includes("\\")) {
+        return res.status(400).json({ error: `unsafe characterName: "${characterName}"` });
+      }
 
       const { readFileSync } = require("fs");
-      const { resolve, join } = require("path");
+      const { resolve } = require("path");
 
       const dataRoot = resolveStDataRoot(settings);
       const chatsBase = resolve(dataRoot, "chats");
@@ -612,7 +670,19 @@ async function init(router) {
       const matchingDir = entries.find((e) => e === characterName || e.startsWith(characterName));
       if (!matchingDir) return res.status(404).json({ error: "Character chat dir not found" });
 
-      const filePath = join(chatsBase, matchingDir, filename);
+      // Re-verify the selected directory actually lives under chatsBase
+      // (readdirSync can't normally return traversal entries, but this is
+      // defense-in-depth against a compromised ST data dir or a follower
+      // symlink). Then resolve the chat JSONL filename safely under that
+      // directory so `filename` can't escape either.
+      let matchedDir;
+      let filePath;
+      try {
+        matchedDir = safeResolveUnder(chatsBase, matchingDir);
+        filePath = safeResolveUnder(matchedDir, filename);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
       const raw = readFileSync(filePath, "utf-8");
       const lines = raw.split("\n").filter((l) => l.trim());
       if (lines.length === 0) return res.status(400).json({ error: "Empty chat file" });
@@ -760,6 +830,15 @@ async function init(router) {
       const result = await ingestLorebook(settings, filename, embed);
       res.json(result);
     } catch (err) {
+      // ingestLorebook() throws validation errors from the path-traversal
+      // guard with recognizable prefixes. Map those to 400; anything else
+      // is a real server failure and returns 500.
+      const msg = err.message || "";
+      if (msg.startsWith("unsafe filename:")
+          || msg.startsWith("path traversal blocked:")
+          || msg === "filename required") {
+        return res.status(400).json({ error: msg });
+      }
       console.error("[ChronicleDB] Lorebook ingest error:", err);
       res.status(500).json({ error: err.message });
     }
@@ -798,6 +877,16 @@ async function init(router) {
       const chatIds = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
         ? req.query.chat_id.split(",").map((s) => s.trim()).filter(Boolean)
         : null;
+
+      // Hard-reject global scope with no chat filter. Without this the user
+      // gets an empty payload from the db-level guard and has no idea why.
+      // The db.getGraphData guard stays in place as defense-in-depth.
+      if (scope === "global" && (!chatIds || chatIds.length === 0)) {
+        return res.status(400).json({
+          error: "scope=global requires a chat_id query parameter to avoid unbounded payloads. Pass ?chat_id=... or use scope=character.",
+        });
+      }
+
       let data;
 
       if (scope === "character" && req.query.character) {
@@ -992,10 +1081,19 @@ async function init(router) {
   // Proxy character PNGs so the mind map page can access them
   router.get("/character-image/:filename", async (req, res) => {
     try {
-      const { resolve, join } = require("path");
+      const { resolve } = require("path");
       const { createReadStream, existsSync } = require("fs");
       const dataRoot = resolveStDataRoot(settings);
-      const imgPath = join(resolve(dataRoot, "characters"), req.params.filename);
+      const charsDir = resolve(dataRoot, "characters");
+      let imgPath;
+      try {
+        // Reject `..`, forward/back slashes, NUL bytes up front, and
+        // confirm the resolved path stays under `charsDir`. A request for
+        // `../../etc/passwd` throws here and becomes a 400.
+        imgPath = safeResolveUnder(charsDir, req.params.filename);
+      } catch (e) {
+        return res.status(400).json({ error: e.message });
+      }
       if (!existsSync(imgPath)) return res.status(404).send("Not found");
       res.setHeader("Content-Type", "image/png");
       createReadStream(imgPath).pipe(res);

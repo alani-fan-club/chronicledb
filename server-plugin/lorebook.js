@@ -5,8 +5,29 @@
 
 const { readFileSync, readdirSync } = require("fs");
 const { join, resolve, basename } = require("path");
+const { resolve: pathResolveAbs, sep: pathSep } = require("path");
 const db = require("./db");
 const { resolveStDataRoot } = require("./st-paths");
+
+// Path-traversal guard: verify that a user-supplied filename, when joined to
+// `baseDir`, stays inside `baseDir`. Rejects obvious traversal tokens upfront
+// and then confirms the resolved absolute path is a descendant of the
+// resolved absolute base. Throws on any violation; callers catch and return
+// 400 to the HTTP surface.
+function safeResolveUnder(baseDir, userPath) {
+  if (typeof userPath !== "string" || userPath.length === 0) {
+    throw new Error("filename required");
+  }
+  if (userPath.includes("..") || userPath.includes("\0") || userPath.includes("/") || userPath.includes("\\")) {
+    throw new Error(`unsafe filename: "${userPath}"`);
+  }
+  const absBase = pathResolveAbs(baseDir);
+  const absFinal = pathResolveAbs(absBase, userPath);
+  if (!absFinal.startsWith(absBase + pathSep) && absFinal !== absBase) {
+    throw new Error(`path traversal blocked: "${userPath}" resolved outside "${absBase}"`);
+  }
+  return absFinal;
+}
 
 /**
  * List available lorebooks from the ST worlds directory.
@@ -38,7 +59,9 @@ function listLorebooks(settings) {
  */
 async function ingestLorebook(settings, filename, embedFn) {
   const dataRoot = resolveStDataRoot(settings);
-  const filePath = resolve(dataRoot, "worlds", filename);
+  const worldsDir = resolve(dataRoot, "worlds");
+  // Reject traversal-y filenames up front with a clear 400-worthy error.
+  const filePath = safeResolveUnder(worldsDir, filename);
   const raw = readFileSync(filePath, "utf-8");
   const lorebook = JSON.parse(raw);
 
@@ -47,6 +70,26 @@ async function ingestLorebook(settings, filename, embedFn) {
   let ingested = 0;
   let skipped = 0;
 
+  // Drop any previous embeddings for this lorebook so re-ingesting doesn't
+  // duplicate every row. storeEmbedding is insert-only (db.js is out of
+  // scope for this agent), so we switch to upsertMemoryEmbedding below AND
+  // hard-delete any pre-existing rows for this chat_id as belt-and-braces
+  // for the case where a previous ingest used storeEmbedding and left
+  // duplicated rows behind.
+  try {
+    const pool = db.getPool(settings);
+    await pool.query(
+      `DELETE FROM memory_embeddings WHERE chat_id = $1`,
+      [`lorebook:${lorebookName}`],
+    );
+  } catch (err) {
+    console.warn(`[ChronicleDB] Failed to pre-clean lorebook embeddings for ${lorebookName}:`, err.message);
+  }
+
+  // First pass: graph node writes (Fact / Character / Location) and collect
+  // the entries we need to embed. Embeddings are then computed in parallel
+  // batches to avoid the serial per-entry latency.
+  const embedQueue = [];
   for (const [uid, entry] of Object.entries(entries)) {
     if (entry.disable) {
       skipped++;
@@ -94,23 +137,42 @@ async function ingestLorebook(settings, filename, embedFn) {
       await db.upsertLocation(settings, locMatch, cleanContent.slice(0, 500));
     }
 
-    // Embed the content for vector search
-    try {
-      const embedding = await embedFn(settings, cleanContent.slice(0, 4000));
-      await db.storeEmbedding(settings, {
-        chatId: `lorebook:${lorebookName}`,
-        nodeType: "lore",
-        nodeId: factId,
-        content: `[${comment || keys.join(", ")}] ${cleanContent.slice(0, 1000)}`,
-        embedding,
-        characterScope: [], // global lore
-        messageIndex: null,
-      });
-    } catch (err) {
-      console.warn(`[ChronicleDB] Failed to embed lore entry ${uid}:`, err.message);
-    }
-
+    embedQueue.push({ uid, factId, comment, keys, cleanContent });
     ingested++;
+  }
+
+  // Second pass: embed in parallel batches. We can't use the extractor's
+  // embedBatch helper (cross-module, out of this agent's scope to modify),
+  // so Promise.all over a batch of N per-entry embedFn calls is the right
+  // shape. Batch size 20 bounds peak concurrency so free-tier embedders
+  // don't rate-limit the whole ingest.
+  const BATCH = 20;
+  for (let i = 0; i < embedQueue.length; i += BATCH) {
+    const batch = embedQueue.slice(i, i + BATCH);
+    const results = await Promise.allSettled(
+      batch.map((item) => embedFn(settings, item.cleanContent.slice(0, 4000))),
+    );
+    for (let k = 0; k < batch.length; k++) {
+      const item = batch[k];
+      const r = results[k];
+      if (r.status !== "fulfilled") {
+        console.warn(`[ChronicleDB] Failed to embed lore entry ${item.uid}:`, r.reason?.message);
+        continue;
+      }
+      try {
+        await db.upsertMemoryEmbedding(settings, {
+          chatId: `lorebook:${lorebookName}`,
+          nodeType: "lore",
+          nodeId: item.factId,
+          content: `[${item.comment || item.keys.join(", ")}] ${item.cleanContent.slice(0, 1000)}`,
+          embedding: r.value,
+          characterScope: [], // global lore
+          messageIndex: null,
+        });
+      } catch (err) {
+        console.warn(`[ChronicleDB] Failed to store lore embedding ${item.uid}:`, err.message);
+      }
+    }
   }
 
   return {

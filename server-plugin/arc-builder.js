@@ -511,21 +511,26 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     };
   }
 
-  // 6. Path 4: LLM arc naming at hierarchy_level=1 only. Opt-in via
-  //    opts.nameArcs. Gated on cluster density so incoherent communities
-  //    fall back to the template. We resolve the chat's protagonist once
-  //    here (character with the most participated_in edges across this
-  //    chat's events) and share it for all naming calls. `"the protagonist"`
-  //    is the fallback when the chat has no participated_in rows.
-  //
-  //    Super-arc (level 0) and episode (level 2) titles stay templated in
-  //    this tick regardless of opts.nameArcs — see nameHierarchy caveat in
-  //    the JSDoc. Wiring nameHierarchy through requires a different prompt
-  //    (the nameStoryArc prompt assumes a mid-grain narrative container).
+  // 6. Path 4 + 5: LLM naming for arcs (level 1) and, when nameHierarchy
+  //    is set, also for super-arcs (level 0) and episodes (level 2). One
+  //    pass per level, density-gated so incoherent communities fall back
+  //    to the template at every level. Protagonist lookup runs once and
+  //    is shared across all passes. The extractor.nameStoryArc helper
+  //    takes a `kind` arg so the prompt is level-appropriate ("super arc"
+  //    titles end up broader, "episode" titles scene-focused, "arc"
+  //    unchanged).
   let namedArcs = 0;
   let templatedArcs = 0;
-  if (nameArcs && enrichedArcs.length > 0) {
-    let protagonistName = "the protagonist";
+  let namedSuperArcs = 0;
+  let templatedSuperArcs = 0;
+  let namedEpisodes = 0;
+  let templatedEpisodes = 0;
+
+  // Resolve protagonist name once if any naming pass will run.
+  let protagonistName = "the protagonist";
+  const willName = (nameArcs && enrichedArcs.length > 0) ||
+    (nameHierarchy && (enrichedSuperArcs.length > 0 || enrichedEpisodes.length > 0));
+  if (willName) {
     try {
       const { rows: protoRows } = await p.query(
         `SELECT c.name, COUNT(*)::int AS cnt
@@ -544,15 +549,21 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     } catch (err) {
       console.warn(`[ChronicleDB] Arc naming: protagonist lookup failed: ${err.message}`);
     }
+  }
 
-    // Lazy-require so that pure structural rebuilds (nameArcs=false) never
-    // touch the extractor module — keeps the dry-run grid-sweep path free
-    // of LLM helper state and settings.apiKey dependencies.
-    const extractor = require("./extractor");
+  // Lazy-require so that pure structural rebuilds (nameArcs=false,
+  // nameHierarchy=false) never touch the extractor module — keeps the
+  // dry-run grid-sweep path free of LLM helper state and apiKey deps.
+  let extractor = null;
+  if (willName) extractor = require("./extractor");
 
-    for (const arc of enrichedArcs) {
+  // Inner helper: name one cluster pass. Returns {named, templated}.
+  // Closure captures: extractor, densityGate, protagonistName, settings.
+  async function nameClusterPass(clusters, kind) {
+    let n = 0, t = 0;
+    for (const arc of clusters) {
       if (!(arc.density >= densityGate)) {
-        templatedArcs++;
+        t++;
         continue;
       }
       try {
@@ -565,26 +576,44 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
           spineEventSummary: arc.spine?.summary || "",
           memberEvents,
           importance: arc.importance,
+          kind,
         });
         arc.title = named.title;
         arc.description = named.description;
-        namedArcs++;
+        n++;
       } catch (err) {
         console.warn(
-          `[ChronicleDB] Arc naming failed for cluster ${arc.cIdx}: ${err.message}`,
+          `[ChronicleDB] ${kind} naming failed for cluster ${arc.cIdx}: ${err.message}`,
         );
-        templatedArcs++;
+        t++;
       }
     }
+    return { named: n, templated: t };
+  }
+
+  if (nameArcs && enrichedArcs.length > 0) {
+    const r = await nameClusterPass(enrichedArcs, "arc");
+    namedArcs = r.named;
+    templatedArcs = r.templated;
   } else {
-    // Every arc uses the templated title + empty description.
     templatedArcs = enrichedArcs.length;
   }
 
-  // nameHierarchy is intentionally a no-op this tick even if set. Touch
-  // the variable so lint doesn't flag it as unused while we wire the flag
-  // through for later.
-  void nameHierarchy;
+  if (nameHierarchy && enrichedSuperArcs.length > 0) {
+    const r = await nameClusterPass(enrichedSuperArcs, "super arc");
+    namedSuperArcs = r.named;
+    templatedSuperArcs = r.templated;
+  } else {
+    templatedSuperArcs = enrichedSuperArcs.length;
+  }
+
+  if (nameHierarchy && enrichedEpisodes.length > 0) {
+    const r = await nameClusterPass(enrichedEpisodes, "episode");
+    namedEpisodes = r.named;
+    templatedEpisodes = r.templated;
+  } else {
+    templatedEpisodes = enrichedEpisodes.length;
+  }
 
   // 7. Parent-linking: match each level-1 arc to the level-0 super-arc
   //    whose event set contains a majority of the level-1 arc's members,
@@ -743,6 +772,10 @@ async function rebuildArcsForChat(settings, chatId, opts = {}) {
     episodes: enrichedEpisodes.length,
     modularityQSuper,
     modularityQEpisodes,
+    namedSuperArcs,
+    templatedSuperArcs,
+    namedEpisodes,
+    templatedEpisodes,
   };
 }
 

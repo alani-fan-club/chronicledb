@@ -560,6 +560,7 @@ async function nameStoryArc(settings, args) {
     spineEventSummary,
     memberEvents,
     importance,
+    kind, // "arc" (default) | "super arc" | "episode" — Path 5 hierarchy
   } = args || {};
 
   const apiKey = (settings.extractionApiKey || settings.geminiApiKey || "").trim();
@@ -567,6 +568,26 @@ async function nameStoryArc(settings, args) {
   // plenty for a 3-7 word naming task.
   const model = (settings.arcNamingModel || settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
+
+  // Path 5: pick the level-appropriate naming idiom. Super-arcs span the
+  // most events and want broad, story-arc-of-arcs titles; episodes are
+  // the finest grain and want scene-specific titles. Arcs are unchanged.
+  const safeKind = kind === "super arc" || kind === "episode" ? kind : "arc";
+  const kindLabel =
+    safeKind === "arc"
+      ? "narrative arc"
+      : safeKind === "super arc"
+        ? "narrative super-arc (a chat-scale beat that spans multiple smaller arcs)"
+        : "narrative episode (a single scene or short sequence inside a larger arc)";
+  const importanceLabel =
+    safeKind === "arc" ? "Arc" : safeKind === "super arc" ? "Super-arc" : "Episode";
+  const noSuffixRule =
+    safeKind === "super arc"
+      ? "no 'Super Arc' or 'Arc' suffix"
+      : safeKind === "episode"
+        ? "no 'Episode' or 'Arc' suffix"
+        : "no 'Arc' suffix";
+  const descWordCap = safeKind === "super arc" ? 35 : 30;
 
   if (!apiKey) {
     const err = new Error("nameStoryArc: settings missing apiKey");
@@ -613,17 +634,17 @@ async function nameStoryArc(settings, args) {
       ? characterName.trim()
       : "the protagonist";
 
-  const prompt = `You are naming a narrative arc inferred from a roleplay chat.
+  const prompt = `You are naming a ${kindLabel} inferred from a roleplay chat.
 
 Protagonist: ${safeCharacter}
-Arc importance: ${safeImportance}/5
+${importanceLabel} importance: ${safeImportance}/5
 
-The arc groups these events in chronological order:
+The ${safeKind} groups these events in chronological order:
 ${memberLines.join("\n")}
 
 Produce:
-- A concise arc title (3-7 words, no quotes, no "Arc" suffix, no articles)
-- A one-sentence description (≤30 words) of what this arc is about
+- A concise ${safeKind} title (3-7 words, no quotes, ${noSuffixRule}, no articles)
+- A one-sentence description (≤${descWordCap} words) of what this ${safeKind} is about
 
 Respond with strict JSON, no preamble, no markdown fence:
 {"title": "...", "description": "..."}`;

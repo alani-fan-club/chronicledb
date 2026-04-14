@@ -53,6 +53,12 @@ const DEFAULT_SETTINGS = {
   // named). 0 disables incremental rebuild entirely.
   arcRebuildEveryN: 30,
   extractEveryN: 1,
+  // Padding-window ingestion (Dong's design): the newest N messages stay
+  // purely in ST's raw context and are NOT ingested into the graph. Only
+  // messages older than N turns get written to the DB. Swiping or editing
+  // recent replies therefore never needs DB cleanup — nothing is there yet.
+  // Default 5 = a roughly one-exchange safety buffer.
+  ingestionPadding: 5,
   // When true, extraction fires automatically after every generation so
   // memory builds live as you chat. When false, only the manual "Ingest"
   // buttons in the chat selector write to memory.
@@ -180,11 +186,19 @@ let isExtracting = false;
       if (settings.sessionMode === "readonly") return;
       try {
         const ctx = getContext();
+        const chatLen = ctx.chat?.length ?? 0;
         const messageIndex = typeof messageIdOrIdx === "number"
           ? messageIdOrIdx
-          : (ctx.chat?.length ?? 0) - 1;
+          : chatLen - 1;
         const chatId = String(ctx.chatId || "");
         if (!chatId) return;
+        // Padding-window optimization: if the swiped message is still inside
+        // the padding window, nothing has been written to the DB for it yet
+        // and the cleanup POST would be a no-op. Skip the round-trip.
+        const paddingSize = Math.max(0, parseInt(settings.ingestionPadding, 10) || 0);
+        if (paddingSize > 0 && messageIndex >= chatLen - paddingSize) {
+          return;
+        }
         const res = await fetch(`${PLUGIN_BASE}/clear-message-extractions`, {
           method: "POST",
           headers: getRequestHeaders(),
@@ -220,46 +234,63 @@ async function triggerExtraction() {
     const chat = ctx.chat;
     if (!chat || chat.length === 0) return;
 
+    const settings = extension_settings[EXT_NAME];
     const characterName = ctx.name2;
     const userName = ctx.name1;
     const chatId = ctx.chatId;
 
-    // Get last N messages for extraction batch.
+    // Padding-window ingestion: the newest `ingestionPadding` messages stay
+    // purely in ST's raw context and are NOT written to the graph. Only the
+    // message that has just aged out of the window gets ingested. Swipes /
+    // edits within the padding window therefore don't need DB cleanup —
+    // there's nothing in the DB for them yet.
+    const paddingSize = Math.max(0, parseInt(settings.ingestionPadding, 10) || 0);
+    const targetIdx = chat.length - 1 - paddingSize;
+    if (targetIdx < 0) {
+      // Chat is still entirely inside the padding window; nothing to ingest yet.
+      return;
+    }
+    const targetMsg = chat[targetIdx];
+    if (!targetMsg) return;
+
     // Single-message batches in the live path so the swipe cleanup hook
     // below can DELETE by (chat_id, message_index) surgically. The previous
     // 10-message batch made cleanup either leaky (stale events from
     // discarded swipes lingered) or aggressive (cleanup deleted neighboring
     // canonical messages too). Cross-message context is rebuilt at full
     // /ingest-chat time, which still uses 10-message batches.
-    const batchSize = 1;
-    const recentMessages = chat.slice(-batchSize).map((m) => ({
-      name: m.name,
-      is_user: m.is_user,
-      is_system: m.is_system || false,
+    const recentMessages = [{
+      name: targetMsg.name,
+      is_user: targetMsg.is_user,
+      is_system: targetMsg.is_system || false,
       // ST sometimes leaves m.mes pointing at swipe 0 while swipe_id is N>0.
       // Normalize the same way /ingest-chat does at server-plugin/index.js:513
       // so live extract reliably ingests the user's actively-selected reply,
       // not whichever swipe happened to be in m.mes at GENERATION_ENDED time.
-      mes: m.swipe_id !== undefined && m.swipes?.[m.swipe_id] ? m.swipes[m.swipe_id] : m.mes,
-      send_date: m.send_date,
-    }));
+      mes: targetMsg.swipe_id !== undefined && targetMsg.swipes?.[targetMsg.swipe_id] ? targetMsg.swipes[targetMsg.swipe_id] : targetMsg.mes,
+      send_date: targetMsg.send_date,
+    }];
 
-    // Fire and forget — don't block the UI
-    fetch(`${PLUGIN_BASE}/extract`, {
-      method: "POST",
-      headers: getRequestHeaders(),
-      body: JSON.stringify({
-        characterName,
-        userName,
-        messages: recentMessages,
-        chatId: String(chatId),
-        messageIndex: chat.length - 1,
-      }),
-    }).then((res) => {
+    // Awaited so the client mutex actually holds until the POST completes.
+    // The server-side extractMutex is still the authoritative guard, but
+    // the client mutex lets other code paths (UI, padding-window logic)
+    // cheaply tell whether an extraction is in flight.
+    try {
+      const res = await fetch(`${PLUGIN_BASE}/extract`, {
+        method: "POST",
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+          characterName,
+          userName,
+          messages: recentMessages,
+          chatId: String(chatId),
+          messageIndex: targetIdx,
+        }),
+      });
       if (!res.ok) console.warn("[ChronicleDB] Extraction failed:", res.status);
-    }).catch((err) => {
+    } catch (err) {
       console.warn("[ChronicleDB] Extraction error:", err);
-    });
+    }
   } finally {
     isExtracting = false;
   }
@@ -340,14 +371,23 @@ function bindSettings(settings) {
     });
   }
 
+  // Optional data-root override — the server auto-detects ST's data dir, but
+  // users on a non-default layout need a way to point it at the right path.
+  $("#chronicle_stDataRoot").val(settings.stDataRoot || "").on("input", function () {
+    settings.stDataRoot = $(this).val();
+    saveAndSync(settings);
+  });
+
   // These keys must match what server-plugin/extractor.js actually reads.
-  // The new generic embedding* fields take precedence over the legacy
-  // gemini* names; both are kept in DEFAULT_SETTINGS for backward compat.
+  // The generic embedding* fields (added by the embedding-provider refactor)
+  // replaced the legacy geminiApiKey binding here — the UI no longer renders
+  // a #chronicle_geminiApiKey input, so binding it would be a silent no-op.
+  // geminiApiKey stays in DEFAULT_SETTINGS for backward compat with save
+  // files from older builds but is no longer surfaced in the settings panel.
   for (const field of [
     "extractionApiUrl",
     "extractionApiKey",
     "extractionModel",
-    "geminiApiKey",
     "embeddingApiKey",
     "embeddingApiUrl",
     "embeddingModel",
@@ -388,6 +428,15 @@ function bindSettings(settings) {
   });
   $("#chronicle_extractEveryN").val(settings.extractEveryN).on("input", function () {
     settings.extractEveryN = parseInt($(this).val()) || 1;
+    saveAndSync(settings);
+  });
+
+  // Padding-window size — live auto-ingest skips the newest N messages so
+  // swipes/edits inside the window need no cleanup. 0 = ingest everything
+  // (matches old behavior). See triggerExtraction() for the targetIdx math.
+  $("#chronicle_ingestionPadding").val(settings.ingestionPadding ?? 5).on("input", function () {
+    const v = parseInt($(this).val(), 10);
+    settings.ingestionPadding = Number.isFinite(v) && v >= 0 ? v : 5;
     saveAndSync(settings);
   });
 
@@ -480,7 +529,8 @@ async function loadLorebookList() {
     const books = await res.json();
     const select = $("#chronicle_lorebookSelect");
     for (const book of books) {
-      select.append(`<option value="${book.filename}">${book.name}</option>`);
+      // escape: lorebook filename + name come from user-authored lore files on disk
+      select.append(`<option value="${escapeHtml(book.filename)}">${escapeHtml(book.name)}</option>`);
     }
   } catch (err) {
     console.warn("[ChronicleDB] Failed to load lorebook list:", err);
@@ -604,18 +654,21 @@ async function loadChatSelector() {
       const checked = selected.has(chat.chatId) ? "checked" : "";
       const dateLabel = chat.date || "unknown date";
       const displayName = chat.chatId.split(" - ").pop() || chat.chatId;
+      // escape: every interpolated value below originates from chat metadata
+      // (chatId, filename, date) or from characterName — all of which trace
+      // back to user-imported chat files and character cards on disk.
       html += `
         <div class="chronicle-chat-item">
-          <input type="checkbox" value="${chat.chatId}" ${checked}
+          <input type="checkbox" value="${escapeHtml(chat.chatId)}" ${checked}
                  class="chronicle-chat-checkbox">
-          <span class="chronicle-chat-name" title="${chat.chatId}">${displayName}</span>
-          <span class="chronicle-chat-msgs">~${chat.messageEstimate} msgs</span>
-          <span class="chronicle-chat-date">${dateLabel}</span>
+          <span class="chronicle-chat-name" title="${escapeHtml(chat.chatId)}">${escapeHtml(displayName)}</span>
+          <span class="chronicle-chat-msgs">~${escapeHtml(chat.messageEstimate)} msgs</span>
+          <span class="chronicle-chat-date">${escapeHtml(dateLabel)}</span>
           ${chat.ingested
-            ? `<span class="chronicle-ingested-badge" title="Ingested ${chat.batchesDone || ''} batches">Ingested</span>`
+            ? `<span class="chronicle-ingested-badge" title="Ingested ${escapeHtml(chat.batchesDone || '')} batches">Ingested</span>`
             : `<button class="chronicle-ingest-btn menu_button menu_button_small"
-                    data-filename="${chat.filename}" data-character="${characterName}"
-                    data-msgs="${chat.messageEstimate}">Ingest</button>`
+                    data-filename="${escapeHtml(chat.filename)}" data-character="${escapeHtml(characterName)}"
+                    data-msgs="${escapeHtml(chat.messageEstimate)}">Ingest</button>`
           }
         </div>`;
     }
@@ -640,7 +693,8 @@ async function loadChatSelector() {
       // Show progress in the status bar
       const statusEl = $("#chronicle_ingestStatus");
       btn.prop("disabled", true).text("Ingesting...").addClass("ingesting");
-      statusEl.html(`<span class="chronicle-ingesting-indicator">Ingesting <b>${filename}</b> (~${estMsgs} messages)... <span class="chronicle-spinner"></span></span>`);
+      // escape: filename + estMsgs come from chat data-* attributes, originally from user-imported chat files
+      statusEl.html(`<span class="chronicle-ingesting-indicator">Ingesting <b>${escapeHtml(filename)}</b> (~${escapeHtml(estMsgs)} messages)... <span class="chronicle-spinner"></span></span>`);
 
       try {
         const res = await fetch(`${PLUGIN_BASE}/ingest-chat`, {
@@ -651,16 +705,19 @@ async function loadChatSelector() {
         const data = await res.json();
         if (res.ok) {
           btn.text("Done!").removeClass("ingesting").addClass("success");
-          statusEl.html(`<span class="chronicle-ingest-done">Ingested <b>${data.messagesTotal}</b> messages in <b>${data.batchesProcessed}</b> batches from <b>${charName}</b>.</span>`);
+          // escape: charName from user-imported character card; counts from server response
+          statusEl.html(`<span class="chronicle-ingest-done">Ingested <b>${escapeHtml(data.messagesTotal)}</b> messages in <b>${escapeHtml(data.batchesProcessed)}</b> batches from <b>${escapeHtml(charName)}</b>.</span>`);
           toastr.success(`Ingested ${data.messagesTotal} messages (${data.batchesProcessed}/${data.batchesTotal} batches) from ${charName}.`);
         } else {
           btn.text("Error").removeClass("ingesting");
-          statusEl.html(`<span class="chronicle-ingest-error">Error: ${data.error}</span>`);
+          // escape: data.error comes from server JSON and may contain user-data fragments
+          statusEl.html(`<span class="chronicle-ingest-error">Error: ${escapeHtml(data.error)}</span>`);
           toastr.error(`Ingest failed: ${data.error}`);
         }
       } catch (err) {
         btn.text("Error").removeClass("ingesting");
-        statusEl.html(`<span class="chronicle-ingest-error">Error: ${err.message}</span>`);
+        // escape: err.message can include fetch error text from the server
+        statusEl.html(`<span class="chronicle-ingest-error">Error: ${escapeHtml(err.message)}</span>`);
         toastr.error(`Ingest error: ${err.message}`);
       }
       setTimeout(() => {
@@ -875,8 +932,10 @@ async function refreshCharacterPanel() {
     if (statsRes.ok) {
       const s = await statsRes.json();
       const lastSeen = s.lastSeenTurn == null ? "never" : `turn ${s.lastSeenTurn}`;
+      // escape: counts + lastSeen come from the server — numeric in practice,
+      // but escape defensively so a malformed JSON response can't inject HTML.
       statsEl.html(
-        `<b>${s.events}</b> events &middot; <b>${s.traits}</b> traits &middot; <b>${s.relationships}</b> relationships &middot; last seen ${lastSeen}`,
+        `<b>${escapeHtml(s.events)}</b> events &middot; <b>${escapeHtml(s.traits)}</b> traits &middot; <b>${escapeHtml(s.relationships)}</b> relationships &middot; last seen ${escapeHtml(lastSeen)}`,
       );
     } else {
       statsEl.html('<span class="chronicle-hint">Could not load stats.</span>');

@@ -63,6 +63,11 @@
         </div>
       </div>
       <div class="chronicle-setting">
+        <label for="chronicle_stDataRoot">SillyTavern data root (optional):</label>
+        <input type="text" id="chronicle_stDataRoot" class="text_pole" placeholder="auto-detected">
+        <p class="chronicle-hint">Leave blank to auto-detect. Only set this if your ST install uses a non-default layout and the server can't find your chats or character cards on its own.</p>
+      </div>
+      <div class="chronicle-setting">
         <input type="button" id="chronicle_initDb" class="menu_button" value="Connect &amp; initialize">
       </div>
 
@@ -147,6 +152,11 @@
           <label for="chronicle_maxInjectionTokens">Memory budget (tokens):</label>
           <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="8000" placeholder="3000">
         </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_ingestionPadding">Keep last N messages raw (don't ingest):</label>
+        <input type="number" id="chronicle_ingestionPadding" class="text_pole" min="0" max="50" placeholder="5">
+        <p class="chronicle-hint">Recent messages stay in ST's native context until they're N turns behind. Skipping ingest on the latest N means swiping or editing recent replies doesn't need cleanup because nothing was written to the graph yet. Default 5.</p>
       </div>
       <div class="chronicle-setting">
         <label for="chronicle_arcRebuildEveryN">Refresh story arcs every N events:</label>

@@ -749,7 +749,8 @@ async function showDetailPanel(data) {
     }
   }
   html += `<h2>${escapeHtml(title)}</h2>`;
-  html += `<div class="detail-type">${data.type || "node"}</div>`;
+  // escape: data.type comes from DB node rows (extracted LLM output)
+  html += `<div class="detail-type">${escapeHtml(data.type || "node")}</div>`;
 
   if (data.description) html += `<p class="detail-desc">${escapeHtml(data.description)}</p>`;
   if (data.content && data.type === "fact") html += `<p class="detail-desc">${escapeHtml(data.content)}</p>`;
@@ -807,7 +808,8 @@ async function showDetailPanel(data) {
       };
 
       for (const [edgeType, items] of groups) {
-        html += `<h3>${typeDisplayNames[edgeType] || edgeType} <span class="detail-count">${items.length}</span></h3>`;
+        // escape: edgeType falls through to DB-originated relationship name when not in typeDisplayNames
+        html += `<h3>${escapeHtml(typeDisplayNames[edgeType] || edgeType)} <span class="detail-count">${items.length}</span></h3>`;
         html += `<ul class="detail-list">`;
         // Limit to first 15 to avoid flooding
         const shown = items.slice(0, 15);
@@ -905,7 +907,8 @@ async function showDetailPanel(data) {
                 physical: "#b8b8b8",
                 faction: "#FF5841",
               }[cat] || "#6a6a6a";
-              html += `<li><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(traitContent)} <span class="detail-meta">${cat}</span></span></li>`;
+              // escape: cat is the trait category from DB rows (LLM-extracted, untrusted)
+              html += `<li><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(traitContent)} <span class="detail-meta">${escapeHtml(cat)}</span></span></li>`;
             }
           }
           html += `</ul>`;
@@ -937,9 +940,11 @@ function showEdgeDetail(data) {
   const tgt = cy.getElementById(data.target).data("label") || data.target;
   const sentClass = sentimentClass(data.sentiment);
 
-  let html = `<h2>${src} → ${tgt}</h2>`;
-  html += `<div class="detail-type">${data.type}</div>`;
-  if (data.label) html += `<p class="detail-desc">${data.label}</p>`;
+  // escape: src/tgt come from node labels (character names, event summaries),
+  // data.type is a DB relationship name, data.label is the LLM-extracted edge label.
+  let html = `<h2>${escapeHtml(src)} → ${escapeHtml(tgt)}</h2>`;
+  html += `<div class="detail-type">${escapeHtml(data.type)}</div>`;
+  if (data.label) html += `<p class="detail-desc">${escapeHtml(data.label)}</p>`;
   if (data.sentiment !== undefined) html += `<div class="detail-row"><span>Sentiment</span><b class="${sentClass}">${data.sentiment.toFixed(2)}</b></div>`;
   if (data.intensity !== undefined) {
     html += `<div class="detail-row"><span>Intensity</span><b>${(data.intensity * 100).toFixed(0)}%</b></div>`;
@@ -989,11 +994,14 @@ function renderCharacterSidebar(cards) {
     const div = document.createElement("div");
     div.className = "char-card";
     div.dataset.name = card.name;
+    // escape: card.name comes from user-imported character cards
+    const safeName = escapeHtml(card.name);
+    const safeInitial = escapeHtml(card.name.charAt(0).toUpperCase());
     div.innerHTML = `
       <img class="char-card-img" src="${API_BASE}/character-image/${encodeURIComponent(card.filename)}"
            onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
-      <div class="char-card-placeholder" style="display:none;">${card.name.charAt(0).toUpperCase()}</div>
-      <div class="char-card-name">${card.name}</div>
+      <div class="char-card-placeholder" style="display:none;">${safeInitial}</div>
+      <div class="char-card-name">${safeName}</div>
     `;
     div.addEventListener("click", () => selectCharacter(card.name));
     container.appendChild(div);

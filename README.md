@@ -268,6 +268,21 @@ Story arcs used to come from the extraction LLM naming them per batch, which pro
 
 Retrieval reads level-1 arcs only via the `COALESCE(sa.hierarchy_level, 1) = 1` filter in `fetchArcExpansion`, so the hierarchy is backward compatible: legacy flat rows stay level 1 by default. Rationale and weight tuning history live in `RESEARCH_ARCS.md`.
 
+### Lorebooks (ST World Info)
+
+ChronicleDB has a dedicated ingest path for SillyTavern lorebook / World Info files. `server-plugin/lorebook.js::ingestLorebook` reads a `worlds/<name>.json` file from the ST data dir and, for every enabled entry, performs the following:
+
+1. Creates a `facts` row with the entry's content (up to 2000 chars), a domain classified by keyword heuristics (`lore`, `secret`, `rule`, `backstory`), and `confidence = 1.0` (lorebook entries are treated as authoritative).
+2. If the entry's comment and content look character-like (matches personality / appearance / pronoun heuristics and a short comment), upserts a `characters` row with the entry's keys as aliases and the content as the description.
+3. If the entry looks location-like (contains words like "located", "village", "castle", etc.), upserts a `locations` row.
+4. Embeds the content (up to 4000 chars, prefixed with the comment and keys) and stores it in `memory_embeddings` with `node_type = 'lore'` and a synthetic `chat_id` of `"lorebook:<lorebook_name>"`.
+
+**Ingest is opt-in and manual.** The UI extension exposes an "Ingest lorebook" button that lists every `.json` file in the ST `worlds/` directory and posts `/lorebooks/ingest` on click. Live-chat ingestion never touches `worlds/` — the extractor only reads message content from the chat `.jsonl`, so lorebook text cannot accidentally leak into extracted events.
+
+**Interaction with ST's native world-info activation.** ST already has a keyword-triggered World Info injection system built into its prompt assembler. Ingesting a lorebook into ChronicleDB does **not** disable ST's native injection; both systems run in parallel. ST injects entries into its own World Info slot based on keyword matches in the recent chat; ChronicleDB stores a copy of the same entries as graph + vector rows for semantic retrieval. Expect some duplication in the assembled prompt when both systems hit the same entry on a given turn; keep lorebooks focused to minimize bloat.
+
+**Retrieval gap worth knowing.** The memory_embeddings rows written by lorebook ingest use a synthetic `chat_id` (`lorebook:<name>`) that is **not** in the `selectedChats` list passed to `/retrieve` by default, because that list comes from the per-character chat picker and contains only real chat IDs. With the current strict `chat_id = ANY(...)` filter in the hybrid search, ingested lorebook entries are therefore invisible to retrieval unless you explicitly add `lorebook:<name>` to a character's `selectedChats` preference, or a future change routes lorebook chunks through a separate global-scope search bucket. The Character / Location nodes created in step 2 still participate in the mindmap and panel queries; it's specifically the vector + lexical search that skips them today.
+
 ### Chat scoping
 
 Parallel roleplays with the same character must not bleed into each other. Every chat-scoped subsystem filters by `chat_id`:
@@ -357,7 +372,7 @@ Every plugin endpoint lives under `/api/plugins/chronicle-db/` (defined in `serv
 - `GET /character-cards`, `GET /character-image/:filename` — proxy for ST's character PNGs so the standalone mindmap can show avatars.
 - `GET /graph` — graph data for the mindmap, with `scope=global|character`, `depth`, and `chat_id` query parameters.
 - `GET /memories/:chatId`, `DELETE /memories/:id` — direct memory_embeddings CRUD, used for debugging.
-- `GET /lorebooks`, `POST /lorebooks/ingest` — list and ingest ST lorebook JSON files into the graph plus the vector store as globally-scoped facts.
+- `GET /lorebooks`, `POST /lorebooks/ingest` — list and ingest ST lorebook JSON files. Each entry becomes a `facts` row plus an optional `characters` / `locations` row via keyword heuristics, plus a `memory_embeddings` chunk under synthetic `chat_id = "lorebook:<name>"`. See the "Lorebooks (ST World Info)" section under Architecture for the retrieval caveat.
 - `GET /map` — serves the standalone mindmap UI statically from `src/ui/`.
 
 ### UI

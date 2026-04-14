@@ -308,29 +308,59 @@ Parallel roleplays with the same character must not bleed into each other. Every
 
 ### Prerequisites
 
-- PostgreSQL 17 (generated columns, `AVG(vector)` aggregate support, and pgvector's full feature set).
-- `vector` extension (pgvector) and `pg_trgm` extension.
-- Node.js 18 or newer.
-- A SillyTavern install with server plugins enabled.
-- An API key for the extraction LLM. Gemini is the default (cheap and fast on `gemini-2.5-flash-lite`); any OpenAI-compatible endpoint also works. Embeddings are Gemini-only right now; the default embedder is `gemini-embedding-2-preview` at 768 dimensions with task type `SEMANTIC_SIMILARITY`.
-
-### Install
-
-**Prerequisites you need to already have installed:**
-
-- SillyTavern (already running at least once so `config.yaml` exists)
+- A SillyTavern install with server plugins enabled (running at least once so `config.yaml` exists)
 - Node.js 18 or newer
-- PostgreSQL 14 or newer (17 recommended) with the **pgvector** extension installed into the Postgres binary
+- An API key for the extraction LLM (Gemini is the default and cheapest — see "LLM keys" below)
+- A PostgreSQL 14+ database with the **pgvector** extension. You have two options for this:
 
-If any of these are missing, install them first:
+#### Option A — Use a free hosted Postgres (easiest, no local install)
 
-| | macOS | Linux (Debian/Ubuntu) |
+If you don't want to install PostgreSQL on your own machine, use a free hosted instance. Both providers below come with **pgvector pre-installed** and have free tiers generous enough for years of roleplay chats:
+
+| provider | free tier | how to enable pgvector |
 |---|---|---|
-| Node 18+ | `brew install node` | follow [nodejs.org packages](https://nodejs.org/en/download/package-manager) |
-| Postgres 17 | `brew install postgresql@17 && brew services start postgresql@17` | `sudo apt-get install postgresql-17` |
-| pgvector | `brew install pgvector` | `sudo apt-get install postgresql-17-pgvector` |
+| **[Neon](https://neon.tech)** | 0.5 GB storage, autosuspends after 5 min idle (1-2 s wake-up on next message) | After project creation, click **SQL Editor** and run `CREATE EXTENSION vector;` once |
+| **[Supabase](https://supabase.com)** | 500 MB storage, no idle suspension | **Database → Extensions** in the dashboard, search for `vector`, toggle on |
 
-> `pg_trgm` ships with Postgres core and needs no separate install. `pgvector` does not — `CREATE EXTENSION vector` will fail until the binary is on disk.
+**Walkthrough (Neon, fastest):**
+
+1. Sign up at <https://neon.tech> with email or GitHub
+2. Create a project. Pick the closest region. Default Postgres 16+ is fine.
+3. Copy the connection string Neon shows you. It looks like:
+   ```
+   postgresql://username:AbCdEf123456@ep-cool-name-abc123.us-east-2.aws.neon.tech/neondb?sslmode=require
+   ```
+4. Open the Neon SQL Editor (left sidebar) and run:
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS vector;
+   CREATE EXTENSION IF NOT EXISTS pg_trgm;
+   ```
+5. In the ChronicleDB settings panel, split the connection string into the 5 fields:
+
+   | URL part | example value | settings field |
+   |---|---|---|
+   | `username` | `username` | **User** |
+   | password (after `:`) | `AbCdEf123456` | **Password** |
+   | host (after `@`) | `ep-cool-name-abc123.us-east-2.aws.neon.tech` | **Host** |
+   | port (default `5432`) | `5432` | **Port** |
+   | database (path component) | `neondb` | **Database** |
+
+6. Click **Connect & initialize**. Done.
+
+> **Privacy note:** chat content goes through the hosted provider on every retrieve and ingest. If your roleplays contain anything you wouldn't want a third party to see, use the local install option instead. Hosted Postgres is the right answer for "I just want this to work and I'm not paranoid about my chats."
+
+#### Option B — Install PostgreSQL + pgvector locally
+
+If you want everything on your own machine (privacy, no internet dependency, no provider sign-up), install Postgres + pgvector once. The one-shot installer (`install.sh`, below) checks for these and offers to install them for you on macOS and Linux. If you'd rather do it manually:
+
+| | macOS (Homebrew) | Linux (Debian/Ubuntu) | Windows |
+|---|---|---|---|
+| **Node 18+** | `brew install node` | use [NodeSource](https://github.com/nodesource/distributions) | [nodejs.org installer](https://nodejs.org/en/download/) |
+| **Postgres 17** | `brew install postgresql@17 && brew services start postgresql@17` | `sudo apt-get install postgresql-17 && sudo systemctl start postgresql` | [EnterpriseDB Windows installer](https://www.postgresql.org/download/windows/) — graphical, click-through |
+| **pgvector** | `brew install pgvector` | `sudo apt-get install postgresql-17-pgvector` | follow the [pgvector Windows install](https://github.com/pgvector/pgvector#windows) section (uses `nmake` against your installed Postgres) |
+| **Create role on Linux first time** | not needed | `sudo -u postgres createuser --superuser "$USER"` | the EDB installer prompts you for a superuser password |
+
+> `pg_trgm` ships with Postgres core and needs no separate install. `pgvector` does — `CREATE EXTENSION vector` will fail until the binary is on disk. The Windows install path is the rockiest of the three; if you're on Windows and don't want to mess with `nmake`, **use Option A (Neon)** instead — it skips this entire section.
 
 #### One-shot install (recommended)
 

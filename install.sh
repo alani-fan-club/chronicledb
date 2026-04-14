@@ -30,6 +30,30 @@ ok()   { printf '%s[chronicledb]%s %s\n' "$GREEN"  "$RESET" "$*"; }
 warn() { printf '%s[chronicledb]%s %s\n' "$YELLOW" "$RESET" "$*"; }
 fail() { printf '%s[chronicledb]%s %s\n' "$RED"    "$RESET" "$*" >&2; exit 1; }
 
+# Prompt the user for yes/no with a default. Returns 0 for yes, 1 for no.
+# If stdin isn't a TTY (e.g. piped install), falls back to the default
+# silently — never block on input.
+prompt_yes() {
+  local prompt="$1"
+  local default="${2:-y}"
+  if [[ ! -t 0 ]]; then
+    [[ "$default" == "y" ]] && return 0 || return 1
+  fi
+  local hint=$([[ "$default" == "y" ]] && echo "[Y/n]" || echo "[y/N]")
+  local reply
+  printf '%s[chronicledb]%s %s %s ' "$YELLOW" "$RESET" "$prompt" "$hint"
+  read -r reply
+  reply="${reply:-$default}"
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# Run a command, optionally with sudo if the platform needs it.
+run_install() {
+  local cmd="$1"
+  log "Running: $cmd"
+  eval "$cmd"
+}
+
 # ── 1. Detect platform ──────────────────────────────────────────────
 case "$(uname -s)" in
   Darwin) PLATFORM=macos ;;
@@ -75,27 +99,75 @@ if [[ "$NODE_MAJOR" -lt 18 ]]; then
 fi
 ok "Node $(node --version)"
 
-# ── 4. Check PostgreSQL ─────────────────────────────────────────────
+# ── 4. Check PostgreSQL — offer to install if missing ──────────────
 if ! command -v psql >/dev/null 2>&1; then
-  fail "PostgreSQL is not installed. Install Postgres 14+ (17 recommended):
-    macOS:  brew install postgresql@17 && brew services start postgresql@17
-    Linux:  sudo apt-get install postgresql-17 && sudo systemctl start postgresql
-  Then re-run this script."
+  warn "PostgreSQL is not installed."
+  case "$PLATFORM" in
+    macos)
+      if command -v brew >/dev/null 2>&1; then
+        if prompt_yes "Install PostgreSQL 17 + pgvector via Homebrew now?"; then
+          run_install "brew install postgresql@17 pgvector"
+          run_install "brew services start postgresql@17"
+          # Make sure brew's pg is on PATH for the rest of the script
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+        else
+          fail "Cannot continue without PostgreSQL. Install it manually and re-run."
+        fi
+      else
+        fail "Homebrew not found. Install Homebrew first (https://brew.sh), then re-run this script. Or install PostgreSQL manually from https://www.postgresql.org/download/macosx/"
+      fi
+      ;;
+    linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        if prompt_yes "Install PostgreSQL 17 + pgvector via apt now? (will sudo)"; then
+          run_install "sudo apt-get update"
+          run_install "sudo apt-get install -y postgresql-17 postgresql-17-pgvector"
+          run_install "sudo systemctl start postgresql"
+          # Linux distros require a Postgres role for the OS user — create it now
+          if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER'" 2>/dev/null | grep -q 1; then
+            log "Creating Postgres role for current user '$USER'..."
+            sudo -u postgres createuser --superuser "$USER"
+          fi
+        else
+          fail "Cannot continue without PostgreSQL. Install it manually and re-run."
+        fi
+      else
+        fail "apt-get not found. This installer's auto-install only knows Debian/Ubuntu. Install PostgreSQL 14+ manually for your distro and re-run."
+      fi
+      ;;
+  esac
 fi
 PG_VERSION=$(psql --version | grep -oE '[0-9]+' | head -1)
 if [[ "$PG_VERSION" -lt 14 ]]; then
   fail "PostgreSQL 14+ required (you have $PG_VERSION). 17 recommended."
 fi
 if ! psql -tAc "SELECT 1" >/dev/null 2>&1; then
-  fail "PostgreSQL is installed but psql can't connect. Make sure the server is running:
-    macOS:  brew services start postgresql@17
-    Linux:  sudo systemctl start postgresql
-  And that your user has a Postgres role. If you're new to Postgres on Linux:
-    sudo -u postgres createuser --superuser \"\$USER\""
+  warn "PostgreSQL is installed but the server isn't accepting connections."
+  case "$PLATFORM" in
+    macos)
+      if prompt_yes "Try starting it via 'brew services start postgresql@17' now?"; then
+        run_install "brew services start postgresql@17 || brew services start postgresql"
+        sleep 2
+      fi
+      ;;
+    linux)
+      if prompt_yes "Try starting it via 'sudo systemctl start postgresql' now?"; then
+        run_install "sudo systemctl start postgresql"
+        sleep 2
+        if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER'" 2>/dev/null | grep -q 1; then
+          log "Creating Postgres role for current user '$USER'..."
+          sudo -u postgres createuser --superuser "$USER"
+        fi
+      fi
+      ;;
+  esac
+  if ! psql -tAc "SELECT 1" >/dev/null 2>&1; then
+    fail "Still can't connect to PostgreSQL after attempting to start it. Check 'pg_isready' and the Postgres logs, then re-run."
+  fi
 fi
 ok "PostgreSQL $PG_VERSION (running, current user can connect)"
 
-# ── 5. Check pgvector extension ─────────────────────────────────────
+# ── 5. Check pgvector extension — offer to install if missing ──────
 TMP_DB="chronicledb_pgvector_check_$$"
 if createdb "$TMP_DB" 2>/dev/null && \
    psql -d "$TMP_DB" -tAc "CREATE EXTENSION IF NOT EXISTS vector; DROP EXTENSION vector;" >/dev/null 2>&1; then
@@ -105,13 +177,30 @@ else
 fi
 dropdb "$TMP_DB" 2>/dev/null || true
 if [[ "$PGVECTOR_OK" -eq 0 ]]; then
+  warn "pgvector extension is not installed in your Postgres binary."
   case "$PLATFORM" in
-    macos) PGV_CMD="brew install pgvector" ;;
-    linux) PGV_CMD="sudo apt-get install postgresql-${PG_VERSION}-pgvector" ;;
+    macos)
+      if command -v brew >/dev/null 2>&1 && prompt_yes "Install pgvector via 'brew install pgvector' now?"; then
+        run_install "brew install pgvector"
+      else
+        fail "Install pgvector manually and re-run:  brew install pgvector"
+      fi
+      ;;
+    linux)
+      if command -v apt-get >/dev/null 2>&1 && prompt_yes "Install pgvector via 'sudo apt-get install postgresql-${PG_VERSION}-pgvector' now?"; then
+        run_install "sudo apt-get install -y postgresql-${PG_VERSION}-pgvector"
+      else
+        fail "Install pgvector manually and re-run:  sudo apt-get install postgresql-${PG_VERSION}-pgvector"
+      fi
+      ;;
   esac
-  fail "pgvector extension is not installed in your Postgres binary. Install it:
-    $PGV_CMD
-  Then re-run this script."
+  # Re-check after install
+  TMP_DB="chronicledb_pgvector_recheck_$$"
+  if ! (createdb "$TMP_DB" 2>/dev/null && psql -d "$TMP_DB" -tAc "CREATE EXTENSION IF NOT EXISTS vector; DROP EXTENSION vector;" >/dev/null 2>&1); then
+    dropdb "$TMP_DB" 2>/dev/null || true
+    fail "pgvector still not loadable after install attempt. Check the install output above."
+  fi
+  dropdb "$TMP_DB" 2>/dev/null || true
 fi
 ok "pgvector is available"
 

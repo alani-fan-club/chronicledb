@@ -68,7 +68,7 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     core.getWorldState(pool, chatIds),
     core.getPlotThreads(pool, chatIds),
     core.getRecentSnapshots(pool, chatIds, 3),
-    core.getLocations(pool, activeCharacters || []),
+    core.getLocations(pool, chatIds, activeCharacters || []),
   ]);
 
   // Hybrid search: six-source fusion with graph expansion boost. When

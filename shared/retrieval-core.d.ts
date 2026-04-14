@@ -54,6 +54,6 @@ export function getKnowledgeBoundaries(pool: any, chatIds: string | string[] | n
 export function getWorldState(pool: any, chatIds: string | string[] | null): Promise<any[]>;
 export function getPlotThreads(pool: any, chatIds: string | string[] | null): Promise<any[]>;
 export function getRecentSnapshots(pool: any, chatIds: string | string[] | null, limit?: number): Promise<any[]>;
-export function getLocations(pool: any, characters: string[]): Promise<any[]>;
+export function getLocations(pool: any, chatIds: string | string[] | null, characters: string[]): Promise<any[]>;
 
 export function formatMemoryBlock(result: any, maxChars: number): string;

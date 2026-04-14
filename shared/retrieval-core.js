@@ -806,16 +806,27 @@ async function getRecentSnapshots(pool, chatIds, limit = 3) {
   return rows;
 }
 
-async function getLocations(pool, characters) {
+async function getLocations(pool, chatIds, characters) {
   if (!characters || characters.length === 0) return [];
+  const ids = normalizeChatIds(chatIds);
+  if (!ids) return [];
   const charIds = characters.map(slugify);
+  // Strict chat_id scope — unlike getWorldState where NULL means "global
+  // truth", present_at NULL rows are stale is_current=TRUE snapshots from
+  // legacy ingests before the chat_id column existed. They claim a
+  // character is currently at a location that was true in some other
+  // chat's history, which is exactly the cross-chat leak the user keeps
+  // hitting. Legacy NULL rows stay invisible; re-ingest populates proper
+  // chat_id on every new present_at write.
   const { rows } = await pool.query(
     `SELECT c.name as entity, l.name as location
      FROM present_at pa
      JOIN characters c ON c.id = pa.character_id
      JOIN locations l ON l.id = pa.location_id
-     WHERE pa.character_id = ANY($1::text[]) AND pa.is_current = TRUE`,
-    [charIds],
+     WHERE pa.character_id = ANY($1::text[])
+       AND pa.is_current = TRUE
+       AND pa.chat_id = ANY($2::text[])`,
+    [charIds, ids],
   );
   return rows;
 }

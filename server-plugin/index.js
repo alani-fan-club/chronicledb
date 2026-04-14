@@ -14,6 +14,7 @@ const {
 } = require("./extractor");
 const { retrieve, formatMemoryBlock } = require("./retriever");
 const { ingestLorebook, listLorebooks } = require("./lorebook");
+const { resolveStDataRoot } = require("./st-paths");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { resolve: pathResolve, dirname: pathDirname } = require("path");
 
@@ -52,12 +53,41 @@ async function tryAutoConnect() {
   }
   try {
     await db.initSchema(settings);
+    // Postgres trust auth (and peer auth on Unix sockets) ignore the
+    // username field — they accept the connection as whatever role
+    // the OS user maps to. So a typo in pgUser will silently "succeed"
+    // and then every subsequent query runs as a different role than
+    // the user thinks. Verify after connect: query SELECT current_user
+    // and current_database, compare to the configured values, and
+    // surface a hard error if either drifts. This catches the
+    // "I had a wrong username for the database and the plugin didn't
+    // catch it" failure mode reported by friends during install.
+    const pool = db.getPool(settings);
+    const { rows: [verify] } = await pool.query(
+      `SELECT current_user AS u, current_database() AS d`,
+    );
+    const expectedUser = (settings.pgUser || "").trim();
+    const expectedDb = (settings.pgDatabase || "").trim();
+    if (expectedUser && verify.u !== expectedUser) {
+      throw new Error(
+        `Database connected as "${verify.u}" but settings configured user "${expectedUser}". ` +
+        `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
+        `password auth, or update the user field to "${verify.u}" to match what Postgres ` +
+        `actually logged you in as.`,
+      );
+    }
+    if (expectedDb && verify.d !== expectedDb) {
+      throw new Error(
+        `Connected to database "${verify.d}" but settings configured "${expectedDb}". ` +
+        `Check the database name field.`,
+      );
+    }
     connectionState = {
       connected: true,
       error: null,
       initializedAt: new Date().toISOString(),
     };
-    console.log("[ChronicleDB] Auto-connected to database.");
+    console.log(`[ChronicleDB] Auto-connected to database "${verify.d}" as "${verify.u}".`);
   } catch (err) {
     connectionState = {
       connected: false,
@@ -147,6 +177,30 @@ async function init(router) {
   router.post("/init-db", async (_req, res) => {
     try {
       await db.initSchema(settings);
+      // Same trust-auth verification as tryAutoConnect — a user clicking
+      // "Connect & initialize" with a wrong username typo should see a
+      // clear error in the UI, not a green checkmark followed by silent
+      // query failures later.
+      const pool = db.getPool(settings);
+      const { rows: [verify] } = await pool.query(
+        `SELECT current_user AS u, current_database() AS d`,
+      );
+      const expectedUser = (settings.pgUser || "").trim();
+      const expectedDb = (settings.pgDatabase || "").trim();
+      if (expectedUser && verify.u !== expectedUser) {
+        throw new Error(
+          `Connected as "${verify.u}" but you configured user "${expectedUser}". ` +
+          `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
+          `password auth, or change the user field to "${verify.u}" to match what ` +
+          `Postgres logged you in as.`,
+        );
+      }
+      if (expectedDb && verify.d !== expectedDb) {
+        throw new Error(
+          `Connected to database "${verify.d}" but you configured "${expectedDb}". ` +
+          `Check the database name field.`,
+        );
+      }
       connectionState = {
         connected: true,
         error: null,
@@ -157,7 +211,7 @@ async function init(router) {
       // here too means standalone /init-db POSTs still work.
       settings.initialized = true;
       saveCachedSettings(settings);
-      res.json({ ok: true });
+      res.json({ ok: true, user: verify.u, database: verify.d });
     } catch (err) {
       connectionState = { connected: false, error: err.message, initializedAt: null };
       console.error("[ChronicleDB] DB init error:", err);
@@ -280,7 +334,7 @@ async function init(router) {
       const { readdirSync, statSync } = require("fs");
       const { join, resolve } = require("path");
 
-      const dataRoot = settings.stDataRoot || "";
+      const dataRoot = resolveStDataRoot(settings);
       const chatsBase = resolve(dataRoot, "chats");
       const charName = req.params.characterName;
       const entries = readdirSync(chatsBase);
@@ -351,7 +405,7 @@ async function init(router) {
       const { readFileSync } = require("fs");
       const { resolve, join } = require("path");
 
-      const dataRoot = settings.stDataRoot || "";
+      const dataRoot = resolveStDataRoot(settings);
       const chatsBase = resolve(dataRoot, "chats");
 
       // Find matching directory
@@ -719,7 +773,7 @@ async function init(router) {
     try {
       const { readdirSync } = require("fs");
       const { resolve } = require("path");
-      const dataRoot = settings.stDataRoot || "";
+      const dataRoot = resolveStDataRoot(settings);
       const charsDir = resolve(dataRoot, "characters");
       const files = readdirSync(charsDir)
         .filter((f) => f.endsWith(".png"))
@@ -742,7 +796,7 @@ async function init(router) {
     try {
       const { resolve, join } = require("path");
       const { createReadStream, existsSync } = require("fs");
-      const dataRoot = settings.stDataRoot || "";
+      const dataRoot = resolveStDataRoot(settings);
       const imgPath = join(resolve(dataRoot, "characters"), req.params.filename);
       if (!existsSync(imgPath)) return res.status(404).send("Not found");
       res.setHeader("Content-Type", "image/png");

@@ -299,7 +299,14 @@ JSON:`;
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0.1,
-            maxOutputTokens: 65536,
+            // Gemini's documented upper bound is 65536 EXCLUSIVE — so the
+            // largest valid value is 65535. Setting 65536 returns a 400
+            // INVALID_ARGUMENT, which silently bricks every extraction
+            // batch. 32768 is plenty of headroom for the JSON output of
+            // a 10-message extraction batch and stays well clear of the
+            // model-specific cap (some Gemini variants cap lower than
+            // the 2.5 series).
+            maxOutputTokens: 32768,
             responseMimeType: "application/json",
           },
         }),

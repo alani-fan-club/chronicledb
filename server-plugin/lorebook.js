@@ -6,12 +6,13 @@
 const { readFileSync, readdirSync } = require("fs");
 const { join, resolve, basename } = require("path");
 const db = require("./db");
+const { resolveStDataRoot } = require("./st-paths");
 
 /**
  * List available lorebooks from the ST worlds directory.
  */
 function listLorebooks(settings) {
-  const dataRoot = settings.stDataRoot || "";
+  const dataRoot = resolveStDataRoot(settings);
   const worldsDir = resolve(dataRoot, "worlds");
 
   try {
@@ -36,7 +37,7 @@ function listLorebooks(settings) {
  *   looks like it describes one (heuristic based on keywords + comment)
  */
 async function ingestLorebook(settings, filename, embedFn) {
-  const dataRoot = settings.stDataRoot || "";
+  const dataRoot = resolveStDataRoot(settings);
   const filePath = resolve(dataRoot, "worlds", filename);
   const raw = readFileSync(filePath, "utf-8");
   const lorebook = JSON.parse(raw);

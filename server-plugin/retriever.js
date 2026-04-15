@@ -26,6 +26,59 @@ const db = require("./db");
 const { embed } = require("./extractor");
 const core = require("../shared/retrieval-core");
 
+// ── Per-consumer budget profiles ────────────────────────────────
+//
+// Different callers of /retrieve want wildly different slice sizes out
+// of the same underlying corpus. The main generation inject path needs
+// a big helping of events, quotes, and snippets to prime the model;
+// the character-panel sidebar is a tiny glance and should not eat 3k
+// tokens; the mindmap UI wants structural events only (no prose, no
+// scene snapshots).
+//
+// A profile is a per-kind cap + an overall maxTokens render ceiling.
+// Caller picks one by name via `budgetProfile` and can override any
+// individual field explicitly. `settings.maxInjectionTokens` (the
+// legacy knob on the UI extension side) still wins for the inject
+// profile so existing user settings keep working.
+const BUDGET_PROFILES = {
+  inject:         { events: 12, dialogue: 8, memory: 10, snapshots: 3, maxTokens: 3000 },
+  characterPanel: { events: 5,  dialogue: 0, memory: 5,  snapshots: 0, maxTokens: 1500 },
+  mindmap:        { events: 30, dialogue: 0, memory: 0,  snapshots: 0, maxTokens: 8000 },
+};
+
+/**
+ * Merge a budget profile with settings + explicit per-field overrides.
+ *
+ * Precedence (highest wins):
+ *   1. explicit per-field overrides from the caller (overrides arg)
+ *   2. settings.maxInjectionTokens (legacy UI knob → inject profile's
+ *      maxTokens; also honored for other profiles because users tuning
+ *      this knob generally mean "cap every memory block at N tokens")
+ *   3. the named profile's defaults
+ *
+ * Unknown profile names fall through to the "inject" profile — it's a
+ * safer default than throwing at the retrieval boundary on a typo.
+ */
+function resolveBudgets(settings, profileName, overrides) {
+  const name = profileName && BUDGET_PROFILES[profileName] ? profileName : "inject";
+  const base = BUDGET_PROFILES[name];
+  const merged = { ...base };
+  const settingsMaxTokens = Number(settings && settings.maxInjectionTokens);
+  if (Number.isFinite(settingsMaxTokens) && settingsMaxTokens > 0) {
+    merged.maxTokens = settingsMaxTokens;
+  }
+  if (overrides && typeof overrides === "object") {
+    for (const key of ["events", "dialogue", "memory", "snapshots", "maxTokens"]) {
+      const v = overrides[key];
+      if (typeof v === "number" && Number.isFinite(v) && v >= 0) {
+        merged[key] = v;
+      }
+    }
+  }
+  merged.profile = name;
+  return merged;
+}
+
 // Chat-scoped character index cache for graph expansion. Long-lived
 // process → keep a per-chat Map with 5-minute TTL so chat-switching
 // doesn't re-query characters every turn. The shared detector checks
@@ -45,8 +98,25 @@ function getCharacterCache(chatId) {
   return cache;
 }
 
-async function retrieve(settings, { chatId, activeCharacters, recentText, sessionMode, sessionId, selectedChats }) {
+async function retrieve(
+  settings,
+  {
+    chatId,
+    activeCharacters,
+    recentText,
+    sessionMode,
+    sessionId,
+    selectedChats,
+    budgetProfile,
+    budgetOverrides,
+  } = {},
+) {
   const pool = db.getPool(settings);
+
+  // Resolve the per-consumer budget once and thread it through every
+  // downstream knob: hybrid fusion's per-kind caps, the recent-events
+  // count, the snapshot count, and the eventual render ceiling.
+  const budgets = resolveBudgets(settings, budgetProfile, budgetOverrides);
 
   // Compute the chat-id scope once and thread it through every helper.
   // - explicit selectedChats wins (per-character preference from the chat picker UI)
@@ -61,13 +131,19 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
   // all live in the shared core now — the settings-threaded versions in
   // db.js remain for backward compatibility but this code path uses the
   // pool-parameterized variants for consistency with eval.
+  //
+  // Budget plumbing: the two count-bearing helpers (recent events and
+  // recent snapshots) honor per-profile caps. The previous hard-coded
+  // `8` and `3` are now the inject profile's defaults.
+  const recentEventsLimit = Math.max(0, Number(budgets.events ?? 8));
+  const recentSnapshotsLimit = Math.max(0, Number(budgets.snapshots ?? 3));
   const structuredPromise = Promise.all([
     core.getRelationships(pool, chatIds, activeCharacters || []),
-    core.getRecentEvents(pool, chatIds, 8),
+    core.getRecentEvents(pool, chatIds, recentEventsLimit),
     core.getKnowledgeBoundaries(pool, chatIds, activeCharacters || []),
     core.getWorldState(pool, chatIds),
     core.getPlotThreads(pool, chatIds),
-    core.getRecentSnapshots(pool, chatIds, 3),
+    core.getRecentSnapshots(pool, chatIds, recentSnapshotsLimit),
     core.getLocations(pool, chatIds, activeCharacters || []),
   ]);
 
@@ -101,6 +177,7 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
           query: recentText,
           limit: 40,
           boostCharIds,
+          budgets,
         });
       } catch (err) {
         console.warn("[ChronicleDB] hybridSearch failed:", err.message);
@@ -108,9 +185,14 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
       }
     } else {
       // Lexical-only fallback: still better than nothing if embed went down.
+      // Honor the profile's memory cap here too — a mindmap profile with
+      // memory:0 should get zero memory rows even on the fallback path.
       try {
-        const lex = await core.lexicalSearch(pool, chatIds, recentText, 8);
-        fusedHits = lex.map((m) => ({ kind: "memory", key: `m:${m.id}`, memory: m }));
+        const lexLimit = Math.max(0, Number(budgets.memory ?? 8));
+        if (lexLimit > 0) {
+          const lex = await core.lexicalSearch(pool, chatIds, recentText, lexLimit);
+          fusedHits = lex.map((m) => ({ kind: "memory", key: `m:${m.id}`, memory: m }));
+        }
       } catch (err) {
         console.warn("[ChronicleDB] lexical fallback failed:", err.message);
       }
@@ -148,6 +230,10 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
     vectorResults: fusedHits.filter((h) => h.kind === "memory").map((h) => h.memory),
     eventHits: fusedHits.filter((h) => h.kind === "event").map((h) => h.event),
     dialogueHits: fusedHits.filter((h) => h.kind === "dialogue").map((h) => h.dialogue),
+    // Expose the resolved budget so /retrieve + formatMemoryBlock can
+    // honor maxTokens without re-deriving it. Debug surfaces also peek
+    // at this to explain which profile was picked.
+    budgets,
   };
 }
 
@@ -155,9 +241,18 @@ async function retrieve(settings, { chatId, activeCharacters, recentText, sessio
  * Format retrieval results into the injection block via the shared
  * SECTION_REGISTRY. ST historically passed `maxTokens` (not `maxChars`);
  * we convert at the boundary — 4 chars ≈ 1 token.
+ *
+ * When `result.budgets.maxTokens` is present (any path that went through
+ * `retrieve()` above), it's used as the default ceiling so per-profile
+ * budgets flow all the way to render. An explicit `maxTokens` arg still
+ * wins over the profile value for callers that want a one-off override.
  */
-function formatMemoryBlock(result, maxTokens = 1500) {
-  return core.formatMemoryBlock(result, maxTokens * 4);
+function formatMemoryBlock(result, maxTokens) {
+  const profileMax = result && result.budgets && Number(result.budgets.maxTokens);
+  const effective = (typeof maxTokens === "number" && Number.isFinite(maxTokens))
+    ? maxTokens
+    : (Number.isFinite(profileMax) && profileMax > 0 ? profileMax : 1500);
+  return core.formatMemoryBlock(result, effective * 4);
 }
 
-module.exports = { retrieve, formatMemoryBlock };
+module.exports = { retrieve, formatMemoryBlock, BUDGET_PROFILES, resolveBudgets };

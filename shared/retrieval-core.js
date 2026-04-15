@@ -162,12 +162,17 @@ async function lexicalSearch(pool, chatIds, query, limit = 5) {
 /**
  * HNSW vector search over events.embedding (populated by the multi-
  * granularity backfill). Previously eval-only; now shared.
+ *
+ * `world_time` is a nullable human-readable in-story time marker (e.g.
+ * "Day 3, morning") added by Agent A's schema migration. We project it
+ * so the fused event payload carries the marker all the way through to
+ * timeline-ordered rendering — see `getRecentEvents` ORDER BY.
  */
 async function eventVectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
   const ids = normalizeChatIds(chatIds);
   if (!ids) return [];
   const { rows } = await pool.query(
-    `SELECT e.id, e.source_text, e.message_index, e.timestamp, e.summary,
+    `SELECT e.id, e.source_text, e.message_index, e.timestamp, e.summary, e.world_time,
             1 - (e.embedding <=> $1::vector) as similarity
      FROM events e
      WHERE e.chat_id = ANY($2::text[])
@@ -181,6 +186,7 @@ async function eventVectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
     source_text: r.source_text ?? r.summary ?? "",
     message_index: r.message_index ?? null,
     timestamp: r.timestamp ?? null,
+    world_time: r.world_time ?? null,
     session_id: null,
     rank: r.similarity,
   }));
@@ -189,6 +195,9 @@ async function eventVectorSearch(pool, chatIds, queryEmbedding, limit = 5) {
 /**
  * Full-text lexical search over events.source_text. Used in hybrid
  * fusion alongside the event vector search. OR tsquery.
+ *
+ * Projects `world_time` for the same reason `eventVectorSearch` does —
+ * fused event payloads need it for downstream timeline ordering.
  */
 async function eventLexicalSearch(pool, chatIds, query, limit = 5) {
   const ids = normalizeChatIds(chatIds);
@@ -196,7 +205,7 @@ async function eventLexicalSearch(pool, chatIds, query, limit = 5) {
   const tsquery = buildOrTsquery(query);
   if (!tsquery) return [];
   const { rows } = await pool.query(
-    `SELECT e.id, e.source_text, e.message_index, e.timestamp,
+    `SELECT e.id, e.source_text, e.message_index, e.timestamp, e.world_time,
             ts_rank(to_tsvector('english', e.source_text), to_tsquery('english', $1)) as rank
      FROM events e
      WHERE e.chat_id = ANY($2::text[])
@@ -211,6 +220,7 @@ async function eventLexicalSearch(pool, chatIds, query, limit = 5) {
     source_text: r.source_text ?? "",
     message_index: r.message_index ?? null,
     timestamp: r.timestamp ?? null,
+    world_time: r.world_time ?? null,
     session_id: null,
     rank: r.rank,
   }));
@@ -539,6 +549,12 @@ function capPerKind(sorted, caps, limit) {
  *   query         — raw query string (required for lexical sources)
  *   limit         — top-N after per-kind caps (default 20)
  *   boostCharIds  — character IDs for graph expansion boost (optional)
+ *   budgets       — optional per-consumer slice caps from retriever.js.
+ *                   When present, uses `budgets.events` / `.dialogue` /
+ *                   `.memory` / `.snapshots` as the per-kind caps,
+ *                   overriding PER_KIND_CAPS. Absent → today's default
+ *                   behavior for backward compat with eval harness /
+ *                   legacy callers.
  *
  * Per-source overfetch sizes are tuned per REVIEW §5d:
  *   - memory/event/snapshot vector: limit*3 (cheap pgvector ops)
@@ -546,7 +562,7 @@ function capPerKind(sorted, caps, limit) {
  *   - dialogue quote: limit*2 (trigram is the expensive one)
  *   - event lexical: min(30, limit*2) (capped; only ~10 ever rendered)
  */
-async function hybridSearch(pool, { chatIds, embedding, query, limit = 20, boostCharIds = [] }) {
+async function hybridSearch(pool, { chatIds, embedding, query, limit = 20, boostCharIds = [], budgets = null }) {
   const ids = normalizeChatIds(chatIds);
   if (!ids) return [];
 
@@ -605,7 +621,7 @@ async function hybridSearch(pool, { chatIds, embedding, query, limit = 20, boost
   // lift them in.
   if (boostCharIds && boostCharIds.length > 0) {
     const { rows: boostedEventRows } = await pool.query(
-      `SELECT DISTINCT e.id, e.source_text, e.message_index, e.timestamp, e.summary
+      `SELECT DISTINCT e.id, e.source_text, e.message_index, e.timestamp, e.summary, e.world_time
        FROM events e
        JOIN participated_in pi ON pi.event_id = e.id
        WHERE e.chat_id = ANY($1::text[])
@@ -625,6 +641,7 @@ async function hybridSearch(pool, { chatIds, embedding, query, limit = 20, boost
           source_text: r.source_text ?? r.summary ?? "",
           message_index: r.message_index ?? null,
           timestamp: r.timestamp ?? null,
+          world_time: r.world_time ?? null,
           session_id: null,
         },
       };
@@ -644,7 +661,26 @@ async function hybridSearch(pool, { chatIds, embedding, query, limit = 20, boost
   }
 
   const sorted = [...scores.values()].sort((a, b) => b.score - a.score);
-  return capPerKind(sorted, PER_KIND_CAPS, limit);
+  // When the caller passed a `budgets` profile, its per-kind slice sizes
+  // become the effective caps. This is how the character-panel path
+  // shrinks to `{ events: 5, memory: 5, dialogue: 0, snapshots: 0 }` and
+  // the mindmap path to `{ events: 30, others: 0 }` without touching the
+  // default PER_KIND_CAPS used by eval / legacy callers.
+  const caps = budgets
+    ? {
+        memory: Math.max(0, Number(budgets.memory ?? 0)),
+        event: Math.max(0, Number(budgets.events ?? 0)),
+        dialogue: Math.max(0, Number(budgets.dialogue ?? 0)),
+        snapshot: Math.max(0, Number(budgets.snapshots ?? 0)),
+      }
+    : PER_KIND_CAPS;
+  // Derive a top-N ceiling from the summed per-kind caps (plus a small
+  // floor) so a mindmap-style profile (events: 30) actually gets 30 out
+  // rather than being truncated to the default `limit`.
+  const effectiveLimit = budgets
+    ? Math.max(limit, (caps.memory + caps.event + caps.dialogue + caps.snapshot) || limit)
+    : limit;
+  return capPerKind(sorted, caps, effectiveLimit);
 }
 
 // ── Structured graph helpers (shared between eval + ST) ─────────
@@ -673,18 +709,46 @@ async function getRelationships(pool, chatIds, characters) {
   return rows;
 }
 
+/**
+ * Timeline-ordered recent events. Feeds the "Recent Events" section of
+ * the rendered memory block.
+ *
+ * Ordering (Agent A's `events.world_time` integration):
+ *   `(world_time IS NULL), world_time, message_index`
+ *
+ * Rationale:
+ *   - Rows with a non-null world_time sort first, in lexical order. For
+ *     in-story markers like "Day 3, morning" / "Day 4, dawn" lexical
+ *     ordering is a good-enough proxy for chronological within a single
+ *     chat — a full in-story time parser is way out of scope here.
+ *   - Nulls sink to the end (`IS NULL` sorts true/1 after false/0).
+ *   - `message_index` is the tiebreaker, which matches today's fallback
+ *     behavior: a chat with zero world_time rows sorts purely by
+ *     message_index, i.e. exactly what a naive "recent events" view
+ *     returned before the migration. That's intentional — the rollout
+ *     is non-disruptive until the extractor actually starts writing
+ *     world_time values.
+ *
+ * Note: the previous ordering was `significance DESC, timestamp DESC`
+ * ("most important first"). The world_time ordering is chronological,
+ * not significance-based — the spec explicitly asks for timeline
+ * ordering here because the "Recent Events" block is read top-to-bottom
+ * as a narrative recap, and interleaving sig-5 with sig-3 events out of
+ * order kept confusing the model. Significance is still reflected
+ * elsewhere (matched-event rendering, arc importance).
+ */
 async function getRecentEvents(pool, chatIds, limit = 8) {
   const ids = normalizeChatIds(chatIds);
   if (!ids) return [];
   const { rows } = await pool.query(
-    `SELECT e.summary, e.source_text, e.significance, e.timestamp, e.message_index,
+    `SELECT e.summary, e.source_text, e.significance, e.timestamp, e.message_index, e.world_time,
             array_agg(c.name) FILTER (WHERE c.name IS NOT NULL) as participants
      FROM events e
      LEFT JOIN participated_in pi ON pi.event_id = e.id
      LEFT JOIN characters c ON c.id = pi.character_id
      WHERE e.chat_id = ANY($1::text[])
      GROUP BY e.id
-     ORDER BY e.significance DESC, e.timestamp DESC
+     ORDER BY (e.world_time IS NULL), e.world_time, e.message_index
      LIMIT $2`,
     [ids, limit],
   );
@@ -695,6 +759,7 @@ async function getRecentEvents(pool, chatIds, limit = 8) {
     participants: r.participants ?? [],
     timestamp: r.timestamp,
     message_index: r.message_index ?? null,
+    world_time: r.world_time ?? null,
   }));
 }
 

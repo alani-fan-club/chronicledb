@@ -576,7 +576,16 @@ async function init(router) {
 
   router.post("/retrieve", async (req, res) => {
     try {
-      const { chatId, characterName, activeCharacters, recentText, sessionId, maxTokens } = req.body;
+      const {
+        chatId,
+        characterName,
+        activeCharacters,
+        recentText,
+        sessionId,
+        maxTokens,
+        budgetProfile,
+        budgetOverrides,
+      } = req.body;
 
       // Load per-character config to know which chats to remember
       const charConfig = characterName
@@ -598,9 +607,22 @@ async function init(router) {
         sessionMode: charConfig.sessionMode || "persistent",
         sessionId,
         selectedChats, // scoped chat IDs (defaults to [chatId] when no preference set)
+        budgetProfile,
+        budgetOverrides,
       });
 
-      const memoryBlock = formatMemoryBlock(result, maxTokens || 1500);
+      // Precedence for the render ceiling:
+      //   1. explicit req.body.maxTokens (legacy one-off override)
+      //   2. result.budgets.maxTokens (from the resolved profile, which
+      //      already honors settings.maxInjectionTokens and explicit
+      //      per-field budgetOverrides)
+      //   3. 1500 fallback (unchanged)
+      // retriever.js::formatMemoryBlock already prefers result.budgets
+      // when no maxTokens is passed, so we only pass a value when the
+      // caller explicitly asked for one.
+      const memoryBlock = typeof maxTokens === "number"
+        ? formatMemoryBlock(result, maxTokens)
+        : formatMemoryBlock(result);
       res.json({ result, memoryBlock });
     } catch (err) {
       console.error("[ChronicleDB] Retrieval error:", err);

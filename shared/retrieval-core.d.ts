@@ -45,6 +45,19 @@ export interface HybridSearchOptions {
   query: string;
   limit?: number;
   boostCharIds?: string[];
+  /**
+   * Optional per-consumer budget caps from retriever.js. When present,
+   * its `events` / `dialogue` / `memory` / `snapshots` fields override
+   * the default PER_KIND_CAPS for this call. Absent → legacy behavior.
+   */
+  budgets?: {
+    events?: number;
+    dialogue?: number;
+    memory?: number;
+    snapshots?: number;
+    maxTokens?: number;
+    profile?: string;
+  } | null;
 }
 export function hybridSearch(pool: any, opts: HybridSearchOptions): Promise<any[]>;
 

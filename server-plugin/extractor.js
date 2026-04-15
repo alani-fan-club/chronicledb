@@ -180,6 +180,10 @@ Extract:
    that justifies the event existing — preserve it exactly so we can quote it
    back later. If no specific quote captures it (pure narration), include the
    single most narratively load-bearing sentence verbatim.
+   Also capture **world_time** per event: optional, any in-world time marker
+   for this moment, natural language like "the next morning" or "three hours
+   later" or null if none. Null is the expected default — only populate when
+   the prose itself names a time shift or time-of-day.
    CRITICAL: major events (4-5) are the load-bearing plot beats — only mark something major if it would appear in a summary of the whole chapter:
    - 5 = defining moment (major plot beat, character revelation, death, transformation, confession, betrayal)
    - 4 = important development (confrontation, decision, significant reveal, first meeting, turning point)
@@ -188,10 +192,11 @@ Extract:
    - 1 = flavor detail (background action, mundane interaction, transitional scene)
    Be strict about 4-5. In a typical batch you'll have 1-3 major events at most, many minor ones.
 4. **Event chains** — when one event directly causes, triggers, or leads to another. Think causally: "X caused Y", "Because of A, B happened". Only chain events that have a clear causal link.
-5. **World state** — environmental/setting changes (key-value)
-6. **Knowledge updates** — what each character learned AND what they explicitly do not know
-7. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
-8. **Plot threads** — foreshadowing, pending events, unresolved tensions, promises, threats. Mark if a prior thread got resolved.
+5. **Location transitions** — movement between two named locations mentioned in this batch, as a character going from A to B. Empty if none. Do not invent locations that aren't explicitly in the prose.
+6. **World state** — environmental/setting changes (key-value)
+7. **Knowledge updates** — what each character learned AND what they explicitly do not know
+8. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
+9. **Plot threads** — foreshadowing, pending events, unresolved tensions, promises, threats. Mark if a prior thread got resolved.
 
 RULES:
 - Only attribute knowledge to characters who were PRESENT and could perceive it
@@ -223,9 +228,13 @@ Return ONLY valid JSON:
     "source_quote": "<verbatim quote from the passage>",
     "participants": [],
     "location": "",
-    "significance": 3
+    "significance": 3,
+    "world_time": "<optional: any in-world time marker for this moment, natural language like 'the next morning' or 'three hours later' or null if none>"
   }],
   "event_chains": [{ "from": "event_key", "to": "event_key", "chain_type": "caused | triggered | led_to | followed_by", "description": "" }],
+  "location_transitions": [
+    { "from": "<location name>", "to": "<location name>" }
+  ],
   "world_state": [{ "key": "", "value": "", "reason": "" }],
   "knowledge_updates": [
     { "character": "", "learned": "", "source": "" },
@@ -1087,6 +1096,7 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
       significance: event.significance,
       messageIndex: msgIdx,
       sessionId: safeChat,
+      worldTime: event.world_time,
     });
     if (event.event_key) eventKeyToId.set(event.event_key, eventId);
     insertedEventIds.push(eventId);
@@ -1145,6 +1155,30 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
         chainType: chain.chain_type || "caused",
         description: chain.description || "",
       });
+    }
+  }
+
+  // AGARS location adjacency. Each transition is an undirected edge
+  // between two named locations the extractor saw characters move between
+  // in this batch. upsertLocationAdjacency is idempotent (content-id-keyed
+  // on the lex-sorted pair) so re-ingesting a chat is a no-op on these
+  // rows. The event anchor is a rough pointer at this batch's first event
+  // — the extractor doesn't attach transitions to specific events, so we
+  // don't have a per-transition spine; the anchor is an optional
+  // breadcrumb, not a load-bearing join key. Failures are swallowed so a
+  // bad transition doesn't abort the rest of the extraction.
+  const spineEventId = insertedEventIds[0] || null;
+  for (const t of (extraction.location_transitions || [])) {
+    if (!t || !t.from || !t.to) continue;
+    try {
+      await db.upsertLocationAdjacency(settings, {
+        chatId: safeChat,
+        fromName: t.from,
+        toName: t.to,
+        eventId: spineEventId,
+      });
+    } catch (err) {
+      console.warn(`[ChronicleDB] location_adjacency upsert failed: ${err.message}`);
     }
   }
 

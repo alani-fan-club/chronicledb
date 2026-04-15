@@ -459,3 +459,31 @@ CREATE TABLE IF NOT EXISTS character_memory_config (
     selected_chats TEXT[] DEFAULT '{}',
     updated_at     TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- AGARS Path: in-story time marker per event. Free-form prose like "next
+-- morning", "Day 3, evening", "three hours later", "dusk". Nullable — most
+-- events have no explicit time marker in the source passage, and we
+-- deliberately do NOT use a numeric day/hour clock (ChronicleDB is a memory
+-- store over free-form prose, not a simulator). upsertEvent writes this via
+-- COALESCE so re-ingesting a null on an already-populated row is a no-op.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS world_time TEXT;
+
+-- AGARS Path: chat-scoped undirected adjacency between two locations,
+-- emitted by the extractor when source prose shows characters moving
+-- between named locations. Content-addressed id: sort a/b lexically then
+-- hash (chat_id, a, b), so (X,Y) and (Y,X) dedupe to the same row.
+-- first_seen_event_id is a rough anchor to the batch that produced this
+-- edge (ON DELETE SET NULL so deleting the anchor doesn't cascade-drop
+-- the edge). Not used for runtime pathing / movement validation — we're
+-- ingesting edges, not policing movement.
+CREATE TABLE IF NOT EXISTS location_adjacency (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT,
+    location_a_id TEXT REFERENCES locations(id) ON DELETE CASCADE,
+    location_b_id TEXT REFERENCES locations(id) ON DELETE CASCADE,
+    first_seen_event_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chat_id, location_a_id, location_b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_loc_adj_chat_a ON location_adjacency (chat_id, location_a_id);
+CREATE INDEX IF NOT EXISTS idx_loc_adj_chat_b ON location_adjacency (chat_id, location_b_id);

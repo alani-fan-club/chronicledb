@@ -137,6 +137,36 @@ async function upsertLocation(settings, name, description) {
   return id;
 }
 
+// AGARS location adjacency: undirected per-chat edge between two locations
+// that the source prose explicitly moved characters between. Idempotent by
+// content id (lex-sorted (chat_id, a, b) hash) so (X,Y) and (Y,X) collapse
+// to the same row. No-op when from === to after slug resolution (handles
+// the LLM emitting two synonyms of the same room). Returns the edge id, or
+// null if the transition was a self-loop.
+async function upsertLocationAdjacency(settings, { chatId, fromName, toName, eventId }) {
+  if (!fromName || !toName) return null;
+  const fromId = await upsertLocation(settings, fromName, "");
+  const toId = await upsertLocation(settings, toName, "");
+  if (fromId === toId) return null;
+
+  // Lex-sort the two endpoint ids BEFORE hashing so the content id is
+  // direction-independent. The UNIQUE constraint on
+  // (chat_id, location_a_id, location_b_id) is also keyed off the sorted
+  // pair for the same reason.
+  const [a, b] = fromId < toId ? [fromId, toId] : [toId, fromId];
+  const safeChat = chatId || "";
+  const id = contentId("locadj", `${safeChat}::${a}::${b}`);
+
+  const p = getPool(settings);
+  await p.query(
+    `INSERT INTO location_adjacency (id, chat_id, location_a_id, location_b_id, first_seen_event_id)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (chat_id, location_a_id, location_b_id) DO NOTHING`,
+    [id, safeChat, a, b, eventId || null],
+  );
+  return id;
+}
+
 async function upsertRelationship(settings, { from, to, sentiment, intensity, description, sessionId }) {
   const p = getPool(settings);
   const fromId = slugify(from);
@@ -154,7 +184,7 @@ async function upsertRelationship(settings, { from, to, sentiment, intensity, de
   );
 }
 
-async function upsertEvent(settings, { summary, sourceText, participants, location, significance, messageIndex, sessionId }) {
+async function upsertEvent(settings, { summary, sourceText, participants, location, significance, messageIndex, sessionId, worldTime }) {
   const p = getPool(settings);
   const id = contentId("evt", `${summary}|${sessionId || ""}|${messageIndex || 0}`);
 
@@ -163,14 +193,22 @@ async function upsertEvent(settings, { summary, sourceText, participants, locati
     locationId = await upsertLocation(settings, location, "");
   }
 
+  // AGARS world_time: in-story time marker, free-form prose. Null is the
+  // expected default for most events. Empty strings are normalized to NULL
+  // here in JS so the update clause can use a bare COALESCE($8, ...) —
+  // re-ingesting the same event without a time marker never clobbers a
+  // previously-populated value.
+  const wtArg = worldTime && String(worldTime).trim().length > 0 ? String(worldTime).trim() : null;
+
   await p.query(
-    `INSERT INTO events (id, summary, source_text, significance, message_index, location_id, chat_id, timestamp)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+    `INSERT INTO events (id, summary, source_text, significance, message_index, location_id, chat_id, timestamp, world_time)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), $8)
      ON CONFLICT (id) DO UPDATE SET
        summary = EXCLUDED.summary,
        source_text = COALESCE(NULLIF(EXCLUDED.source_text, ''), events.source_text),
-       significance = EXCLUDED.significance`,
-    [id, summary, sourceText || "", significance || 3, messageIndex || 0, locationId, sessionId || ""],
+       significance = EXCLUDED.significance,
+       world_time = COALESCE($8, events.world_time)`,
+    [id, summary, sourceText || "", significance || 3, messageIndex || 0, locationId, sessionId || "", wtArg],
   );
 
   for (const name of (participants || [])) {
@@ -1969,7 +2007,7 @@ async function closePool() {
 
 module.exports = {
   getPool, setPoolErrorHandler, initSchema, slugify,
-  upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
+  upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertLocationAdjacency, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
   upsertTrait, classifyDisposition, getTraitsForCharacter, recomputeCharacterSummary,
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads, upsertItem,

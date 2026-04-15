@@ -563,6 +563,83 @@ function bindSettings(settings) {
       toastr.error(`Ingestion error: ${err.message}`);
     }
   });
+
+  // Debug: recent LLM calls. Buffer lives on the server in llm-monitor.js;
+  // we fetch and render on demand. No auto-refresh on drawer open — the
+  // buffer starts empty until a follow-up wires extractor.js into the
+  // monitor, so a click-to-refresh flow is simpler and avoids network
+  // chatter every time the settings panel opens. Clear view wipes only
+  // the rendered table (no server-side clear endpoint today).
+  // TODO: add POST /debug/llm-calls/clear if we want a server-side wipe.
+  $("#chronicle_refreshLlmMonitor").on("click", () => {
+    refreshLlmMonitor();
+  });
+  $("#chronicle_clearLlmMonitor").on("click", () => {
+    $("#chronicle_llmMonitorTable").html(
+      '<div class="chronicle-hint">No LLM calls recorded yet.</div>',
+    );
+  });
+}
+
+async function refreshLlmMonitor() {
+  const target = $("#chronicle_llmMonitorTable");
+  if (target.length === 0) return;
+  try {
+    const res = await fetch(`${PLUGIN_BASE}/debug/llm-calls`, {
+      headers: getRequestHeaders(),
+    });
+    if (!res.ok) {
+      target.html(
+        `<div class="chronicle-hint">Error loading LLM calls: HTTP ${escapeHtml(String(res.status))}</div>`,
+      );
+      return;
+    }
+    const data = await res.json();
+    const calls = Array.isArray(data.calls) ? data.calls : [];
+    if (calls.length === 0) {
+      target.html('<div class="chronicle-hint">No LLM calls recorded yet.</div>');
+      return;
+    }
+    // Render: one row per call. Fields are server-supplied but may echo
+    // user prompts or model error strings, so escape every interpolation.
+    // Format per row:
+    //   HH:MM:SS  provider:model  purpose  Nms  STATUS
+    //   (error message on a second line if status === "error")
+    const rows = calls.map((c) => {
+      const ts = c.timestamp ? new Date(c.timestamp) : null;
+      const hhmmss = ts && !isNaN(ts.getTime())
+        ? ts.toTimeString().slice(0, 8)
+        : "--:--:--";
+      const provider = c.provider || "?";
+      const model = c.model || "?";
+      const purpose = c.purpose || "?";
+      const latency = (typeof c.latencyMs === "number") ? `${c.latencyMs}ms` : "—";
+      const status = c.status || "?";
+      const statusColor = status === "error" ? "#d66" : (status === "ok" ? "#6c6" : "#999");
+      const header =
+        `<span style="color:#888;">${escapeHtml(hhmmss)}</span> ` +
+        `<b>${escapeHtml(provider)}:${escapeHtml(model)}</b> ` +
+        `<span>${escapeHtml(purpose)}</span> ` +
+        `<span style="color:#888;">${escapeHtml(latency)}</span> ` +
+        `<span style="color:${statusColor};">${escapeHtml(status)}</span>`;
+      let errLine = "";
+      if (status === "error" && c.error) {
+        errLine =
+          `<div style="color:#d66; padding-left: 12px;">` +
+          `${escapeHtml(c.error)}</div>`;
+      }
+      return (
+        `<div style="padding: 2px 0; border-bottom: 1px solid #333;">` +
+        `${header}${errLine}` +
+        `</div>`
+      );
+    });
+    target.html(rows.join(""));
+  } catch (err) {
+    target.html(
+      `<div class="chronicle-hint">Error loading LLM calls: ${escapeHtml(err.message)}</div>`,
+    );
+  }
 }
 
 async function loadLorebookList() {

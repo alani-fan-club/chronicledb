@@ -225,6 +225,17 @@
 
       <hr>
 
+      <!-- Debug: recent LLM calls -->
+      <h4>Debug: recent LLM calls</h4>
+      <p class="chronicle-hint">Last 200 LLM requests the plugin has made. Useful for spotting stalls, retries, and rate limits. Buffer clears on restart.</p>
+      <div class="chronicle-setting-row">
+        <input type="button" id="chronicle_refreshLlmMonitor" class="menu_button menu_button_small" value="Refresh">
+        <input type="button" id="chronicle_clearLlmMonitor" class="menu_button menu_button_small" value="Clear view">
+      </div>
+      <div id="chronicle_llmMonitorTable" class="chronicle-hint" style="max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 11px;"></div>
+
+      <hr>
+
       <!-- Actions -->
       <div class="chronicle-setting">
         <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open mind map">

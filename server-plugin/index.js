@@ -1212,6 +1212,14 @@ async function init(router) {
     }
   });
 
+  // ── Debug: recent LLM calls ──────────────────────────────────
+  // In-memory ring buffer surface for the settings panel. Empty until
+  // extractor.js is wired in a follow-up (intentionally deferred to avoid
+  // conflicting with parallel edits to that file).
+  router.get("/debug/llm-calls", (_req, res) => {
+    res.json({ calls: require("./llm-monitor").list() });
+  });
+
   console.log("[ChronicleDB] Server plugin ready.");
 }
 

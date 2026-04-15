@@ -4,6 +4,7 @@
  */
 
 const db = require("./db");
+const llmMonitor = require("./llm-monitor");
 
 // Shared retry helper. Three call sites used to hand-roll this (callWithRetry,
 // the inline generateSituatingBlurb loop, and run_eval_gemini.ts::gemini) —
@@ -39,6 +40,55 @@ async function withExponentialBackoff(fn, { retries = 4, baseDelay = 1000, isRet
   }
   // Unreachable: the loop either returns or throws.
   throw new Error("withExponentialBackoff: exhausted without result");
+}
+
+// Wraps an LLM-calling async closure with a monitor record. Measures total
+// latency (including all backoff retries if fn internally uses
+// withExponentialBackoff), captures provider/model/purpose/prompt preview,
+// and records the final outcome. On error, records status=error with the
+// message and rethrows so caller control flow is unchanged.
+async function trackLlm(meta, fn) {
+  const started = Date.now();
+  try {
+    const result = await fn();
+    const formatted = meta.formatResult
+      ? meta.formatResult(result)
+      : typeof result === "string"
+        ? result
+        : result == null
+          ? null
+          : JSON.stringify(result);
+    llmMonitor.record({
+      purpose: meta.purpose,
+      provider: meta.provider,
+      model: meta.model,
+      promptPreview: meta.promptPreview,
+      responsePreview: formatted,
+      latencyMs: Date.now() - started,
+      status: "ok",
+      inputSize: typeof meta.inputSize === "number" ? meta.inputSize : null,
+      outputSize:
+        typeof formatted === "string"
+          ? formatted.length
+          : typeof meta.outputSize === "number"
+            ? meta.outputSize
+            : null,
+    });
+    return result;
+  } catch (err) {
+    llmMonitor.record({
+      purpose: meta.purpose,
+      provider: meta.provider,
+      model: meta.model,
+      promptPreview: meta.promptPreview,
+      responsePreview: null,
+      latencyMs: Date.now() - started,
+      status: "error",
+      error: err && err.message ? err.message : String(err),
+      inputSize: typeof meta.inputSize === "number" ? meta.inputSize : null,
+    });
+    throw err;
+  }
 }
 
 const EXTRACTION_PROMPT = `You are a narrative analyst for a roleplay memory system. Extract structured information from RP messages.
@@ -281,6 +331,9 @@ JSON:`;
   const model = (settings.extractionModel || "gemini-2.5-flash-lite").trim();
   const apiUrl = (settings.extractionApiUrl || "https://generativelanguage.googleapis.com/v1beta").trim();
 
+  return trackLlm(
+    { purpose: "extract", provider: apiType, model, promptPreview: prompt, inputSize: prompt.length },
+    async () => {
   let content;
 
   if (apiType === "openai") {
@@ -341,6 +394,8 @@ JSON:`;
   if (!content) throw new Error("LLM returned empty response");
 
   return parseResponse(content);
+    },
+  );
 }
 
 function parseResponse(raw) {
@@ -450,21 +505,34 @@ async function embedBatch(settings, texts) {
   const cfg = embeddingConfig(settings);
   if (!cfg.apiKey) throw new Error(`embedBatch: ${cfg.apiType} embedding API key is missing`);
 
-  const out = new Array(texts.length);
-  for (let start = 0; start < texts.length; start += EMBED_BATCH_CAP) {
-    const slice = texts.slice(start, start + EMBED_BATCH_CAP);
-    let vecs;
-    if (cfg.apiType === "openai") vecs = await openaiEmbedBatch(cfg, slice);
-    else if (cfg.apiType === "vertex") vecs = await vertexEmbedBatch(cfg, slice);
-    else vecs = await geminiEmbedBatch(cfg, slice);
-    if (vecs.length !== slice.length) {
-      throw new Error(`${cfg.apiType} embedBatch returned ${vecs.length} vectors for ${slice.length} inputs`);
-    }
-    for (let i = 0; i < vecs.length; i++) {
-      out[start + i] = vecs[i];
-    }
-  }
-  return out;
+  const totalChars = texts.reduce((a, t) => a + (t?.length || 0), 0);
+  return trackLlm(
+    {
+      purpose: "embed-batch",
+      provider: cfg.apiType,
+      model: cfg.model,
+      promptPreview: `[${texts.length} texts, ${totalChars} chars total]`,
+      inputSize: totalChars,
+      formatResult: (vecs) => `[${vecs.length} vectors, ${cfg.dimension}-dim]`,
+    },
+    async () => {
+      const out = new Array(texts.length);
+      for (let start = 0; start < texts.length; start += EMBED_BATCH_CAP) {
+        const slice = texts.slice(start, start + EMBED_BATCH_CAP);
+        let vecs;
+        if (cfg.apiType === "openai") vecs = await openaiEmbedBatch(cfg, slice);
+        else if (cfg.apiType === "vertex") vecs = await vertexEmbedBatch(cfg, slice);
+        else vecs = await geminiEmbedBatch(cfg, slice);
+        if (vecs.length !== slice.length) {
+          throw new Error(`${cfg.apiType} embedBatch returned ${vecs.length} vectors for ${slice.length} inputs`);
+        }
+        for (let i = 0; i < vecs.length; i++) {
+          out[start + i] = vecs[i];
+        }
+      }
+      return out;
+    },
+  );
 }
 
 async function geminiEmbedBatch(cfg, slice) {
@@ -601,33 +669,48 @@ async function vertexEmbedBatch(cfg, slice) {
 async function embed(settings, text) {
   const cfg = embeddingConfig(settings);
   if (!cfg.apiKey) throw new Error(`embed: ${cfg.apiType} embedding API key is missing`);
-  if (cfg.apiType === "openai") {
-    const [vec] = await openaiEmbedBatch(cfg, [text]);
-    return vec;
-  }
-  if (cfg.apiType === "vertex") {
-    const [vec] = await vertexEmbedBatch(cfg, [text]);
-    return vec;
-  }
-  return withExponentialBackoff(async () => {
-    const res = await fetch(`${cfg.apiBase}/models/${cfg.model}:embedContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.apiKey },
-      body: JSON.stringify({
-        content: { parts: [{ text }] },
-        taskType: "SEMANTIC_SIMILARITY",
-        outputDimensionality: cfg.dimension,
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      const err = new Error(`Gemini embed error ${res.status}: ${body}`);
-      err.status = res.status;
-      throw err;
-    }
-    const data = await res.json();
-    return data.embedding.values;
-  });
+  // openai/vertex paths delegate to embedBatch's sub-functions, which don't
+  // emit their own monitor records, so embed() is the right wrap point for
+  // the single-text case to avoid double-counting against embedBatch.
+  return trackLlm(
+    {
+      purpose: "embed",
+      provider: cfg.apiType,
+      model: cfg.model,
+      promptPreview: typeof text === "string" ? text.slice(0, 500) : null,
+      inputSize: typeof text === "string" ? text.length : null,
+      formatResult: (vec) => `[vector, ${Array.isArray(vec) ? vec.length : 0}-dim]`,
+    },
+    async () => {
+      if (cfg.apiType === "openai") {
+        const [vec] = await openaiEmbedBatch(cfg, [text]);
+        return vec;
+      }
+      if (cfg.apiType === "vertex") {
+        const [vec] = await vertexEmbedBatch(cfg, [text]);
+        return vec;
+      }
+      return withExponentialBackoff(async () => {
+        const res = await fetch(`${cfg.apiBase}/models/${cfg.model}:embedContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": cfg.apiKey },
+          body: JSON.stringify({
+            content: { parts: [{ text }] },
+            taskType: "SEMANTIC_SIMILARITY",
+            outputDimensionality: cfg.dimension,
+          }),
+        });
+        if (!res.ok) {
+          const body = await res.text();
+          const err = new Error(`Gemini embed error ${res.status}: ${body}`);
+          err.status = res.status;
+          throw err;
+        }
+        const data = await res.json();
+        return data.embedding.values;
+      });
+    },
+  );
 }
 
 // Path 3: tiny trait-pair verifier. Called by db.upsertTrait when a candidate
@@ -683,37 +766,40 @@ Rules:
 
 Answer:`;
 
-  return withExponentialBackoff(async () => {
-    const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...auth.headers },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        // 32 rather than 8: Gemini 2.5 models sometimes consume output
-        // tokens on internal thinking before emitting visible text, and
-        // a prior bug silently zeroed out the eval judge with a tight
-        // cap. 32 is still ≤1 cent per thousand calls and gives room for
-        // "Answer: MERGE" or similar incidental preamble.
-        generationConfig: { temperature: 0.0, maxOutputTokens: 32 },
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      const err = new Error(`Trait verifier LLM error ${res.status}: ${body}`);
-      err.status = res.status;
-      throw err;
-    }
-    const data = await res.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    // Tolerant parse: the three valid tokens are disjoint substrings, so
-    // check longest-first. Handles "Answer: MERGE", "**MERGE**", "MERGE.",
-    // etc. without falling through to KEEP_DISTINCT on incidental preamble.
-    const up = text.toUpperCase();
-    if (up.includes("KEEP_DISTINCT")) return "KEEP_DISTINCT";
-    if (up.includes("REJECT_NEW")) return "REJECT_NEW";
-    if (up.includes("MERGE")) return "MERGE";
-    throw new Error(`verifyTraitPair: unexpected response "${(text || "").slice(0, 40)}"`);
-  });
+  return trackLlm(
+    { purpose: "verify-trait", provider: apiType, model, promptPreview: prompt, inputSize: prompt.length },
+    async () => withExponentialBackoff(async () => {
+      const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...auth.headers },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          // 32 rather than 8: Gemini 2.5 models sometimes consume output
+          // tokens on internal thinking before emitting visible text, and
+          // a prior bug silently zeroed out the eval judge with a tight
+          // cap. 32 is still ≤1 cent per thousand calls and gives room for
+          // "Answer: MERGE" or similar incidental preamble.
+          generationConfig: { temperature: 0.0, maxOutputTokens: 32 },
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        const err = new Error(`Trait verifier LLM error ${res.status}: ${body}`);
+        err.status = res.status;
+        throw err;
+      }
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      // Tolerant parse: the three valid tokens are disjoint substrings, so
+      // check longest-first. Handles "Answer: MERGE", "**MERGE**", "MERGE.",
+      // etc. without falling through to KEEP_DISTINCT on incidental preamble.
+      const up = text.toUpperCase();
+      if (up.includes("KEEP_DISTINCT")) return "KEEP_DISTINCT";
+      if (up.includes("REJECT_NEW")) return "REJECT_NEW";
+      if (up.includes("MERGE")) return "MERGE";
+      throw new Error(`verifyTraitPair: unexpected response "${(text || "").slice(0, 40)}"`);
+    }),
+  );
 }
 
 async function generateSituatingBlurb(settings, { chatTitle, surroundingContext, message }) {
@@ -738,25 +824,28 @@ ${(message || "").slice(0, 3000)}
 
 Situating sentences:`;
 
-  return withExponentialBackoff(async () => {
-    const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...auth.headers },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      const err = new Error(`Situating LLM error ${res.status}: ${body}`);
-      err.status = res.status;
-      throw err;
-    }
-    const data = await res.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    return (text || "").trim();
-  });
+  return trackLlm(
+    { purpose: "situating-blurb", provider: apiType, model, promptPreview: prompt, inputSize: prompt.length },
+    async () => withExponentialBackoff(async () => {
+      const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...auth.headers },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 200 },
+        }),
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        const err = new Error(`Situating LLM error ${res.status}: ${body}`);
+        err.status = res.status;
+        throw err;
+      }
+      const data = await res.json();
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      return (text || "").trim();
+    }),
+  );
 }
 
 // Path 4: one-shot LLM arc naming. Called by arc-builder.js once per
@@ -861,7 +950,15 @@ Produce:
 Respond with strict JSON, no preamble, no markdown fence:
 {"title": "...", "description": "..."}`;
 
-  return withExponentialBackoff(async () => {
+  return trackLlm(
+    {
+      purpose: `name-${safeKind === "super arc" ? "super-arc" : safeKind}`,
+      provider: apiType,
+      model,
+      promptPreview: prompt,
+      inputSize: prompt.length,
+    },
+    async () => withExponentialBackoff(async () => {
     const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...auth.headers },
@@ -914,7 +1011,8 @@ Respond with strict JSON, no preamble, no markdown fence:
     if (!title) throw new Error(`nameStoryArc: could not extract title from "${text.slice(0, 80)}"`);
     if (!description) description = ""; // title-only is acceptable; arc still gets a real name
     return { title, description };
-  });
+    }),
+  );
 }
 
 const CHUNK_CHAR_TARGET = 2000;

@@ -8,6 +8,20 @@ const { GOLDBERG_100, NRC_EMOTION, NRC_VAD } = require("../shared/trait-lexicons
 let pool = null;
 let poolConfigHash = "";
 
+// Pool error handler. pg.Pool emits 'error' when an IDLE client fails —
+// typically because the DB server restarted, dropped the connection, or
+// the network blipped. Without a listener, node-postgres crashes the
+// process on emit. index.js registers a real handler that flips the
+// plugin's connectionState so /status reflects the outage; before that
+// runs, the default below just logs so we still see what happened.
+let poolErrorHandler = (err) => {
+  console.error("[ChronicleDB] Pool error (idle client):", err?.message || err);
+};
+
+function setPoolErrorHandler(fn) {
+  if (typeof fn === "function") poolErrorHandler = fn;
+}
+
 /**
  * Compute a deterministic content-addressed ID from a semantic key.
  * Re-ingesting the same content will produce the same ID, allowing
@@ -34,6 +48,9 @@ function getPool(settings) {
       // max:10 was leaving the excess queries queued on the pool; 20 gives
       // headroom so the common fan-out patterns run unthrottled.
       max: 20,
+    });
+    pool.on("error", (err) => {
+      try { poolErrorHandler(err); } catch (_) { /* swallowing ensures listener never throws */ }
     });
   }
   return pool;
@@ -1951,7 +1968,7 @@ async function closePool() {
 }
 
 module.exports = {
-  getPool, initSchema, slugify,
+  getPool, setPoolErrorHandler, initSchema, slugify,
   upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
   upsertTrait, classifyDisposition, getTraitsForCharacter, recomputeCharacterSummary,
   insertContextSnapshot, getRecentSnapshots,

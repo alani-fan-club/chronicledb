@@ -76,6 +76,11 @@ const DEFAULT_SETTINGS = {
 
 let messageCounter = 0;
 let isExtracting = false;
+// Tracks whether we've already toasted the user about a DB outage so
+// subsequent /extract or /retrieve failures while still disconnected
+// don't spam the notification area. Reset when /status shows the DB
+// is reachable again.
+let dbDownNotified = false;
 
 // ── Initialization ─────────────────────────────────────────────
 
@@ -122,6 +127,13 @@ let isExtracting = false;
   } else {
     refreshStatus();
   }
+
+  // Periodic /status poll. Server-side /status probes the pool with
+  // SELECT 1, so this loop surfaces runtime DB outages (DB restart,
+  // admin shutdown, network blip) to the badge + toast without waiting
+  // for the next extraction to fail. 30s is a balance between "user
+  // notices within half a minute" and "not spamming the event loop".
+  setInterval(() => { refreshStatus().catch(() => {}); }, 30000);
 
   // ── Load chat selector when character changes ───────────────
 
@@ -287,13 +299,42 @@ async function triggerExtraction() {
           messageIndex: targetIdx,
         }),
       });
-      if (!res.ok) console.warn("[ChronicleDB] Extraction failed:", res.status);
+      if (!res.ok) {
+        await handleBackgroundFailure(res, "Extraction");
+      }
     } catch (err) {
       console.warn("[ChronicleDB] Extraction error:", err);
+      await handleBackgroundFailure(null, "Extraction", err);
     }
   } finally {
     isExtracting = false;
   }
+}
+
+// Shared handler for /extract and /retrieve failures. Reads the error
+// body so the user sees the actual cause (usually a pg connect error),
+// surfaces a one-shot toast, and kicks /status to update the badge.
+// Debounced via dbDownNotified so a sustained outage only toasts once.
+async function handleBackgroundFailure(res, context, err) {
+  let detail = err?.message || "";
+  if (res) {
+    try {
+      const body = await res.clone().json();
+      if (body?.error) detail = body.error;
+    } catch (_) { /* non-JSON body, fall back to status */ }
+    if (!detail) detail = `HTTP ${res.status}`;
+  }
+  console.warn(`[ChronicleDB] ${context} failed:`, detail);
+  if (!dbDownNotified && typeof toastr !== "undefined") {
+    dbDownNotified = true;
+    toastr.error(
+      `ChronicleDB ${context.toLowerCase()} failed: ${detail}`,
+      "Memory unavailable",
+      { timeOut: 8000 },
+    );
+  }
+  // Refresh status so the badge flips and future reconnect is detected.
+  refreshStatus().catch(() => {});
 }
 
 // ── Retrieval + Injection ──────────────────────────────────────
@@ -336,7 +377,7 @@ async function injectMemoryContext() {
     });
 
     if (!res.ok) {
-      console.warn("[ChronicleDB] Retrieval failed:", res.status);
+      await handleBackgroundFailure(res, "Retrieval");
       return;
     }
 
@@ -351,6 +392,7 @@ async function injectMemoryContext() {
     }
   } catch (err) {
     console.warn("[ChronicleDB] Retrieval error:", err);
+    await handleBackgroundFailure(null, "Retrieval", err);
   }
 }
 
@@ -586,8 +628,29 @@ async function refreshStatus() {
     }
     const data = await res.json();
     if (data.connected) {
+      // Reconnect transition: if we'd previously toasted an outage,
+      // tell the user memory is back online and reset the dedup flag so
+      // a future outage re-toasts.
+      if (dbDownNotified) {
+        dbDownNotified = false;
+        if (typeof toastr !== "undefined") {
+          toastr.success("ChronicleDB: memory reconnected", "", { timeOut: 2500 });
+        }
+      }
       setStatus("connected", "");
     } else if (data.error) {
+      // First time we observe a disconnect via the poll (rather than a
+      // direct extract/retrieve failure), surface it once via toast so
+      // the user knows memory stopped flowing even if the settings
+      // drawer is collapsed.
+      if (!dbDownNotified && typeof toastr !== "undefined") {
+        dbDownNotified = true;
+        toastr.error(
+          `ChronicleDB disconnected: ${data.error}`,
+          "Memory unavailable",
+          { timeOut: 8000 },
+        );
+      }
       setStatus("error", data.error);
     } else {
       setStatus("not-configured", "Fill in database settings and press Connect.");
@@ -602,13 +665,40 @@ async function autoConnect(settings) {
   try {
     const res = await fetch(`${PLUGIN_BASE}/init-db`, { method: "POST", headers: getRequestHeaders() });
     if (res.ok) {
+      dbDownNotified = false;
       setStatus("connected", "");
     } else {
-      const body = await res.text().catch(() => "");
-      setStatus("error", body || `HTTP ${res.status}`);
+      // Parse JSON first (the server returns {error: ...}); fall back to
+      // raw text for older responses. Toast once so the user notices at
+      // startup that memory isn't running — the settings drawer is often
+      // collapsed and the badge alone is easy to miss.
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = await res.clone().json();
+        if (body?.error) detail = body.error;
+      } catch (_) {
+        try { detail = (await res.text()) || detail; } catch (_) { /* keep HTTP code */ }
+      }
+      setStatus("error", detail);
+      if (!dbDownNotified && typeof toastr !== "undefined") {
+        dbDownNotified = true;
+        toastr.error(
+          `ChronicleDB couldn't connect: ${detail}`,
+          "Memory unavailable",
+          { timeOut: 8000 },
+        );
+      }
     }
   } catch (err) {
     setStatus("error", err.message);
+    if (!dbDownNotified && typeof toastr !== "undefined") {
+      dbDownNotified = true;
+      toastr.error(
+        `ChronicleDB couldn't connect: ${err.message}`,
+        "Memory unavailable",
+        { timeOut: 8000 },
+      );
+    }
   }
 }
 

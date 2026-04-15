@@ -67,6 +67,30 @@ function saveCachedSettings(s) {
   }
 }
 
+// Recognize pg/node connectivity failures so routes can flip
+// connectionState. Covers: refused / DNS / timeout / admin shutdown /
+// crash shutdown / cannot_connect_now, plus the catch-all "Connection
+// terminated" message pg emits when an active client loses its socket.
+// Used by /extract, /retrieve, and the /status probe; intentionally
+// over-inclusive so a real outage always flips state even if pg adds
+// new error codes in future versions.
+function isDbConnectivityError(err) {
+  if (!err) return false;
+  const code = err.code || "";
+  if (["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
+       "57P01", "57P02", "57P03", "08000", "08003", "08006"].includes(code)) return true;
+  const msg = String(err.message || "").toLowerCase();
+  return /connect|terminat|socket|refused|not found|timeout/.test(msg);
+}
+
+function markDisconnected(err) {
+  connectionState = {
+    connected: false,
+    error: err?.message || String(err),
+    initializedAt: null,
+  };
+}
+
 async function tryAutoConnect() {
   if (!settings.pgHost || !settings.pgDatabase) {
     connectionState = { connected: false, error: null, initializedAt: null };
@@ -135,6 +159,15 @@ const info = {
 async function init(router) {
   console.log("[ChronicleDB] Initializing server plugin...");
 
+  // Hook pool-level idle-client errors so a DB restart or network blip
+  // flips connectionState instead of silently killing queries. Without
+  // this the plugin would keep reporting connected=true while every
+  // subsequent query fails.
+  db.setPoolErrorHandler((err) => {
+    console.error("[ChronicleDB] Pool error (idle client):", err?.message || err);
+    markDisconnected(err);
+  });
+
   // Hydrate settings from the on-disk cache so we can auto-reconnect before
   // the UI extension pushes anything via POST /settings.
   const cached = loadCachedSettings();
@@ -184,7 +217,31 @@ async function init(router) {
 
   // ── Connection status ────────────────────────────────────────
 
-  router.get("/status", (_req, res) => {
+  router.get("/status", async (_req, res) => {
+    // Probe the pool on every poll so the UI catches runtime DB outages
+    // (DB restart, network blip, admin shutdown) without waiting for the
+    // next /extract or /retrieve to fail. Also surfaces recovery: if we
+    // previously flipped to error but the DB is back, SELECT 1 succeeds
+    // and we restore connected=true. SELECT 1 on a warm pool is
+    // microseconds so a 30s client poll is effectively free.
+    if (settings.pgHost && settings.pgDatabase) {
+      try {
+        await db.getPool(settings).query("SELECT 1");
+        if (!connectionState.connected) {
+          connectionState = {
+            connected: true,
+            error: null,
+            initializedAt: new Date().toISOString(),
+          };
+          console.log("[ChronicleDB] DB reachable again — connectionState restored.");
+        }
+      } catch (err) {
+        if (connectionState.connected || !connectionState.error) {
+          console.warn("[ChronicleDB] /status probe failed:", err.message);
+        }
+        markDisconnected(err);
+      }
+    }
     res.json({
       connected: connectionState.connected,
       error: connectionState.error,
@@ -406,6 +463,11 @@ async function init(router) {
       }
     } catch (err) {
       console.error("[ChronicleDB] Extraction error:", err);
+      // Connectivity failures (DB down, pool can't connect) flip the
+      // plugin's connectionState so the UI's /status poll sees the outage
+      // immediately instead of waiting for an idle-client error to bubble
+      // up through pool.on('error').
+      if (isDbConnectivityError(err)) markDisconnected(err);
       // res.json may have already been sent if we got past step 3 — guard.
       if (!res.headersSent) {
         res.status(500).json({ error: err.message });
@@ -542,6 +604,7 @@ async function init(router) {
       res.json({ result, memoryBlock });
     } catch (err) {
       console.error("[ChronicleDB] Retrieval error:", err);
+      if (isDbConnectivityError(err)) markDisconnected(err);
       res.status(500).json({ error: err.message });
     }
   });

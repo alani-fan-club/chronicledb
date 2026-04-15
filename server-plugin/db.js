@@ -970,10 +970,32 @@ async function getActivePlotThreads(settings, chatId) {
 
 async function upsertItem(settings, { name, description, powers, significance, owner, location, status, chatId }) {
   const p = getPool(settings);
-  // ID is content-addressed by (name, chatId) so the same-named item in two
-  // different chats gets two separate rows. This means OWNS edges never
-  // bleed across chats even when the same character appears in both.
-  const id = contentId("item", `${name}|${chatId || ""}`);
+  // ID is content-addressed by (slug(name), chatId) so the same-named item
+  // in two different chats gets two separate rows (OWNS edges never bleed
+  // across chats even when the same character appears in both), and so
+  // case/punctuation variants of the same in-chat item ("Bob's knife" vs
+  // "bob's knife") collapse to one row. The previous scheme keyed the
+  // content id off the raw name, which meant every LLM re-render of an
+  // item name spawned a new row — the cross-batch fragmentation this fix
+  // targets.
+  const itemSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const safeChat = chatId || "";
+  const id = contentId("item", `${itemSlug}|${safeChat}`);
+  // Legacy-row absorption: items inserted under the old raw-name scheme
+  // have different content ids than the new slug-based one, so INSERT ON
+  // CONFLICT alone would leave the old row and also write a new row. A
+  // pre-SELECT by slug-normalized name in this chat finds any legacy row
+  // and reuses its id, so subsequent upserts converge on a single row per
+  // canonical item name. Scoped to chatId so items in other chats are
+  // never touched.
+  const existing = await p.query(
+    `SELECT id FROM items
+      WHERE chat_id = $1
+        AND trim(both '-' from regexp_replace(lower(name), '[^a-z0-9]+', '-', 'g')) = $2
+      LIMIT 1`,
+    [safeChat, itemSlug],
+  );
+  const targetId = existing.rows[0]?.id || id;
   const ownerId = owner ? slugify(owner) : null;
   const locationId = location ? await upsertLocation(settings, location, "") : null;
   await p.query(
@@ -987,9 +1009,158 @@ async function upsertItem(settings, { name, description, powers, significance, o
        location_id = EXCLUDED.location_id,
        status = EXCLUDED.status,
        chat_id = COALESCE(items.chat_id, EXCLUDED.chat_id)`,
-    [id, name, description || "", powers || "", significance || 3, ownerId, locationId, status || "intact", chatId || null],
+    [targetId, name, description || "", powers || "", significance || 3, ownerId, locationId, status || "intact", chatId || null],
   );
-  return id;
+  return targetId;
+}
+
+// Cross-batch entity context for the extraction prompt. Returns the set of
+// characters, locations, and items already known in this chat so the
+// extractor LLM can reuse those exact names instead of spawning variant
+// rows ("the tavern" in batch 5, "The Tavern" in batch 12). AGARS-inspired:
+// inject the known-entity list into the prompt, then canonicalize at insert
+// time as a belt-and-braces backstop. See "cross-batch entity context"
+// design note.
+//
+// Recency proxies:
+//   - characters: MAX(events.message_index) from participated_in joined
+//     through events.chat_id, falling back to present_at.since.
+//   - locations: MAX(events.message_index) across events in this chat that
+//     point at the location, plus present_at.since when the location only
+//     appears as a presence pin.
+//   - items: created_at DESC (items has no updated_at column).
+//
+// Each list is capped at 50 entries. For characters we flatten aliases
+// (each alias counts as its own entry) while preserving recency order,
+// so a character whose row is the most recent contributes its canonical
+// name first and then its aliases. Dedup is case-sensitive on the raw
+// string so "Alice" and "alice" both land in the list; the extractor
+// prompt tells the LLM to prefer these exact names.
+//
+// Fails closed: any SQL error returns empty lists so the extraction
+// pipeline never aborts on this best-effort enrichment.
+async function listKnownEntitiesForChat(settings, chatId) {
+  const empty = { characterNames: [], locationNames: [], itemNames: [] };
+  if (!chatId) return empty;
+  const p = getPool(settings);
+
+  try {
+    // Characters: distinct char ids referenced by this chat, ordered by
+    // recency. We pull 50 character rows from the DB (enough headroom to
+    // flatten aliases and still have 50 strings after) and do the
+    // flatten + dedup in JS.
+    const charRes = await p.query(
+      `WITH char_refs AS (
+         SELECT pi.character_id AS char_id,
+                e.message_index AS msg_idx,
+                NULL::timestamptz AS pa_since
+           FROM participated_in pi
+           JOIN events e ON e.id = pi.event_id
+          WHERE e.chat_id = $1
+         UNION ALL
+         SELECT pa.character_id,
+                NULL::int,
+                pa.since
+           FROM present_at pa
+          WHERE pa.chat_id = $1
+       )
+       SELECT c.name,
+              c.aliases,
+              MAX(cr.msg_idx) AS max_msg_idx,
+              MAX(cr.pa_since) AS max_since,
+              c.updated_at
+         FROM char_refs cr
+         JOIN characters c ON c.id = cr.char_id
+        GROUP BY c.id, c.name, c.aliases, c.updated_at
+        ORDER BY MAX(cr.msg_idx) DESC NULLS LAST,
+                 MAX(cr.pa_since) DESC NULLS LAST,
+                 c.updated_at DESC NULLS LAST
+        LIMIT 50`,
+      [chatId],
+    );
+
+    const characterNames = [];
+    const seenCharNames = new Set();
+    const pushCharName = (n) => {
+      if (characterNames.length >= 50) return;
+      const s = (n || "").toString().trim();
+      if (!s) return;
+      if (seenCharNames.has(s)) return;
+      seenCharNames.add(s);
+      characterNames.push(s);
+    };
+    for (const row of charRes.rows) {
+      pushCharName(row.name);
+      const aliases = Array.isArray(row.aliases) ? row.aliases : [];
+      for (const a of aliases) pushCharName(a);
+      if (characterNames.length >= 50) break;
+    }
+
+    // Locations: distinct location ids pointed at by events.chat_id or
+    // present_at.chat_id in this chat. Use events.message_index as the
+    // recency proxy, with present_at.since as a fallback for locations
+    // that only appear as presence pins.
+    const locRes = await p.query(
+      `WITH loc_refs AS (
+         SELECT e.location_id AS loc_id,
+                e.message_index AS msg_idx,
+                NULL::timestamptz AS pa_since
+           FROM events e
+          WHERE e.chat_id = $1 AND e.location_id IS NOT NULL
+         UNION ALL
+         SELECT pa.location_id, NULL::int, pa.since
+           FROM present_at pa
+          WHERE pa.chat_id = $1 AND pa.location_id IS NOT NULL
+       )
+       SELECT l.name,
+              MAX(lr.msg_idx) AS max_msg_idx,
+              MAX(lr.pa_since) AS max_since
+         FROM loc_refs lr
+         JOIN locations l ON l.id = lr.loc_id
+        GROUP BY l.id, l.name
+        ORDER BY MAX(lr.msg_idx) DESC NULLS LAST,
+                 MAX(lr.pa_since) DESC NULLS LAST
+        LIMIT 50`,
+      [chatId],
+    );
+    const locationNames = [];
+    const seenLocNames = new Set();
+    for (const row of locRes.rows) {
+      const s = (row.name || "").toString().trim();
+      if (!s || seenLocNames.has(s)) continue;
+      seenLocNames.add(s);
+      locationNames.push(s);
+      if (locationNames.length >= 50) break;
+    }
+
+    // Items: chat-scoped via items.chat_id. Items has created_at only —
+    // upsertItem rewrites description/powers/status via ON CONFLICT but
+    // does not touch created_at, so created_at DESC is the best proxy
+    // for "most recently seen". Legacy NULL-chat rows are intentionally
+    // skipped; they don't belong to any chat and shouldn't leak into
+    // every chat's known list.
+    const itemRes = await p.query(
+      `SELECT name FROM items
+        WHERE chat_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50`,
+      [chatId],
+    );
+    const itemNames = [];
+    const seenItemNames = new Set();
+    for (const row of itemRes.rows) {
+      const s = (row.name || "").toString().trim();
+      if (!s || seenItemNames.has(s)) continue;
+      seenItemNames.add(s);
+      itemNames.push(s);
+      if (itemNames.length >= 50) break;
+    }
+
+    return { characterNames, locationNames, itemNames };
+  } catch (err) {
+    console.warn(`[ChronicleDB] listKnownEntitiesForChat(${chatId}) failed: ${err.message}`);
+    return empty;
+  }
 }
 
 // ── Vector operations ───────────────────────────────────────��──
@@ -2197,7 +2368,7 @@ module.exports = {
   upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertLocationAdjacency, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
   upsertTrait, classifyDisposition, getTraitsForCharacter, recomputeCharacterSummary,
   insertContextSnapshot, getRecentSnapshots,
-  upsertPlotThread, getActivePlotThreads, upsertItem,
+  upsertPlotThread, getActivePlotThreads, upsertItem, listKnownEntitiesForChat,
   upsertStoryArc, linkEventToArc, createEventChain,
   storeEmbedding, upsertMemoryEmbedding, upsertDialogueQuote, vectorSearch, vectorSearchScoped, lexicalSearch, hybridSearch,
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,

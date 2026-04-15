@@ -380,8 +380,11 @@ async function init(router) {
         }
       }
 
-      // 1. Extract structured data from messages.
-      const extraction = await extract(settings, { characterName, userName, messages });
+      // 1. Extract structured data from messages. chatId is plumbed in so
+      //    the extractor can fetch already-known entities for this chat
+      //    and inject them into the prompt, so the LLM stops re-naming
+      //    existing characters/locations/items on every batch.
+      const extraction = await extract(settings, { characterName, userName, messages, chatId });
 
       // 2. Graph writes — single source of truth in extractor.js. Previously
       //    this route reimplemented ~180 lines of upserts and was missing

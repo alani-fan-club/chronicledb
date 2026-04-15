@@ -311,15 +311,49 @@ Return ONLY valid JSON:
   "contradictions": ["Any detail that contradicts previously established facts, if noticed"]
 }`;
 
-async function extract(settings, { characterName, userName, messages }) {
+async function extract(settings, { characterName, userName, messages, chatId }) {
   const msgBlock = messages
     .filter((m) => !m.is_system)
     .map((m) => `[${m.is_user ? "USER" : "CHARACTER"}] ${m.name}: ${m.mes.slice(0, 2000)}`)
     .join("\n\n---\n\n");
 
+  // Cross-batch entity context: prepend a bullet list of characters,
+  // locations, and items already known in THIS chat so the per-batch
+  // extraction LLM stops spawning variants of the same entity ("the
+  // tavern" in batch 5, "The Tavern" in batch 12). The list is best-
+  // effort — if chatId is missing or the lookup fails, the prompt is
+  // unchanged from the pre-fix behavior. AGARS-inspired; paired with
+  // deterministic slug canonicalization at insert time in
+  // db.upsertLocation / db.upsertItem as a backstop.
+  let knownSection = "";
+  if (chatId) {
+    try {
+      const known = await db.listKnownEntitiesForChat(settings, chatId);
+      if (known) {
+        const bullets = [];
+        if (known.characterNames && known.characterNames.length > 0) {
+          bullets.push(`- Characters: ${known.characterNames.join(", ")}`);
+        }
+        if (known.locationNames && known.locationNames.length > 0) {
+          bullets.push(`- Locations: ${known.locationNames.join(", ")}`);
+        }
+        if (known.itemNames && known.itemNames.length > 0) {
+          bullets.push(`- Items: ${known.itemNames.join(", ")}`);
+        }
+        if (bullets.length > 0) {
+          knownSection =
+            `\n\nKnown entities in this chat (prefer reusing these exact names when you recognize them; do not re-name or re-describe them with variations):\n` +
+            bullets.join("\n");
+        }
+      }
+    } catch (err) {
+      console.warn(`[ChronicleDB] extract: listKnownEntitiesForChat failed (${err.message}); continuing without known-entity context`);
+    }
+  }
+
   const prompt = `${EXTRACTION_PROMPT}
 
-Context: roleplay between user "${userName}" and character "${characterName}".
+Context: roleplay between user "${userName}" and character "${characterName}".${knownSection}
 
 Messages:
 ${msgBlock}

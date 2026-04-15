@@ -101,7 +101,7 @@ async function run() {
 
     let extraction = null;
     try {
-      extraction = await extract(settings, { characterName: charName, userName, messages: batch });
+      extraction = await extract(settings, { characterName: charName, userName, messages: batch, chatId });
     } catch (err) {
       console.warn(`[ingest] batch ${i} extraction failed: ${err.message.slice(0, 200)}`);
     }

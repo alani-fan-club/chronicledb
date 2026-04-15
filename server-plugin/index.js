@@ -585,6 +585,7 @@ async function init(router) {
         maxTokens,
         budgetProfile,
         budgetOverrides,
+        pov,
       } = req.body;
 
       // Load per-character config to know which chats to remember
@@ -600,6 +601,22 @@ async function init(router) {
         ? configuredChats
         : (chatId ? [chatId] : []);
 
+      // AGARS per-character epistemic mask: optional `pov` payload on
+      // the /retrieve request threads through to retriever.js as a
+      // post-filter over the omniscient result. When the caller omits
+      // `pov`, retrieve() behaves bit-for-bit as before.
+      //
+      // Shape: `{ characterName: string, upToMessageIndex?: number }`.
+      // Defensive normalization: accept either a string characterName
+      // or nothing; an empty string is treated as "no POV" so the
+      // downstream call can no-op without a special case.
+      const povArg = (pov && typeof pov === "object" && typeof pov.characterName === "string" && pov.characterName.trim().length > 0)
+        ? {
+            characterName: pov.characterName.trim(),
+            upToMessageIndex: typeof pov.upToMessageIndex === "number" ? pov.upToMessageIndex : undefined,
+          }
+        : undefined;
+
       const result = await retrieve(settings, {
         chatId,
         activeCharacters: activeCharacters || [],
@@ -609,6 +626,7 @@ async function init(router) {
         selectedChats, // scoped chat IDs (defaults to [chatId] when no preference set)
         budgetProfile,
         budgetOverrides,
+        pov: povArg,
       });
 
       // Precedence for the render ceiling:

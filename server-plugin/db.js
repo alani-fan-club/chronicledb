@@ -1974,6 +1974,193 @@ async function getCharacterOutboundRelationships(settings, characterName, chatId
   }));
 }
 
+// ── Per-character epistemic mask (AGARS known_nodes, derived view) ─────
+//
+// "At turn N in chat X, what does character Y know about?" is answered
+// entirely from existing edges — no stored mask, no schema changes. The
+// return shape is a bag of Sets the retriever uses as an allowlist to
+// post-filter omniscient retrieval results.
+//
+// Knowledge model:
+//   - Events: a character "knows" an event iff they directly
+//     `participated_in` it, OR they were `present_at` the event's
+//     location during the same chat (scene-presence). The message-index
+//     cap lets a caller answer "what did Y know as of turn N" without
+//     poisoning the scene with post-turn spoilers.
+//   - Facts: `knows.fact_id` scoped to (character, chat). Already the
+//     extractor's explicit model — just read it back.
+//   - Locations: locations of events the character witnessed, plus
+//     every location they're `present_at` in this chat.
+//   - Items: items the character owns directly (`items.owner_id`).
+//     Items also have a `location_id` but no link to a witnessing event,
+//     so we deliberately stop at the owned set rather than over-project.
+//     See the report for the ambiguity call.
+//   - Characters: other characters who co-appeared in any witnessed
+//     event (via participated_in or present_at at the same location
+//     for the same chat). Focal character is excluded from their own
+//     set — "Y knows about Y" is trivially true and not useful for
+//     post-filter cross-referencing.
+//
+// Implementation notes:
+//   - One query per set; SELECT DISTINCT ids only — no full rows.
+//   - `upToMessageIndex` is optional. When undefined/null, no
+//     message-cap filter is applied (omniscient-within-edges).
+//   - Returns all-empty Sets when the character can't be resolved for
+//     this chat, not an error — the retriever treats an unknown POV
+//     as "knows nothing", which is the safest possible fail mode.
+//   - `eventMessageIndexes` is returned alongside `eventIds` as an
+//     additive helper: the retriever needs it to filter
+//     `result.events` (which `getRecentEvents` projects without ids)
+//     and neighbor padding (keyed by message_index, not event id).
+async function getCharacterKnownUniverse(settings, { characterName, chatId, upToMessageIndex } = {}) {
+  const empty = {
+    eventIds: new Set(),
+    eventMessageIndexes: new Set(),
+    factIds: new Set(),
+    locationIds: new Set(),
+    itemIds: new Set(),
+    characterIds: new Set(),
+  };
+  if (!characterName || !chatId) return empty;
+
+  const character = await findCharacterByNameOrAlias(settings, characterName);
+  if (!character) return empty;
+  const charId = character.id;
+
+  const p = getPool(settings);
+
+  // Normalize the message-index cap. `undefined` / `null` means "no cap"
+  // and we pass NULL to Postgres; the WHERE clause uses IS NULL fallback
+  // so a NULL cap doesn't filter. Numeric 0 is a legitimate cap value
+  // ("as of turn zero") and preserved.
+  const msgCap = (upToMessageIndex === undefined || upToMessageIndex === null)
+    ? null
+    : Number(upToMessageIndex);
+
+  // ── Events witnessed via participated_in OR present_at ────────
+  // participated_in is character-indexed so the ANY-join is cheap.
+  // present_at carries chat_id directly; we pivot through events at
+  // the same location AND same chat AND (optional) message_index cap.
+  // The UNION collapses to a DISTINCT id + message_index projection.
+  const eventsPromise = p.query(
+    `SELECT DISTINCT e.id, e.message_index, e.location_id
+       FROM events e
+       JOIN participated_in pi ON pi.event_id = e.id
+      WHERE pi.character_id = $1
+        AND e.chat_id = $2
+        AND ($3::int IS NULL OR e.message_index IS NULL OR e.message_index <= $3::int)
+     UNION
+     SELECT DISTINCT e.id, e.message_index, e.location_id
+       FROM events e
+       JOIN present_at pa ON pa.location_id = e.location_id
+                         AND pa.chat_id = e.chat_id
+      WHERE pa.character_id = $1
+        AND e.chat_id = $2
+        AND ($3::int IS NULL OR e.message_index IS NULL OR e.message_index <= $3::int)`,
+    [charId, chatId, msgCap],
+  );
+
+  // ── Facts ─────────────────────────────────────────────────────
+  // Direct read of the knows edge. chat_id scope is part of the unique
+  // key, so this is a one-shot index lookup on idx_knows_chat.
+  const factsPromise = p.query(
+    `SELECT DISTINCT fact_id
+       FROM knows
+      WHERE character_id = $1
+        AND chat_id = $2`,
+    [charId, chatId],
+  );
+
+  // ── Locations via present_at (chat-scoped) ────────────────────
+  // Event-location locations are derived from the events query above
+  // and merged JS-side (avoids duplicating the UNION).
+  const presentLocationsPromise = p.query(
+    `SELECT DISTINCT location_id
+       FROM present_at
+      WHERE character_id = $1
+        AND chat_id = $2
+        AND location_id IS NOT NULL`,
+    [charId, chatId],
+  );
+
+  // ── Items owned by this character ─────────────────────────────
+  // items.owner_id is the ownership edge (confirmed via schema.sql §
+  // Items and upsertItem in db.js). No separate OWNS table. Items carry
+  // chat_id so we filter to this chat, but tolerate legacy NULL rows
+  // that predate the chat_id column — otherwise re-scoping a character
+  // to an older chat drops their own inventory.
+  const itemsPromise = p.query(
+    `SELECT DISTINCT id
+       FROM items
+      WHERE owner_id = $1
+        AND (chat_id = $2 OR chat_id IS NULL)`,
+    [charId, chatId],
+  );
+
+  const [eventsRes, factsRes, presentLocRes, itemsRes] = await Promise.all([
+    eventsPromise, factsPromise, presentLocationsPromise, itemsPromise,
+  ]);
+
+  const eventIds = new Set();
+  const eventMessageIndexes = new Set();
+  const locationIds = new Set();
+  for (const r of eventsRes.rows) {
+    if (r.id) eventIds.add(r.id);
+    if (typeof r.message_index === "number") eventMessageIndexes.add(r.message_index);
+    if (r.location_id) locationIds.add(r.location_id);
+  }
+  for (const r of presentLocRes.rows) {
+    if (r.location_id) locationIds.add(r.location_id);
+  }
+
+  const factIds = new Set();
+  for (const r of factsRes.rows) if (r.fact_id) factIds.add(r.fact_id);
+
+  const itemIds = new Set();
+  for (const r of itemsRes.rows) if (r.id) itemIds.add(r.id);
+
+  // ── Co-appearing characters ────────────────────────────────────
+  // Characters who participated_in any witnessed event, OR who were
+  // present_at the same location during a witnessed event. One query,
+  // fed the eventIds + location_ids sets. Empty-set guards: pg rejects
+  // `ANY(ARRAY[]::text[])` pattern matching cleanly but we short-circuit
+  // anyway to save a round-trip when the character has witnessed
+  // nothing.
+  const characterIds = new Set();
+  if (eventIds.size > 0) {
+    const eventIdArr = [...eventIds];
+    const { rows: coRows } = await p.query(
+      `SELECT DISTINCT character_id
+         FROM participated_in
+        WHERE event_id = ANY($1::text[])
+          AND character_id <> $2`,
+      [eventIdArr, charId],
+    );
+    for (const r of coRows) if (r.character_id) characterIds.add(r.character_id);
+  }
+  if (locationIds.size > 0) {
+    const locationIdArr = [...locationIds];
+    const { rows: coPresentRows } = await p.query(
+      `SELECT DISTINCT character_id
+         FROM present_at
+        WHERE location_id = ANY($1::text[])
+          AND chat_id = $2
+          AND character_id <> $3`,
+      [locationIdArr, chatId, charId],
+    );
+    for (const r of coPresentRows) if (r.character_id) characterIds.add(r.character_id);
+  }
+
+  return {
+    eventIds,
+    eventMessageIndexes,
+    factIds,
+    locationIds,
+    itemIds,
+    characterIds,
+  };
+}
+
 async function clearCharacterMemories(settings, characterName) {
   const p = getPool(settings);
   const charId = slugify(characterName);
@@ -2016,5 +2203,6 @@ module.exports = {
   getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
   getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig,
   getCharacterPanelStats, getCharacterRecentEvents, getCharacterOutboundRelationships, clearCharacterMemories,
+  getCharacterKnownUniverse,
   closePool,
 };

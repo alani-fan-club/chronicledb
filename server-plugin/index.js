@@ -96,6 +96,10 @@ function readRequiredRequestValue(res, source, key) {
   return null;
 }
 
+function sendInternalError(res, err) {
+  res.status(500).json({ error: err.message });
+}
+
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
   const pool = db.getPool(activeSettings);
   const { rows: [verify] } = await pool.query(
@@ -287,7 +291,7 @@ async function init(router) {
     } catch (err) {
       connectionState = { connected: false, error: err.message, initializedAt: null };
       console.error("[ChronicleDB] DB init error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -464,7 +468,7 @@ async function init(router) {
       if (isDbConnectivityError(err)) markDisconnected(err);
       // res.json may have already been sent if we got past step 3 — guard.
       if (!res.headersSent) {
-        res.status(500).json({ error: err.message });
+        sendInternalError(res, err);
       }
     } finally {
       // Release the per-message mutex so the next /extract for the same
@@ -561,7 +565,7 @@ async function init(router) {
       });
     } catch (err) {
       console.error("[ChronicleDB] /clear-message-extractions error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -639,7 +643,7 @@ async function init(router) {
     } catch (err) {
       console.error("[ChronicleDB] Retrieval error:", err);
       if (isDbConnectivityError(err)) markDisconnected(err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -651,7 +655,7 @@ async function init(router) {
       const config = await db.getCharacterMemoryConfig(settings, req.params.characterName);
       res.json(config);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -664,7 +668,7 @@ async function init(router) {
       });
       res.json({ ok: true });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -730,7 +734,7 @@ async function init(router) {
 
       res.json(chatFiles);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -906,7 +910,7 @@ async function init(router) {
       });
     } catch (err) {
       console.error("[ChronicleDB] Ingest chat error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -917,7 +921,7 @@ async function init(router) {
       const books = listLorebooks(settings);
       res.json(books);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -937,7 +941,7 @@ async function init(router) {
         return res.status(400).json({ error: msg });
       }
       console.error("[ChronicleDB] Lorebook ingest error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -958,7 +962,7 @@ async function init(router) {
         label: `${r.character_name} — ${(r.chat_id || "").replace(/\.jsonl$/, "")}`,
       })));
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -992,7 +996,7 @@ async function init(router) {
       res.json(data);
     } catch (err) {
       console.error("[ChronicleDB] Graph query error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1004,7 +1008,7 @@ async function init(router) {
       const { rows } = await p.query(`SELECT name FROM characters ORDER BY name`);
       res.json(rows.map((r) => r.name));
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1032,7 +1036,7 @@ async function init(router) {
       const { rows } = await p.query(sql, params);
       res.json(rows);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1048,7 +1052,7 @@ async function init(router) {
       const stats = await db.getCharacterPanelStats(settings, name, chatId);
       res.json(stats);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1061,7 +1065,7 @@ async function init(router) {
       const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
       res.json(events);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1073,7 +1077,7 @@ async function init(router) {
       const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
       res.json(rels);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1084,7 +1088,7 @@ async function init(router) {
       const config = await db.getCharacterMemoryConfig(settings, name);
       res.json({ sessionMode: config.sessionMode || "persistent" });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1103,7 +1107,7 @@ async function init(router) {
       });
       res.json({ ok: true });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1114,7 +1118,7 @@ async function init(router) {
       const cleared = await db.clearCharacterMemories(settings, name);
       res.json({ ok: true, cleared });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1138,7 +1142,7 @@ async function init(router) {
       res.json({ updated });
     } catch (err) {
       console.error("[ChronicleDB] Recompute summaries error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1162,7 +1166,7 @@ async function init(router) {
       res.json(files);
     } catch (err) {
       console.error("[ChronicleDB] Character cards error:", err);
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1186,7 +1190,7 @@ async function init(router) {
       res.setHeader("Content-Type", "image/png");
       createReadStream(imgPath).pipe(res);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1201,7 +1205,7 @@ async function init(router) {
       );
       res.json(rows);
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 
@@ -1211,7 +1215,7 @@ async function init(router) {
       await p.query(`DELETE FROM memory_embeddings WHERE id = $1`, [req.params.id]);
       res.json({ ok: true });
     } catch (err) {
-      res.status(500).json({ error: err.message });
+      sendInternalError(res, err);
     }
   });
 

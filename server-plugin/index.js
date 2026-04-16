@@ -100,9 +100,21 @@ function sendInternalError(res, err) {
   res.status(500).json({ error: err.message });
 }
 
+function sendBadRequest(res, message) {
+  return res.status(400).json({ error: message });
+}
+
 async function queryRows(sql, params = []) {
   const { rows } = await db.getPool(settings).query(sql, params);
   return rows;
+}
+
+function resolveStChatsDir() {
+  return pathResolve(resolveStDataRoot(settings), "chats");
+}
+
+function resolveStCharactersDir() {
+  return pathResolve(resolveStDataRoot(settings), "characters");
 }
 
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
@@ -522,7 +534,7 @@ async function init(router) {
     try {
       const { chatId, messageIndex } = req.body;
       if (!chatId || typeof messageIndex !== "number") {
-        return res.status(400).json({ error: "chatId and messageIndex required" });
+        return sendBadRequest(res, "chatId and messageIndex required");
       }
       const pool = db.getPool(settings);
       // Order matters: participated_in references events.id without ON
@@ -682,10 +694,9 @@ async function init(router) {
   router.get("/chats/:characterName", async (req, res) => {
     try {
       const { readdirSync, statSync } = require("fs");
-      const { join, resolve } = require("path");
+      const { join } = require("path");
 
-      const dataRoot = resolveStDataRoot(settings);
-      const chatsBase = resolve(dataRoot, "chats");
+      const chatsBase = resolveStChatsDir();
       const charName = req.params.characterName;
       const entries = readdirSync(chatsBase);
       const matchingDir = entries.find((e) => e === charName || e.startsWith(charName));
@@ -748,7 +759,7 @@ async function init(router) {
     try {
       const { characterName, filename } = req.body;
       if (!characterName || !filename) {
-        return res.status(400).json({ error: "characterName and filename required" });
+        return sendBadRequest(res, "characterName and filename required");
       }
       // Reject traversal-y characterName up front. The directory-picking
       // logic below uses a fuzzy `startsWith` match on `characterName`, so
@@ -760,14 +771,11 @@ async function init(router) {
           || characterName.includes("\0")
           || characterName.includes("/")
           || characterName.includes("\\")) {
-        return res.status(400).json({ error: `unsafe characterName: "${characterName}"` });
+        return sendBadRequest(res, `unsafe characterName: "${characterName}"`);
       }
 
       const { readFileSync } = require("fs");
-      const { resolve } = require("path");
-
-      const dataRoot = resolveStDataRoot(settings);
-      const chatsBase = resolve(dataRoot, "chats");
+      const chatsBase = resolveStChatsDir();
 
       // Find matching directory
       const { readdirSync } = require("fs");
@@ -786,11 +794,11 @@ async function init(router) {
         matchedDir = safeResolveUnder(chatsBase, matchingDir);
         filePath = safeResolveUnder(matchedDir, filename);
       } catch (e) {
-        return res.status(400).json({ error: e.message });
+        return sendBadRequest(res, e.message);
       }
       const raw = readFileSync(filePath, "utf-8");
       const lines = raw.split("\n").filter((l) => l.trim());
-      if (lines.length === 0) return res.status(400).json({ error: "Empty chat file" });
+      if (lines.length === 0) return sendBadRequest(res, "Empty chat file");
 
       // Parse metadata from first line
       const metadata = JSON.parse(lines[0]);
@@ -942,7 +950,7 @@ async function init(router) {
       if (msg.startsWith("unsafe filename:")
           || msg.startsWith("path traversal blocked:")
           || msg === "filename required") {
-        return res.status(400).json({ error: msg });
+        return sendBadRequest(res, msg);
       }
       console.error("[ChronicleDB] Lorebook ingest error:", err);
       sendInternalError(res, err);
@@ -1151,9 +1159,7 @@ async function init(router) {
   router.get("/character-cards", async (req, res) => {
     try {
       const { readdirSync } = require("fs");
-      const { resolve } = require("path");
-      const dataRoot = resolveStDataRoot(settings);
-      const charsDir = resolve(dataRoot, "characters");
+      const charsDir = resolveStCharactersDir();
       const files = readdirSync(charsDir)
         .filter((f) => f.endsWith(".png"))
         .sort()
@@ -1173,10 +1179,8 @@ async function init(router) {
   // Proxy character PNGs so the mind map page can access them
   router.get("/character-image/:filename", async (req, res) => {
     try {
-      const { resolve } = require("path");
       const { createReadStream, existsSync } = require("fs");
-      const dataRoot = resolveStDataRoot(settings);
-      const charsDir = resolve(dataRoot, "characters");
+      const charsDir = resolveStCharactersDir();
       let imgPath;
       try {
         // Reject `..`, forward/back slashes, NUL bytes up front, and
@@ -1184,7 +1188,7 @@ async function init(router) {
         // `../../etc/passwd` throws here and becomes a 400.
         imgPath = safeResolveUnder(charsDir, req.params.filename);
       } catch (e) {
-        return res.status(400).json({ error: e.message });
+        return sendBadRequest(res, e.message);
       }
       if (!existsSync(imgPath)) return res.status(404).send("Not found");
       res.setHeader("Content-Type", "image/png");

@@ -85,16 +85,29 @@ function resolveBudgets(settings, profileName, overrides) {
 // `expiresAt` and refreshes when stale.
 const characterCacheByChat = new Map();
 const CHARACTER_CACHE_TTL_MS = 5 * 60 * 1000;
+const CHARACTER_CACHE_MAX_ENTRIES = 50;
 
 function getCharacterCache(chatId) {
   if (!chatId) return null;
+  const now = Date.now();
   let cache = characterCacheByChat.get(chatId);
-  if (!cache) {
-    cache = { chatId, entries: [], expiresAt: 0 };
+  if (cache) {
+    if (typeof cache.expiresAt === "number" && cache.expiresAt < now) {
+      cache.entries = [];
+      cache.expiresAt = now + CHARACTER_CACHE_TTL_MS;
+    }
+    // Re-set to bump insertion order; Map iterates in insert order so the
+    // first key is the LRU candidate.
+    characterCacheByChat.delete(chatId);
     characterCacheByChat.set(chatId, cache);
+    return cache;
   }
-  // If we ever grow many long-lived chats, an LRU eviction goes here.
-  // For now we leak a handful of Maps per process, which is negligible.
+  cache = { chatId, entries: [], expiresAt: now + CHARACTER_CACHE_TTL_MS };
+  if (characterCacheByChat.size >= CHARACTER_CACHE_MAX_ENTRIES) {
+    const oldestKey = characterCacheByChat.keys().next().value;
+    if (oldestKey !== undefined) characterCacheByChat.delete(oldestKey);
+  }
+  characterCacheByChat.set(chatId, cache);
   return cache;
 }
 
@@ -318,9 +331,8 @@ async function retrieve(
   let boostCharIds = [];
   if (recentText) {
     // Detect mentioned characters for the graph expansion boost.
-    // Shared detector — cache scoped per chat, 5-min TTL, LRU-ish.
+    // Shared detector — cache scoped per chat, 5-min TTL, LRU-evicted.
     const cache = getCharacterCache(chatIds && chatIds[0]);
-    if (cache && cache.expiresAt === 0) cache.expiresAt = Date.now() + CHARACTER_CACHE_TTL_MS;
     try {
       boostCharIds = await core.detectMentionedCharacters(pool, chatIds, recentText, cache);
     } catch (err) {

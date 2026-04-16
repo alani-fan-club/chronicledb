@@ -17,8 +17,17 @@ const { ingestLorebook, listLorebooks } = require("./lorebook");
 const { safeResolveUnder } = require("./path-safety");
 const { setWithBoundedEviction } = require("./bounded-map");
 const { resolveStDataRoot } = require("./st-paths");
-const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
-const { resolve: pathResolve, dirname: pathDirname } = require("path");
+const {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  realpathSync,
+  createReadStream,
+} = require("fs");
+const { resolve: pathResolve, dirname: pathDirname, join: pathJoin } = require("path");
 
 let settings = {};
 // Tracks live DB state so /status can report it without touching the pool.
@@ -118,7 +127,7 @@ function resolveStCharactersDir() {
 }
 
 function findMatchingChatDirectoryName(chatsBase, characterName) {
-  const entries = require("fs").readdirSync(chatsBase);
+  const entries = readdirSync(chatsBase);
   return entries.find((entry) => entry === characterName || entry.startsWith(characterName)) || null;
 }
 
@@ -130,6 +139,15 @@ function readOptionalIntegerQuery(query, key, fallback, radix) {
   const raw = query ? query[key] : undefined;
   const parsed = typeof radix === "number" ? parseInt(raw, radix) : parseInt(raw);
   return parsed || fallback;
+}
+
+function safeResolveUnderOrBadRequest(res, basePath, requestedPath) {
+  try {
+    return safeResolveUnder(basePath, requestedPath);
+  } catch (err) {
+    sendBadRequest(res, err.message);
+    return null;
+  }
 }
 
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
@@ -229,12 +247,10 @@ async function init(router) {
   }
 
   // ── Serve mind map UI ────────────────────────────────────────
-  const { resolve, dirname } = require("path");
-  const { realpathSync } = require("fs");
   const express = require("express");
   // Resolve through symlink to find the actual project root
   const pluginRealDir = realpathSync(__dirname);
-  const mapPath = resolve(pluginRealDir, "..", "src", "ui");
+  const mapPath = pathResolve(pluginRealDir, "..", "src", "ui");
   console.log("[ChronicleDB] Mind map path:", mapPath);
   router.use("/map", express.static(mapPath));
 
@@ -708,28 +724,25 @@ async function init(router) {
 
   router.get("/chats/:characterName", async (req, res) => {
     try {
-      const { statSync } = require("fs");
-      const { join } = require("path");
-
       const chatsBase = resolveStChatsDir();
       const charName = req.params.characterName;
       const matchingDir = findMatchingChatDirectoryName(chatsBase, charName);
 
       if (!matchingDir) return res.json([]);
 
-      const dirPath = join(chatsBase, matchingDir);
+      const dirPath = pathJoin(chatsBase, matchingDir);
       if (!statSync(dirPath).isDirectory()) return res.json([]);
 
       const chatFiles = readdirSync(dirPath)
         .filter((f) => f.endsWith(".jsonl"))
         .sort()
         .map((f) => {
-          const stat = statSync(join(dirPath, f));
+          const stat = statSync(pathJoin(dirPath, f));
           const dateMatch = f.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
           // Count actual message lines (subtract 1 for metadata header)
           let messageCount;
           try {
-            const content = readFileSync(join(dirPath, f), "utf-8");
+            const content = readFileSync(pathJoin(dirPath, f), "utf-8");
             messageCount = content.split("\n").filter((l) => l.trim()).length - 1;
           } catch {
             messageCount = Math.max(1, Math.floor(stat.size / 2000));
@@ -788,7 +801,6 @@ async function init(router) {
         return sendBadRequest(res, `unsafe characterName: "${characterName}"`);
       }
 
-      const { readFileSync } = require("fs");
       const chatsBase = resolveStChatsDir();
 
       // Find matching directory
@@ -800,14 +812,10 @@ async function init(router) {
       // defense-in-depth against a compromised ST data dir or a follower
       // symlink). Then resolve the chat JSONL filename safely under that
       // directory so `filename` can't escape either.
-      let matchedDir;
-      let filePath;
-      try {
-        matchedDir = safeResolveUnder(chatsBase, matchingDir);
-        filePath = safeResolveUnder(matchedDir, filename);
-      } catch (e) {
-        return sendBadRequest(res, e.message);
-      }
+      const matchedDir = safeResolveUnderOrBadRequest(res, chatsBase, matchingDir);
+      if (!matchedDir) return;
+      const filePath = safeResolveUnderOrBadRequest(res, matchedDir, filename);
+      if (!filePath) return;
       const raw = readFileSync(filePath, "utf-8");
       const lines = raw.split("\n").filter((l) => l.trim());
       if (lines.length === 0) return sendBadRequest(res, "Empty chat file");
@@ -1170,7 +1178,6 @@ async function init(router) {
 
   router.get("/character-cards", async (req, res) => {
     try {
-      const { readdirSync } = require("fs");
       const charsDir = resolveStCharactersDir();
       const files = readdirSync(charsDir)
         .filter((f) => f.endsWith(".png"))
@@ -1191,17 +1198,12 @@ async function init(router) {
   // Proxy character PNGs so the mind map page can access them
   router.get("/character-image/:filename", async (req, res) => {
     try {
-      const { createReadStream, existsSync } = require("fs");
       const charsDir = resolveStCharactersDir();
-      let imgPath;
-      try {
-        // Reject `..`, forward/back slashes, NUL bytes up front, and
-        // confirm the resolved path stays under `charsDir`. A request for
-        // `../../etc/passwd` throws here and becomes a 400.
-        imgPath = safeResolveUnder(charsDir, req.params.filename);
-      } catch (e) {
-        return sendBadRequest(res, e.message);
-      }
+      // Reject `..`, forward/back slashes, NUL bytes up front, and
+      // confirm the resolved path stays under `charsDir`. A request for
+      // `../../etc/passwd` throws here and becomes a 400.
+      const imgPath = safeResolveUnderOrBadRequest(res, charsDir, req.params.filename);
+      if (!imgPath) return;
       if (!existsSync(imgPath)) return res.status(404).send("Not found");
       res.setHeader("Content-Type", "image/png");
       createReadStream(imgPath).pipe(res);

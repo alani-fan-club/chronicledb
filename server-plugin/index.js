@@ -100,6 +100,11 @@ function sendInternalError(res, err) {
   res.status(500).json({ error: err.message });
 }
 
+async function queryRows(sql, params = []) {
+  const { rows } = await db.getPool(settings).query(sql, params);
+  return rows;
+}
+
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
   const pool = db.getPool(activeSettings);
   const { rows: [verify] } = await pool.query(
@@ -715,8 +720,7 @@ async function init(router) {
 
       // Enrich with ingestion status
       try {
-        const p = db.getPool(settings);
-        const { rows: statuses } = await p.query(
+        const statuses = await queryRows(
           `SELECT chat_file, status, batches_done, ingested_at FROM ingestion_status WHERE character_name = $1`,
           [charName],
         );
@@ -949,8 +953,7 @@ async function init(router) {
 
   router.get("/chats", async (req, res) => {
     try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query(
+      const rows = await queryRows(
         `SELECT DISTINCT chat_file AS chat_id, character_name, ingested_at
          FROM ingestion_status
          WHERE status = 'done'
@@ -1004,8 +1007,7 @@ async function init(router) {
 
   router.get("/characters", async (req, res) => {
     try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query(`SELECT name FROM characters ORDER BY name`);
+      const rows = await queryRows(`SELECT name FROM characters ORDER BY name`);
       res.json(rows.map((r) => r.name));
     } catch (err) {
       sendInternalError(res, err);
@@ -1014,7 +1016,6 @@ async function init(router) {
 
   router.get("/character/:name/traits", async (req, res) => {
     try {
-      const p = db.getPool(settings);
       const charId = db.slugify(req.params.name);
       // Accept chat_id as a filter so the standalone mindmap detail panel
       // can scope character traits to the currently-selected chat filter.
@@ -1033,7 +1034,7 @@ async function init(router) {
            WHERE character_id = $1 AND canonical_id IS NULL
            ORDER BY category, content`;
       const params = chatId ? [charId, chatId] : [charId];
-      const { rows } = await p.query(sql, params);
+      const rows = await queryRows(sql, params);
       res.json(rows);
     } catch (err) {
       sendInternalError(res, err);
@@ -1132,8 +1133,7 @@ async function init(router) {
 
   router.post("/recompute-character-summaries", async (req, res) => {
     try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query("SELECT id FROM characters");
+      const rows = await queryRows("SELECT id FROM characters");
       let updated = 0;
       for (const row of rows) {
         await db.recomputeCharacterSummary(settings, row.id);
@@ -1198,8 +1198,7 @@ async function init(router) {
 
   router.get("/memories/:chatId", async (req, res) => {
     try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query(
+      const rows = await queryRows(
         `SELECT * FROM memory_embeddings WHERE chat_id = $1 ORDER BY created_at DESC`,
         [req.params.chatId],
       );

@@ -117,6 +117,21 @@ function resolveStCharactersDir() {
   return pathResolve(resolveStDataRoot(settings), "characters");
 }
 
+function findMatchingChatDirectoryName(chatsBase, characterName) {
+  const entries = require("fs").readdirSync(chatsBase);
+  return entries.find((entry) => entry === characterName || entry.startsWith(characterName)) || null;
+}
+
+function stripJsonlSuffix(value) {
+  return (value || "").replace(/\.jsonl$/, "");
+}
+
+function readOptionalIntegerQuery(query, key, fallback, radix) {
+  const raw = query ? query[key] : undefined;
+  const parsed = typeof radix === "number" ? parseInt(raw, radix) : parseInt(raw);
+  return parsed || fallback;
+}
+
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
   const pool = db.getPool(activeSettings);
   const { rows: [verify] } = await pool.query(
@@ -693,13 +708,12 @@ async function init(router) {
 
   router.get("/chats/:characterName", async (req, res) => {
     try {
-      const { readdirSync, statSync } = require("fs");
+      const { statSync } = require("fs");
       const { join } = require("path");
 
       const chatsBase = resolveStChatsDir();
       const charName = req.params.characterName;
-      const entries = readdirSync(chatsBase);
-      const matchingDir = entries.find((e) => e === charName || e.startsWith(charName));
+      const matchingDir = findMatchingChatDirectoryName(chatsBase, charName);
 
       if (!matchingDir) return res.json([]);
 
@@ -715,14 +729,14 @@ async function init(router) {
           // Count actual message lines (subtract 1 for metadata header)
           let messageCount;
           try {
-            const content = require("fs").readFileSync(join(dirPath, f), "utf-8");
+            const content = readFileSync(join(dirPath, f), "utf-8");
             messageCount = content.split("\n").filter((l) => l.trim()).length - 1;
           } catch {
             messageCount = Math.max(1, Math.floor(stat.size / 2000));
           }
           return {
             filename: f,
-            chatId: f.replace(".jsonl", ""),
+            chatId: stripJsonlSuffix(f),
             date: dateMatch ? dateMatch[1] : "",
             size: stat.size,
             messageEstimate: Math.max(0, messageCount),
@@ -778,9 +792,7 @@ async function init(router) {
       const chatsBase = resolveStChatsDir();
 
       // Find matching directory
-      const { readdirSync } = require("fs");
-      const entries = readdirSync(chatsBase);
-      const matchingDir = entries.find((e) => e === characterName || e.startsWith(characterName));
+      const matchingDir = findMatchingChatDirectoryName(chatsBase, characterName);
       if (!matchingDir) return res.status(404).json({ error: "Character chat dir not found" });
 
       // Re-verify the selected directory actually lives under chatsBase
@@ -804,7 +816,7 @@ async function init(router) {
       const metadata = JSON.parse(lines[0]);
       const charName = metadata.character_name || characterName;
       const userName = metadata.user_name || "User";
-      const chatId = filename.replace(".jsonl", "");
+      const chatId = stripJsonlSuffix(filename);
 
       // Parse messages
       const messages = [];
@@ -968,9 +980,9 @@ async function init(router) {
          ORDER BY ingested_at DESC NULLS LAST, chat_file`,
       );
       res.json(rows.map((r) => ({
-        chatId: (r.chat_id || "").replace(/\.jsonl$/, ""),
+        chatId: stripJsonlSuffix(r.chat_id || ""),
         character: r.character_name,
-        label: `${r.character_name} — ${(r.chat_id || "").replace(/\.jsonl$/, "")}`,
+        label: `${r.character_name} — ${stripJsonlSuffix(r.chat_id || "")}`,
       })));
     } catch (err) {
       sendInternalError(res, err);
@@ -982,7 +994,7 @@ async function init(router) {
   router.get("/graph", async (req, res) => {
     try {
       const scope = req.query.scope || "global";
-      const depth = parseInt(req.query.depth) || 3;
+      const depth = readOptionalIntegerQuery(req.query, "depth", 3);
       // Accept chat_id as single value or comma-separated list. When set,
       // every edge query filters to the given chat(s); characters and
       // locations reached by those edges still render as nodes.
@@ -1069,7 +1081,7 @@ async function init(router) {
     try {
       const name = readRequiredRequestValue(res, req.query, "name");
       if (!name) return;
-      const limit = parseInt(req.query.limit, 10) || 5;
+      const limit = readOptionalIntegerQuery(req.query, "limit", 5, 10);
       const chatId = readOptionalChatId(req.query);
       const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
       res.json(events);

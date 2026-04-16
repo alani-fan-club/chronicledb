@@ -931,7 +931,7 @@ async function linkEventToArc(settings, { arcId, eventId, position, isAnchor }) 
     `INSERT INTO arc_events (arc_id, event_id, position, is_anchor) VALUES ($1, $2, $3, $4)
      ON CONFLICT DO NOTHING`,
     [arcId, eventId, position || 0, isAnchor || false],
-  ).catch(() => {});
+  ).catch(err => console.warn(`[ChronicleDB] linkEventToArc failed:`, err.message));
 }
 
 async function createEventChain(settings, { fromEventId, toEventId, chainType, description }) {
@@ -940,7 +940,7 @@ async function createEventChain(settings, { fromEventId, toEventId, chainType, d
     `INSERT INTO event_chains (from_event_id, to_event_id, chain_type, description) VALUES ($1, $2, $3, $4)
      ON CONFLICT DO NOTHING`,
     [fromEventId, toEventId, chainType || "caused", description || ""],
-  ).catch(() => {});
+  ).catch(err => console.warn(`[ChronicleDB] createEventChain failed:`, err.message));
 }
 
 // ── Context snapshots ──────────────────────────────────────────
@@ -1463,8 +1463,7 @@ module.exports = {
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads, upsertItem, listKnownEntitiesForChat,
   upsertStoryArc, linkEventToArc, createEventChain,
-  storeEmbedding, upsertMemoryEmbedding, upsertDialogueQuote, vectorSearch, vectorSearchScoped, lexicalSearch, hybridSearch,
-  getRelationships, getKnowledgeBoundaries, getRecentEvents, getWorldState,
+  storeEmbedding, upsertMemoryEmbedding, upsertDialogueQuote,
   getGraphData, traverseFromCharacter, getCharacterMemoryConfig, saveCharacterMemoryConfig,
   getCharacterPanelStats, getCharacterRecentEvents, getCharacterOutboundRelationships, clearCharacterMemories,
   getCharacterKnownUniverse,

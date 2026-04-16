@@ -463,7 +463,7 @@ html, body {
 .chip.active .chip-dot {
   opacity: 1;
   box-shadow: 0 0 0 1px currentColor;
-  background: currentColor !important;
+  background: currentColor;
 }
 
 /* Icon buttons */
@@ -784,24 +784,6 @@ html, body {
   letter-spacing: -0.01em;
 }
 
-.detail-row > span:first-child {
-  flex-shrink: 0;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 0.12em;
-  font-weight: 500;
-}
-
-.detail-row > b {
-  font-family: var(--font-mono);
-  color: var(--text-primary);
-  font-weight: 500;
-  font-size: 12px;
-  text-align: right;
-}
-
 /* Description block */
 #detail-content .detail-desc {
   font-size: 12.5px;
@@ -914,7 +896,6 @@ html, body {
 }
 
 /* Sentiment badges — operational indicators */
-.sentiment-badge,
 .sentiment-positive,
 .sentiment-neutral,
 .sentiment-negative {
@@ -941,25 +922,6 @@ html, body {
   background: rgba(224, 85, 85, 0.08);
   color: var(--negative);
   border: 1px solid rgba(224, 85, 85, 0.25);
-}
-
-/* Edge detail arrow */
-.detail-arrow {
-  display: flex;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 10px;
-  margin: 14px 0 18px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  letter-spacing: 0.02em;
-}
-
-.detail-arrow svg {
-  color: var(--accent);
-  flex-shrink: 0;
 }
 
 /* Intensity bar */

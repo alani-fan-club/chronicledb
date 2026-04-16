@@ -20,7 +20,6 @@ const COLORS = {
   accent:      "#FF5841",
   accentHover: "#ff7057",
   accentDim:   "rgba(255, 88, 65, 0.2)",
-  character:  "#e8e8e8",
   event:      "#d4a574",
   eventMajor: "#FF5841",
   location:   "#7d9a82",
@@ -32,11 +31,6 @@ const COLORS = {
   positive: "#6ac47a",
   negative: "#e05555",
   neutral:  "#7a8594",
-  edge:        "#2c2c2c",
-  edgeBright:  "#4a4a4a",
-  edgeCausal:  "#FF5841",
-  text:    "#f5f5f5",
-  textDim: "#6a6a6a",
   tier1: "#f0f0f0",
   tier2: "#b8b8b8",
   tier3: "#6a6a6a",
@@ -345,18 +339,6 @@ function initGraph() {
   });
   graph.d3Force('charge').distanceMax(500);
 
-  // Pull arcs toward center so they stay near the action.
-  // Access d3-force via the existing center force's constructor
-  const centerForce = graph.d3Force('center');
-  if (centerForce) {
-    // Increase overall center gravity slightly and give arcs extra pull
-    // by making the link force stronger for CONTAINS_EVENT
-    graph.d3Force('link').distance(link => {
-      if (link.type === 'CONTAINS_EVENT') return 40; // short leash — arcs stay near events
-      return 100;
-    });
-  }
-
   graph.d3Force('link').distance(link => {
     if (link.type === 'CONTAINS_EVENT') return 40; // short — keeps arcs near their events
     return 100;
@@ -546,7 +528,7 @@ async function showDetailPanel(data) {
   if (data.type === "character") {
     const avatarUrl = avatarUrlFor(title);
     if (avatarUrl) {
-      html += `<div class="detail-avatar"><img src="${avatarUrl}" onerror="this.style.display='none'; this.parentElement.classList.add('no-img');"></div>`;
+      html += `<div class="detail-avatar"><img src="${avatarUrl}" alt="Portrait of ${escapeHtml(title)}" onerror="this.style.display='none'; this.parentElement.classList.add('no-img');"></div>`;
     } else {
       html += `<div class="detail-avatar no-img"></div>`;
     }
@@ -711,34 +693,6 @@ async function showDetailPanel(data) {
   panel.addEventListener("keydown", panel._escHandler);
 }
 
-function showEdgeDetail(data) {
-  const panel = document.getElementById("detail-panel");
-  const content = document.getElementById("detail-content");
-
-  const si = nodeById.get(data.source);
-  const ti = nodeById.get(data.target);
-  const src = si !== undefined ? (graphNodes[si].fullLabel || graphNodes[si].label || data.source) : data.source;
-  const tgt = ti !== undefined ? (graphNodes[ti].fullLabel || graphNodes[ti].label || data.target) : data.target;
-  const sentClass = sentimentClass(data.sentiment);
-
-  let html = `<h2>${escapeHtml(src)} \u2192 ${escapeHtml(tgt)}</h2>`;
-  html += `<div class="detail-type">${escapeHtml(data.type)}</div>`;
-  if (data.label) html += `<p class="detail-desc">${escapeHtml(data.label)}</p>`;
-  if (data.sentiment !== undefined) html += `<div class="detail-row"><span>Sentiment</span><b class="${sentClass}">${data.sentiment.toFixed(2)}</b></div>`;
-  if (data.intensity !== undefined) {
-    html += `<div class="detail-row"><span>Intensity</span><b>${(data.intensity * 100).toFixed(0)}%</b></div>`;
-    html += `<div class="intensity-bar"><div class="intensity-bar-inner" style="width:${data.intensity * 100}%"></div></div>`;
-  }
-
-  content.innerHTML = html;
-  panel.classList.remove("hidden");
-  panel.focus();
-  panel._escHandler = function (e) {
-    if (e.key === "Escape") hideDetailPanel();
-  };
-  panel.addEventListener("keydown", panel._escHandler);
-}
-
 function hideDetailPanel() {
   const panel = document.getElementById("detail-panel");
   if (panel._escHandler) {
@@ -780,6 +734,7 @@ function renderCharacterSidebar(cards) {
     const safeInitial = escapeHtml(card.name.charAt(0).toUpperCase());
     div.innerHTML = `
       <img class="char-card-img" src="${API_BASE}/character-image/${encodeURIComponent(card.filename)}"
+           alt="${safeName}"
            onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
       <div class="char-card-placeholder" style="display:none;">${safeInitial}</div>
       <div class="char-card-name">${safeName}</div>

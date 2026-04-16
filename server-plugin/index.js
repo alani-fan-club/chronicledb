@@ -154,7 +154,7 @@ function stripJsonlSuffix(value) {
 function readOptionalIntegerQuery(query, key, fallback, radix) {
   const raw = query ? query[key] : undefined;
   const parsed = typeof radix === "number" ? parseInt(raw, radix) : parseInt(raw);
-  return parsed || fallback;
+  return isNaN(parsed) ? fallback : parsed;
 }
 
 function safeResolveUnderOrBadRequest(res, basePath, requestedPath) {
@@ -272,7 +272,7 @@ async function init(router) {
 
   // ── Settings endpoint (UI extension saves/loads settings here) ──
 
-  router.post("/settings", async (req, res) => {
+  router.post("/settings", withInternalError(async (req, res) => {
     const prev = settings;
     settings = { ...settings, ...req.body };
     saveCachedSettings(settings);
@@ -290,7 +290,7 @@ async function init(router) {
     }
 
     res.json({ ok: true });
-  });
+  }));
 
   router.get("/settings", (_req, res) => {
     res.json(settings);
@@ -298,7 +298,7 @@ async function init(router) {
 
   // ── Connection status ────────────────────────────────────────
 
-  router.get("/status", async (_req, res) => {
+  router.get("/status", withInternalError(async (_req, res) => {
     // Probe the pool on every poll so the UI catches runtime DB outages
     // (DB restart, network blip, admin shutdown) without waiting for the
     // next /extract or /retrieve to fail. Also surfaces recovery: if we
@@ -329,7 +329,7 @@ async function init(router) {
       initializedAt: connectionState.initializedAt,
       configured: Boolean(settings.pgHost && settings.pgDatabase),
     });
-  });
+  }));
 
   // ── Schema init ──────────────────────────────────────────────
 
@@ -428,11 +428,13 @@ async function init(router) {
              WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
             [chatId, messageIndex],
           );
-          await pool.query(`DELETE FROM events           WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
-          await pool.query(`DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
-          await pool.query(`DELETE FROM dialogue_quotes  WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
-          await pool.query(`DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
-          await pool.query(`DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2`, [chatId, messageIndex]);
+          await Promise.all([
+            pool.query(`DELETE FROM events           WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
+            pool.query(`DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
+            pool.query(`DELETE FROM dialogue_quotes  WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
+            pool.query(`DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
+            pool.query(`DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2`, [chatId, messageIndex]),
+          ]);
         } catch (err) {
           console.warn(`[ChronicleDB] /extract idempotent pre-clean failed (${err.message}); proceeding anyway`);
         }
@@ -581,27 +583,11 @@ async function init(router) {
     }
     const pool = db.getPool(settings);
     // Order matters: participated_in references events.id without ON
-    // DELETE CASCADE, so we have to clear those rows before deleting the
-    // events themselves (same pattern the manual reingest scripts use).
+    // DELETE CASCADE, so clear those rows first. After that, the remaining
+    // DELETEs are independent and run in parallel.
     await pool.query(
       `DELETE FROM participated_in
        WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
-      [chatId, messageIndex],
-    );
-    const eventsRes = await pool.query(
-      `DELETE FROM events WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-      [chatId, messageIndex],
-    );
-    const memRes = await pool.query(
-      `DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-      [chatId, messageIndex],
-    );
-    const quoteRes = await pool.query(
-      `DELETE FROM dialogue_quotes WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-      [chatId, messageIndex],
-    );
-    const snapRes = await pool.query(
-      `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
       [chatId, messageIndex],
     );
     // Trait cleanup: traits now carry source_message_index (added in the
@@ -609,10 +595,28 @@ async function init(router) {
     // column have NULL and are intentionally skipped — we don't know
     // which message they came from. Future swipes on the same message
     // clean up cleanly because new traits are tagged at write time.
-    const traitRes = await pool.query(
-      `DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2 RETURNING id`,
-      [chatId, messageIndex],
-    );
+    const [eventsRes, memRes, quoteRes, snapRes, traitRes] = await Promise.all([
+      pool.query(
+        `DELETE FROM events WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM dialogue_quotes WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+    ]);
     res.json({
       ok: true,
       deleted: {
@@ -1183,9 +1187,9 @@ async function init(router) {
   // In-memory ring buffer surface for the settings panel. Empty until
   // extractor.js is wired in a follow-up (intentionally deferred to avoid
   // conflicting with parallel edits to that file).
-  router.get("/debug/llm-calls", (_req, res) => {
+  router.get("/debug/llm-calls", withInternalError(async (_req, res) => {
     res.json({ calls: require("./llm-monitor").list() });
-  });
+  }));
 
   console.log("[ChronicleDB] Server plugin ready.");
 }

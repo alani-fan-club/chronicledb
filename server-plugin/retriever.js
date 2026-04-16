@@ -27,16 +27,25 @@ const { embed } = require("./extractor");
 const core = require("../shared/retrieval-core");
 const { BUDGET_PROFILES, resolveBudgets } = require("../shared/retrieval-budgets");
 const { applyPovFilter } = require("../shared/retrieval-pov");
-const {
-  CHARACTER_CACHE_TTL_MS,
-  getCharacterCache,
-} = require("../shared/retrieval-character-cache");
 
 // Chat-scoped character index cache for graph expansion. Long-lived
 // process → keep a per-chat Map with 5-minute TTL so chat-switching
 // doesn't re-query characters every turn. The shared detector checks
 // `expiresAt` and refreshes when stale.
 const characterCacheByChat = new Map();
+const CHARACTER_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function getCharacterCache(chatId) {
+  if (!chatId) return null;
+  let cache = characterCacheByChat.get(chatId);
+  if (!cache) {
+    cache = { chatId, entries: [], expiresAt: 0 };
+    characterCacheByChat.set(chatId, cache);
+  }
+  // If we ever grow many long-lived chats, an LRU eviction goes here.
+  // For now we leak a handful of Maps per process, which is negligible.
+  return cache;
+}
 
 async function retrieve(
   settings,
@@ -95,7 +104,7 @@ async function retrieve(
   if (recentText) {
     // Detect mentioned characters for the graph expansion boost.
     // Shared detector — cache scoped per chat, 5-min TTL, LRU-ish.
-    const cache = getCharacterCache(characterCacheByChat, chatIds && chatIds[0]);
+    const cache = getCharacterCache(chatIds && chatIds[0]);
     if (cache && cache.expiresAt === 0) cache.expiresAt = Date.now() + CHARACTER_CACHE_TTL_MS;
     try {
       boostCharIds = await core.detectMentionedCharacters(pool, chatIds, recentText, cache);

@@ -158,6 +158,11 @@ const linkVisFn = link => {
 
 // ── Utilities ───────────────────────────────────────────────────
 
+// Duplicate of escapeHtml in ui-extension/index.js. mindmap.js is served as
+// a static asset off /api/plugins/chronicle-db/map while ui-extension/index.js
+// is loaded by SillyTavern from a different root, so the two cannot share
+// an ESM import. ui-extension/index.js is the canonical site — keep this
+// copy in sync with that one.
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -247,7 +252,7 @@ function initGraph() {
     controlType: 'orbit',
     extraRenderers: [labelRenderer],
   })(container)
-    .backgroundColor('#181818')
+    .backgroundColor(COLORS.bg)
     .showNavInfo(false)
     // Node config
     .nodeThreeObject(node => {
@@ -308,9 +313,9 @@ function initGraph() {
     // Link config — hidden by default, shown only for hovered node's neighborhood
     .linkColor(link => {
       if (link.type === 'FEELS_ABOUT') {
-        return link.sentiment > 0.3 ? '#6ac47a' : link.sentiment < -0.3 ? '#e05555' : '#7a8594';
+        return link.sentiment > 0.3 ? COLORS.positive : link.sentiment < -0.3 ? COLORS.negative : COLORS.neutral;
       }
-      if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return '#FF5841';
+      if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return COLORS.accent;
       return '#666666';
     })
     .linkOpacity(0.15)
@@ -321,9 +326,9 @@ function initGraph() {
     .linkDirectionalParticleSpeed(0.005)
     .linkDirectionalParticleColor(link => {
       if (link.type === 'FEELS_ABOUT') {
-        return link.sentiment > 0.3 ? '#6ac47a' : link.sentiment < -0.3 ? '#e05555' : '#7a8594';
+        return link.sentiment > 0.3 ? COLORS.positive : link.sentiment < -0.3 ? COLORS.negative : COLORS.neutral;
       }
-      return '#FF5841';
+      return COLORS.accent;
     })
     // Force config
     .d3AlphaDecay(0.02)
@@ -667,12 +672,12 @@ async function showDetailPanel(data) {
           for (const [cat, items] of Object.entries(byCategory)) {
             for (const traitContent of items) {
               const dotColor = {
-                personality: "#c77d5c",
-                skill: "#7d9a82",
-                background: "#a88b6a",
-                physical: "#b8b8b8",
-                faction: "#FF5841",
-              }[cat] || "#6a6a6a";
+                personality: COLORS.plot_thread,
+                skill: COLORS.location,
+                background: COLORS.item,
+                physical: COLORS.tier2,
+                faction: COLORS.accent,
+              }[cat] || COLORS.tier3;
               html += `<li><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(traitContent)} <span class="detail-meta">${escapeHtml(cat)}</span></span></li>`;
             }
           }
@@ -687,6 +692,9 @@ async function showDetailPanel(data) {
   content.innerHTML = html;
   panel.classList.remove("hidden");
   panel.focus();
+  if (panel._escHandler) {
+    panel.removeEventListener("keydown", panel._escHandler);
+  }
   panel._escHandler = function (e) {
     if (e.key === "Escape") hideDetailPanel();
   };

@@ -266,6 +266,19 @@
 .chronicle-sentiment-neutral  { color: #8b949e; }
 .chronicle-sentiment-negative { color: #f85149; }
 
+.chronicle-status-ok    { color: #6c6; }
+.chronicle-status-warn  { color: #999; }
+.chronicle-llm-error    { color: #d66; }
+.chronicle-llm-error-line {
+  color: #d66;
+  padding-left: 12px;
+}
+.chronicle-llm-row {
+  padding: 2px 0;
+  border-bottom: 1px solid #333;
+}
+.chronicle-llm-meta { color: #888; }
+
 #chronicle_char_panel_clear {
   background: rgba(248, 81, 73, 0.08);
   border-color: rgba(248, 81, 73, 0.4);

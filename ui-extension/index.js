@@ -81,6 +81,7 @@ let isExtracting = false;
 // don't spam the notification area. Reset when /status shows the DB
 // is reachable again.
 let dbDownNotified = false;
+let settingsSyncErrorNotified = false;
 
 // ── Initialization ─────────────────────────────────────────────
 
@@ -453,7 +454,7 @@ function bindSettings(settings) {
   // Embedding dimension (numeric, generic name)
   $("#chronicle_embeddingDimension").val(settings.embeddingDimension || 768).on("input", function () {
     settings.embeddingDimension = parseInt($(this).val()) || 768;
-    saveAndSync(settings);
+    saveAndSyncDebounced(settings);
   });
 
   // Auto-ingest toggle — gates the GENERATION_ENDED extract hook
@@ -466,11 +467,11 @@ function bindSettings(settings) {
   $("#chronicle_arcRebuildEveryN").val(settings.arcRebuildEveryN ?? 30).on("input", function () {
     const v = parseInt($(this).val());
     settings.arcRebuildEveryN = Number.isFinite(v) && v >= 0 ? v : 30;
-    saveAndSync(settings);
+    saveAndSyncDebounced(settings);
   });
   $("#chronicle_extractEveryN").val(settings.extractEveryN).on("input", function () {
     settings.extractEveryN = parseInt($(this).val()) || 1;
-    saveAndSync(settings);
+    saveAndSyncDebounced(settings);
   });
 
   // Padding-window size — live auto-ingest skips the newest N messages so
@@ -479,12 +480,12 @@ function bindSettings(settings) {
   $("#chronicle_ingestionPadding").val(settings.ingestionPadding ?? 5).on("input", function () {
     const v = parseInt($(this).val(), 10);
     settings.ingestionPadding = Number.isFinite(v) && v >= 0 ? v : 5;
-    saveAndSync(settings);
+    saveAndSyncDebounced(settings);
   });
 
   $("#chronicle_maxInjectionTokens").val(settings.maxInjectionTokens).on("input", function () {
     settings.maxInjectionTokens = parseInt($(this).val()) || 3000;
-    saveAndSync(settings);
+    saveAndSyncDebounced(settings);
   });
 
   // Memory type toggles
@@ -615,23 +616,22 @@ async function refreshLlmMonitor() {
       const purpose = c.purpose || "?";
       const latency = (typeof c.latencyMs === "number") ? `${c.latencyMs}ms` : "—";
       const status = c.status || "?";
-      const statusColor = status === "error" ? "#d66" : (status === "ok" ? "#6c6" : "#999");
+      const statusClass = status === "error"
+        ? "chronicle-llm-error"
+        : (status === "ok" ? "chronicle-status-ok" : "chronicle-status-warn");
       const header =
-        `<span style="color:#888;">${escapeHtml(hhmmss)}</span> ` +
+        `<span class="chronicle-llm-meta">${escapeHtml(hhmmss)}</span> ` +
         `<b>${escapeHtml(provider)}:${escapeHtml(model)}</b> ` +
         `<span>${escapeHtml(purpose)}</span> ` +
-        `<span style="color:#888;">${escapeHtml(latency)}</span> ` +
-        `<span style="color:${statusColor};">${escapeHtml(status)}</span>`;
+        `<span class="chronicle-llm-meta">${escapeHtml(latency)}</span> ` +
+        `<span class="${statusClass}">${escapeHtml(status)}</span>`;
       let errLine = "";
       if (status === "error" && c.error) {
         errLine =
-          `<div style="color:#d66; padding-left: 12px;">` +
-          `${escapeHtml(c.error)}</div>`;
+          `<div class="chronicle-llm-error-line">${escapeHtml(c.error)}</div>`;
       }
       return (
-        `<div style="padding: 2px 0; border-bottom: 1px solid #333;">` +
-        `${header}${errLine}` +
-        `</div>`
+        `<div class="chronicle-llm-row">${header}${errLine}</div>`
       );
     });
     target.html(rows.join(""));
@@ -661,6 +661,16 @@ function saveAndSync(settings) {
   syncSettings(settings);
 }
 
+let _syncDebounceTimer = null;
+function saveAndSyncDebounced(settings) {
+  saveSettingsDebounced();
+  if (_syncDebounceTimer) clearTimeout(_syncDebounceTimer);
+  _syncDebounceTimer = setTimeout(() => {
+    _syncDebounceTimer = null;
+    syncSettings(settings);
+  }, 400);
+}
+
 function pluginFetch(endpoint, body) {
   return fetch(`${PLUGIN_BASE}${endpoint}`, {
     method: "POST",
@@ -671,9 +681,20 @@ function pluginFetch(endpoint, body) {
 
 async function syncSettings(settings) {
   try {
-    await pluginFetch("/settings", settings);
+    const res = await pluginFetch("/settings", settings);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    settingsSyncErrorNotified = false;
   } catch (err) {
     console.warn("[ChronicleDB] Failed to sync settings:", err);
+    if (!settingsSyncErrorNotified && typeof toastr !== "undefined") {
+      settingsSyncErrorNotified = true;
+      toastr.error(
+        `ChronicleDB couldn't save settings: ${err.message}`,
+        "Settings sync failed",
+        { timeOut: 8000 },
+      );
+      setTimeout(() => { settingsSyncErrorNotified = false; }, 30000);
+    }
   }
 }
 
@@ -1047,6 +1068,11 @@ function sentimentLabel(sentiment) {
   return { text: "very negative", klass: "chronicle-sentiment-negative" };
 }
 
+// Canonical escapeHtml. A duplicate exists in src/ui/mindmap.js: the two
+// files are loaded from different roots (this one as a SillyTavern extension
+// under public/scripts/extensions/third-party, mindmap.js as a static asset
+// off the server-plugin's /api/plugins/chronicle-db/map mount), so they
+// cannot share an ESM import. Keep the two copies in sync.
 function escapeHtml(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")

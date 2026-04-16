@@ -66,6 +66,65 @@ let glowTexture = null;
 
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+// Edges hidden by default, shown only for hovered node's neighborhood
+let hoveredNodeId = null;
+// Only show high-order edges (relationships, arcs, causal chains) on hover.
+// PARTICIPATED_IN, OCCURRED_AT, KNOWS, OWNS, LOCATED_AT are too noisy —
+// they create a starburst from every character to hundreds of events.
+const HIGH_ORDER_EDGE_TYPES = new Set([
+  'FEELS_ABOUT', 'CONTAINS_EVENT', 'CAUSED',
+]);
+
+// n+2 focus: when a node is selected, dim everything outside 2-hop neighborhood
+let focusedNodeId = null;
+let focusNeighborhood = null; // Set of node IDs within 2 hops
+
+function computeNeighborhood(nodeId, depth = 2) {
+  const visited = new Set([nodeId]);
+  let frontier = [nodeId];
+  for (let d = 0; d < depth; d++) {
+    const next = [];
+    for (const nid of frontier) {
+      for (const { neighborId } of (adjacency.get(nid) || [])) {
+        if (!visited.has(neighborId)) {
+          visited.add(neighborId);
+          next.push(neighborId);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return visited;
+}
+
+function applyFocus(nodeId) {
+  focusedNodeId = nodeId;
+  focusNeighborhood = nodeId ? computeNeighborhood(nodeId, 2) : null;
+
+  for (const node of graphNodes) {
+    const obj = node.__threeObj;
+    if (!obj) continue;
+    // First child of the Group is the glow sprite
+    const sprite = obj.children[0];
+    if (!sprite || !sprite.material) continue;
+
+    if (!focusNeighborhood) {
+      sprite.material.opacity = 1.0;
+    } else {
+      sprite.material.opacity = focusNeighborhood.has(node.id) ? 1.0 : 0.15;
+    }
+  }
+}
+
+const linkVisFn = link => {
+  if (!hoveredNodeId) return false;
+  if (!HIGH_ORDER_EDGE_TYPES.has(link.type)) return false;
+  if (!activeEdgeTypes.has(link.type)) return false;
+  const sid = typeof link.source === 'object' ? link.source.id : link.source;
+  const tid = typeof link.target === 'object' ? link.target.id : link.target;
+  return sid === hoveredNodeId || tid === hoveredNodeId;
+};
+
 // ── Utilities ───────────────────────────────────────────────────
 
 function escapeHtml(s) {
@@ -116,9 +175,9 @@ function createGlowTexture() {
 // ── Node color and sizing ───────────────────────────────────────
 
 function nodeColor(type, significance, isPC) {
-  if (type === 'character' && isPC) return '#FF8870'; // coral-tinted for PCs
+  if (type === 'character' && isPC) return '#ffad8a'; // warm coral for PCs
   switch (type) {
-    case 'character': return '#e8e8e8';
+    case 'character': return '#c8d4e8'; // cool blue-white, not grey
     case 'event': return significance >= 4 ? '#FF5841' : '#d4a574';
     case 'story_arc': return '#FF5841';
     case 'location': return '#7d9a82';
@@ -130,8 +189,8 @@ function nodeColor(type, significance, isPC) {
 }
 
 function nodePointSize(type, degree, significance, isPC) {
-  if (type === 'character' && isPC) return Math.min(65, 40 + Math.log(degree + 1) * 5);
-  if (type === 'character') return Math.min(40, 20 + Math.log(degree + 1) * 4);
+  if (type === 'character' && isPC) return Math.min(28, 18 + Math.log(degree + 1) * 2.5);
+  if (type === 'character') return Math.min(20, 12 + Math.log(degree + 1) * 2);
   if (type === 'story_arc') return 10;
   if (type === 'event') return significance >= 4 ? 8 : 4;
   return 3;
@@ -157,7 +216,7 @@ function initGraph() {
     controlType: 'orbit',
     extraRenderers: [labelRenderer],
   })(container)
-    .backgroundColor('#0a0a0a')
+    .backgroundColor('#202020')
     .showNavInfo(false)
     // Node config
     .nodeThreeObject(node => {
@@ -194,6 +253,7 @@ function initGraph() {
     .nodeLabel(node => `<div class="hover-label-content">${escapeHtml(node.fullLabel || node.label || node.id)}</div>`)
     .onNodeClick(node => {
       showDetailPanel(node);
+      applyFocus(node.id);
       // Fly camera to node
       const dist = 150;
       graph.cameraPosition(
@@ -202,18 +262,28 @@ function initGraph() {
         1500
       );
     })
-    .onBackgroundClick(() => hideDetailPanel())
-    // Link config
+    .onBackgroundClick(() => {
+      hideDetailPanel();
+      applyFocus(null);
+      hoveredNodeId = null;
+      graph.linkVisibility(linkVisFn);
+    })
+    .onNodeHover(node => {
+      hoveredNodeId = node ? node.id : null;
+      graph.linkVisibility(linkVisFn);
+      document.getElementById('cy').style.cursor = node ? 'pointer' : 'grab';
+    })
+    // Link config — hidden by default, shown only for hovered node's neighborhood
     .linkColor(link => {
       if (link.type === 'FEELS_ABOUT') {
         return link.sentiment > 0.3 ? '#6ac47a' : link.sentiment < -0.3 ? '#e05555' : '#7a8594';
       }
       if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return '#FF5841';
-      return '#333333';
+      return '#666666';
     })
-    .linkOpacity(0.07)
-    .linkVisibility(link => activeEdgeTypes.has(link.type))
-    .linkWidth(0.3)
+    .linkOpacity(0.25)
+    .linkVisibility(linkVisFn)
+    .linkWidth(0.5)
     // Force config
     .d3AlphaDecay(0.02)
     .d3VelocityDecay(0.3)
@@ -243,9 +313,9 @@ function initGraph() {
   // Add bloom post-processing
   const bloomPass = new UnrealBloomPass(
     new THREE.Vector2(container.clientWidth, container.clientHeight),
-    1.5,   // strength
-    0.5,   // radius
-    0.1    // threshold
+    0.3,   // strength (subtle, not washing out the bg)
+    0.15,  // radius (tight)
+    0.6    // threshold (only the very brightest bloom)
   );
   graph.postProcessingComposer().addPass(bloomPass);
 
@@ -713,7 +783,7 @@ function initEdgeChips() {
 }
 
 function applyEdgeFilter() {
-  graph.linkVisibility(link => activeEdgeTypes.has(link.type));
+  graph.linkVisibility(linkVisFn);
 }
 
 // ── Search ──────────────────────────────────────────────────────

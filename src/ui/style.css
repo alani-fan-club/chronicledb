@@ -514,6 +514,17 @@ html, body {
 #cy {
   flex: 1;
   position: relative;
+  background: var(--bg-base);
+}
+
+/* 3d-force-graph injects these with inline styles — override them all */
+#cy > div,
+.scene-container,
+.scene-nav-info {
+  background: transparent !important;
+}
+.scene-nav-info {
+  display: none !important;
 }
 
 #main::after {

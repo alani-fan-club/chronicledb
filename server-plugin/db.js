@@ -770,6 +770,23 @@ async function upsertTrait(
   return finalId;
 }
 
+async function getTraitsForCharacters(settings, characterNames) {
+  if (!Array.isArray(characterNames) || characterNames.length === 0) return [];
+  const p = getPool(settings);
+  const { rows } = await p.query(
+    `SELECT c.name AS character_name, t.category, t.content
+     FROM traits t
+     JOIN characters c ON c.id = t.character_id
+     WHERE (c.name = ANY($1) OR EXISTS (
+       SELECT 1 FROM unnest(c.aliases) AS a(alias) WHERE a.alias = ANY($1)
+     ))
+     AND t.canonical_id IS NULL
+     ORDER BY c.name, t.category, t.content`,
+    [characterNames],
+  );
+  return rows;
+}
+
 async function getTraitsForCharacter(settings, characterId) {
   const p = getPool(settings);
   // User-visible trait read: filter out merged variant rows
@@ -2366,7 +2383,7 @@ async function closePool() {
 module.exports = {
   getPool, setPoolErrorHandler, initSchema, slugify,
   upsertCharacter, findCharacterByNameOrAlias, upsertLocation, upsertLocationAdjacency, upsertRelationship, upsertEvent, upsertFact, upsertWorldState,
-  upsertTrait, classifyDisposition, getTraitsForCharacter, recomputeCharacterSummary,
+  upsertTrait, classifyDisposition, getTraitsForCharacter, getTraitsForCharacters, recomputeCharacterSummary,
   insertContextSnapshot, getRecentSnapshots,
   upsertPlotThread, getActivePlotThreads, upsertItem, listKnownEntitiesForChat,
   upsertStoryArc, linkEventToArc, createEventChain,

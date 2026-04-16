@@ -839,7 +839,7 @@ async function init(router) {
         // deadlocks on shared entity rows.
         const extractionResults = await Promise.allSettled(
           group.map(({ batch }) =>
-            extract(settings, { characterName: charName, userName, messages: batch })
+            extract(settings, { characterName: charName, userName, messages: batch, chatId })
           ),
         );
 

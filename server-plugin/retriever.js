@@ -306,6 +306,10 @@ async function retrieve(
     core.getPlotThreads(pool, chatIds),
     core.getRecentSnapshots(pool, chatIds, recentSnapshotsLimit),
     core.getLocations(pool, chatIds, activeCharacters || []),
+    db.getTraitsForCharacters(settings, activeCharacters || []).catch((err) => {
+      console.warn("[ChronicleDB] getTraitsForCharacters failed:", err.message);
+      return [];
+    }),
   ]);
 
   // Hybrid search: six-source fusion with graph expansion boost. When
@@ -370,7 +374,7 @@ async function retrieve(
     ),
   ]);
 
-  const [relationships, events, knowledge, worldState, plotThreads, snapshots, locations] = await structuredPromise;
+  const [relationships, events, knowledge, worldState, plotThreads, snapshots, locations, traits] = await structuredPromise;
 
   const result = {
     relationships,
@@ -380,6 +384,7 @@ async function retrieve(
     plotThreads,
     snapshots,
     locations,
+    traits,
     fusedHits,
     neighborPadding,
     arcExpansion,

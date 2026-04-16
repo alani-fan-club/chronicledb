@@ -59,6 +59,7 @@ const SECTION_LIMITS = {
   doesNotKnowTake: 3,
   relationshipTake: 10,
   relationshipDesc: 150,
+  traitsPerCategory: 8,
 };
 
 // Render caps per fused-hit kind in the "Matched *" sections.
@@ -978,6 +979,27 @@ const SECTION_REGISTRY = [
       if (!r.worldState || r.worldState.length === 0) return null;
       const lines = r.worldState.map((ws) => `- ${ws.key}: ${ws.value}`).join("\n");
       return `## World State\n${lines}`;
+    },
+  },
+  {
+    name: "Character Traits",
+    build(r) {
+      if (!r.traits || r.traits.length === 0) return null;
+      const byChar = new Map();
+      for (const t of r.traits) {
+        if (!byChar.has(t.character_name)) byChar.set(t.character_name, new Map());
+        const cats = byChar.get(t.character_name);
+        if (!cats.has(t.category)) cats.set(t.category, []);
+        cats.get(t.category).push(t.content);
+      }
+      const lines = [];
+      for (const [charName, cats] of byChar) {
+        lines.push(`${charName}:`);
+        for (const [cat, items] of cats) {
+          lines.push(`- ${cat}: ${items.slice(0, SECTION_LIMITS.traitsPerCategory).join(", ")}`);
+        }
+      }
+      return `## Character Traits\n${lines.join("\n")}`;
     },
   },
   {

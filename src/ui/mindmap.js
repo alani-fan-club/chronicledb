@@ -3,7 +3,7 @@
 
 import ForceGraph3D from '3d-force-graph';
 import * as THREE from 'three';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+// Bloom removed — was washing out the background
 import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 
 // ── API base ────────────────────────────────────────────────────
@@ -68,12 +68,33 @@ const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matc
 
 // Edges hidden by default, shown only for hovered node's neighborhood
 let hoveredNodeId = null;
-// Only show high-order edges (relationships, arcs, causal chains) on hover.
-// PARTICIPATED_IN, OCCURRED_AT, KNOWS, OWNS, LOCATED_AT are too noisy —
-// they create a starburst from every character to hundreds of events.
-const HIGH_ORDER_EDGE_TYPES = new Set([
-  'FEELS_ABOUT', 'CONTAINS_EVENT', 'CAUSED',
-]);
+
+// Chip edge types → which node types they control
+const EDGE_TO_NODE_TYPES = {
+  'PARTICIPATED_IN': ['event'],
+  'OCCURRED_AT': ['event'],
+  'KNOWS': ['fact'],
+  'OWNS': ['item'],
+  'LOCATED_AT': ['location'],
+  'INVOLVED_IN': ['plot_thread'],
+  'CONTAINS_EVENT': ['story_arc'],
+};
+
+// Which node types are currently visible (characters always visible)
+function visibleNodeTypes() {
+  const types = new Set(['character']); // always show characters
+  for (const edgeType of activeEdgeTypes) {
+    const nodeTypes = EDGE_TO_NODE_TYPES[edgeType];
+    if (nodeTypes) nodeTypes.forEach(t => types.add(t));
+  }
+  return types;
+}
+
+const nodeVisFn = node => {
+  const visible = visibleNodeTypes();
+  return visible.has(node.type);
+};
+
 
 // n+2 focus: when a node is selected, dim everything outside 2-hop neighborhood
 let focusedNodeId = null;
@@ -104,7 +125,6 @@ function applyFocus(nodeId) {
   for (const node of graphNodes) {
     const obj = node.__threeObj;
     if (!obj) continue;
-    // First child of the Group is the glow sprite
     const sprite = obj.children[0];
     if (!sprite || !sprite.material) continue;
 
@@ -114,15 +134,32 @@ function applyFocus(nodeId) {
       sprite.material.opacity = focusNeighborhood.has(node.id) ? 1.0 : 0.15;
     }
   }
+
 }
+
+const HIGHER_ORDER_EDGES = new Set(['FEELS_ABOUT', 'CONTAINS_EVENT', 'CAUSED']);
+const HIGHER_ORDER_NODE_TYPES = new Set(['character', 'story_arc']);
 
 const linkVisFn = link => {
   if (!hoveredNodeId) return false;
-  if (!HIGH_ORDER_EDGE_TYPES.has(link.type)) return false;
-  if (!activeEdgeTypes.has(link.type)) return false;
   const sid = typeof link.source === 'object' ? link.source.id : link.source;
   const tid = typeof link.target === 'object' ? link.target.id : link.target;
-  return sid === hoveredNodeId || tid === hoveredNodeId;
+  if (!(sid === hoveredNodeId || tid === hoveredNodeId)) return false;
+
+  const hoveredNode = graphNodes[nodeById.get(hoveredNodeId)];
+  if (!hoveredNode) return false;
+
+  // Higher-order nodes (characters, arcs): show higher-order edges only
+  if (HIGHER_ORDER_NODE_TYPES.has(hoveredNode.type)) {
+    return HIGHER_ORDER_EDGES.has(link.type) && activeEdgeTypes.has(link.type);
+  }
+
+  // Lower-order nodes (events, items, plots, facts, locations):
+  // show their connection UP to a higher-order node
+  const otherId = sid === hoveredNodeId ? tid : sid;
+  const otherNode = graphNodes[nodeById.get(otherId)];
+  if (!otherNode) return false;
+  return HIGHER_ORDER_NODE_TYPES.has(otherNode.type);
 };
 
 // ── Utilities ───────────────────────────────────────────────────
@@ -175,16 +212,16 @@ function createGlowTexture() {
 // ── Node color and sizing ───────────────────────────────────────
 
 function nodeColor(type, significance, isPC) {
-  if (type === 'character' && isPC) return '#ffad8a'; // warm coral for PCs
+  if (type === 'character' && isPC) return '#e8c4a0'; // warm gold for PCs
   switch (type) {
-    case 'character': return '#c8d4e8'; // cool blue-white, not grey
-    case 'event': return significance >= 4 ? '#FF5841' : '#d4a574';
-    case 'story_arc': return '#FF5841';
-    case 'location': return '#7d9a82';
-    case 'item': return '#a88b6a';
-    case 'plot_thread': return '#c77d5c';
-    case 'fact': return '#444444';
-    default: return '#555555';
+    case 'character': return '#b8c8e0'; // pale steel blue — stars
+    case 'event': return significance >= 4 ? '#c45c4a' : '#8b5e4b'; // ember / dusty rust
+    case 'story_arc': return '#7b68a8'; // muted violet — nebula cores
+    case 'location': return '#4a7a6a'; // deep teal — planetary
+    case 'item': return '#8a7a5a'; // dim bronze — asteroids
+    case 'plot_thread': return '#6a5a8a'; // dusky purple — dark matter
+    case 'fact': return '#3a3a42'; // near-black with blue tint — void dust
+    default: return '#3a3a3a';
   }
 }
 
@@ -216,7 +253,7 @@ function initGraph() {
     controlType: 'orbit',
     extraRenderers: [labelRenderer],
   })(container)
-    .backgroundColor('#202020')
+    .backgroundColor('#181818')
     .showNavInfo(false)
     // Node config
     .nodeThreeObject(node => {
@@ -250,6 +287,7 @@ function initGraph() {
       return group;
     })
     .nodeThreeObjectExtend(false)
+    .nodeVisibility(nodeVisFn)
     .nodeLabel(node => `<div class="hover-label-content">${escapeHtml(node.fullLabel || node.label || node.id)}</div>`)
     .onNodeClick(node => {
       showDetailPanel(node);
@@ -266,11 +304,11 @@ function initGraph() {
       hideDetailPanel();
       applyFocus(null);
       hoveredNodeId = null;
-      graph.linkVisibility(linkVisFn);
+      applyEdgeFilter();
     })
     .onNodeHover(node => {
       hoveredNodeId = node ? node.id : null;
-      graph.linkVisibility(linkVisFn);
+      applyEdgeFilter();
       document.getElementById('cy').style.cursor = node ? 'pointer' : 'grab';
     })
     // Link config — hidden by default, shown only for hovered node's neighborhood
@@ -281,14 +319,23 @@ function initGraph() {
       if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return '#FF5841';
       return '#666666';
     })
-    .linkOpacity(0.25)
+    .linkOpacity(0.15)
     .linkVisibility(linkVisFn)
-    .linkWidth(0.5)
+    .linkWidth(0.2)
+    .linkDirectionalParticles(link => activeEdgeTypes.has(link.type) ? 2 : 0)
+    .linkDirectionalParticleWidth(0.8)
+    .linkDirectionalParticleSpeed(0.005)
+    .linkDirectionalParticleColor(link => {
+      if (link.type === 'FEELS_ABOUT') {
+        return link.sentiment > 0.3 ? '#6ac47a' : link.sentiment < -0.3 ? '#e05555' : '#7a8594';
+      }
+      return '#FF5841';
+    })
     // Force config
     .d3AlphaDecay(0.02)
     .d3VelocityDecay(0.3)
     .warmupTicks(200)
-    .cooldownTicks(0); // render after warmup
+    .cooldownTicks(0);
 
   // Tune forces after graph is created
   graph.d3Force('charge').strength(node => node.type === 'character' ? -250 : -60);
@@ -310,18 +357,8 @@ function initGraph() {
   controls.minPolarAngle = Math.PI * 0.25;
   controls.maxPolarAngle = Math.PI * 0.75;
 
-  // Add bloom post-processing
-  const bloomPass = new UnrealBloomPass(
-    new THREE.Vector2(container.clientWidth, container.clientHeight),
-    0.3,   // strength (subtle, not washing out the bg)
-    0.15,  // radius (tight)
-    0.6    // threshold (only the very brightest bloom)
-  );
-  graph.postProcessingComposer().addPass(bloomPass);
-
-  // Handle resize for bloom pass and label renderer
+  // Handle resize for label renderer
   window.addEventListener('resize', () => {
-    bloomPass.resolution.set(container.clientWidth, container.clientHeight);
     labelRenderer.setSize(container.clientWidth, container.clientHeight);
   });
 }
@@ -783,7 +820,17 @@ function initEdgeChips() {
 }
 
 function applyEdgeFilter() {
-  graph.linkVisibility(linkVisFn);
+  graph
+    .nodeVisibility(nodeVisFn)
+    .linkVisibility(linkVisFn)
+    .linkDirectionalParticles(link => {
+      if (!hoveredNodeId) return 0;
+      const sid = typeof link.source === 'object' ? link.source.id : link.source;
+      const tid = typeof link.target === 'object' ? link.target.id : link.target;
+      if (!(sid === hoveredNodeId || tid === hoveredNodeId)) return 0;
+      if (!activeEdgeTypes.has(link.type)) return 0;
+      return 2;
+    });
 }
 
 // ── Search ──────────────────────────────────────────────────────

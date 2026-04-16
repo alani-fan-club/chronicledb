@@ -89,6 +89,13 @@ function readOptionalChatIds(query) {
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+function readRequiredRequestValue(res, source, key) {
+  const value = source && source[key];
+  if (value) return value;
+  res.status(400).json({ error: `${key} required` });
+  return null;
+}
+
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
   const pool = db.getPool(activeSettings);
   const { rows: [verify] } = await pool.query(
@@ -1035,8 +1042,8 @@ async function init(router) {
 
   router.get("/character-stats", async (req, res) => {
     try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
+      const name = readRequiredRequestValue(res, req.query, "name");
+      if (!name) return;
       const chatId = readOptionalChatId(req.query);
       const stats = await db.getCharacterPanelStats(settings, name, chatId);
       res.json(stats);
@@ -1047,8 +1054,8 @@ async function init(router) {
 
   router.get("/character-recent-events", async (req, res) => {
     try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
+      const name = readRequiredRequestValue(res, req.query, "name");
+      if (!name) return;
       const limit = parseInt(req.query.limit, 10) || 5;
       const chatId = readOptionalChatId(req.query);
       const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
@@ -1060,8 +1067,8 @@ async function init(router) {
 
   router.get("/character-relationships", async (req, res) => {
     try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
+      const name = readRequiredRequestValue(res, req.query, "name");
+      if (!name) return;
       const chatId = readOptionalChatId(req.query);
       const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
       res.json(rels);
@@ -1072,8 +1079,8 @@ async function init(router) {
 
   router.get("/character-memory-config", async (req, res) => {
     try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
+      const name = readRequiredRequestValue(res, req.query, "name");
+      if (!name) return;
       const config = await db.getCharacterMemoryConfig(settings, name);
       res.json({ sessionMode: config.sessionMode || "persistent" });
     } catch (err) {
@@ -1083,8 +1090,9 @@ async function init(router) {
 
   router.post("/character-memory-config", async (req, res) => {
     try {
-      const { name, sessionMode } = req.body || {};
-      if (!name) return res.status(400).json({ error: "name required" });
+      const { sessionMode } = req.body || {};
+      const name = readRequiredRequestValue(res, req.body, "name");
+      if (!name) return;
       // Preserve the user's chat picker selection — saveCharacterMemoryConfig
       // rewrites the whole row, so we have to read-modify-write.
       const existing = await db.getCharacterMemoryConfig(settings, name);
@@ -1101,8 +1109,8 @@ async function init(router) {
 
   router.post("/character-clear-memories", async (req, res) => {
     try {
-      const { name } = req.body || {};
-      if (!name) return res.status(400).json({ error: "name required" });
+      const name = readRequiredRequestValue(res, req.body, "name");
+      if (!name) return;
       const cleared = await db.clearCharacterMemories(settings, name);
       res.json({ ok: true, cleared });
     } catch (err) {

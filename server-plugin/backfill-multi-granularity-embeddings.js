@@ -4,23 +4,13 @@
 // Idempotent: only touches rows where embedding IS NULL.
 //
 // Usage: node backfill-multi-granularity-embeddings.js [chat_id_like]
-require("dotenv").config({ path: require("path").join(__dirname, "..", "eval", ".env") });
-const { Pool } = require("pg");
+const { loadScriptSettings, createPoolFromSettings } = require("./script-settings");
 const { embed } = require("./extractor");
 
-const settings = {
-  geminiApiKey: process.env.GEMINI_API_KEY,
-  geminiEmbeddingModel: process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-2-preview",
-  geminiEmbeddingDimension: parseInt(process.env.GEMINI_EMBEDDING_DIM || "768"),
-};
-
 async function main() {
+  const { settings } = loadScriptSettings();
   const chatFilter = process.argv[2] || "%Protagonist%";
-  const pool = new Pool({
-    host: "localhost",
-    database: "chronicledb",
-    user: process.env.PGUSER || "samantha",
-  });
+  const pool = createPoolFromSettings(settings);
 
   const { rows: events } = await pool.query(
     `SELECT id, summary, source_text

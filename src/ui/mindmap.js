@@ -1,5 +1,12 @@
-// ChronicleDB Mind Map — Obsidian-style force graph with Shift5 aesthetic
-// Dark charcoal background, coral-red highlights, fCoSE physics
+// ChronicleDB Mind Map — Three.js WebGL particle nebula with bloom
+// Dark charcoal background, coral-red highlights, 3D force-directed layout
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 
 // ── API base ────────────────────────────────────────────────────
 const IS_ST_PLUGIN = window.location.pathname.includes("/api/plugins/chronicle-db");
@@ -10,43 +17,28 @@ const API_BASE = IS_ST_PLUGIN
 const fetchOpts = { credentials: "include" };
 
 // ── SHIFT5 Operational palette ──────────────────────────────────
-// Reduced to 4 tonal levels + accent. Hierarchy from shape/size/opacity,
-// not hue. Coral reserved for PCs, arcs, and causal edges.
 const COLORS = {
   bg: "#181818",
-
-  // Signal — coral reserved for arcs and causal chains
   accent:      "#FF5841",
   accentHover: "#ff7057",
   accentDim:   "rgba(255, 88, 65, 0.2)",
-
-  // Color-coded types — muted but distinguishable
-  character:  "#e8e8e8",   // bright white — characters are the stars
-  event:      "#d4a574",   // warm amber — narrative beats
-  eventMajor: "#FF5841",   // coral — major beats
-  location:   "#7d9a82",   // muted sage — places
-  item:       "#a88b6a",   // muted tan — objects
-  plot_thread:"#c77d5c",   // dusty terracotta — unresolved threads
-  story_arc:  "#FF5841",   // coral — narrative containers
-  fact:       "#555",      // dim grey — facts
-  trait:      "#7a8aa5",   // dusty blue — traits (innate)
-
-  // Status
+  character:  "#e8e8e8",
+  event:      "#d4a574",
+  eventMajor: "#FF5841",
+  location:   "#7d9a82",
+  item:       "#a88b6a",
+  plot_thread:"#c77d5c",
+  story_arc:  "#FF5841",
+  fact:       "#555",
+  trait:      "#7a8aa5",
   positive: "#6ac47a",
   negative: "#e05555",
   neutral:  "#7a8594",
-
-  // Edges
   edge:        "#2c2c2c",
   edgeBright:  "#4a4a4a",
   edgeCausal:  "#FF5841",
-
-  // Text
   text:    "#f5f5f5",
   textDim: "#6a6a6a",
-
-  // Tonal tiers — neutral brightness levels for legend dots
-  // (legacy aliases used by detail-panel rendering)
   tier1: "#f0f0f0",
   tier2: "#b8b8b8",
   tier3: "#6a6a6a",
@@ -54,25 +46,42 @@ const COLORS = {
 };
 
 // ── State ───────────────────────────────────────────────────────
-let cy = null;
 let allData = { nodes: [], edges: [] };
 let activeCharacter = null;
 let activeEdgeTypes = new Set([
-  "FEELS_ABOUT",
-  "KNOWS",
-  "PARTICIPATED_IN",
-  "OCCURRED_AT",
-  "OWNS",
-  "LOCATED_AT",
-  "INVOLVED_IN",
-  "CONTAINS_EVENT",
-  "CAUSED",
+  "FEELS_ABOUT", "KNOWS", "PARTICIPATED_IN", "OCCURRED_AT",
+  "OWNS", "LOCATED_AT", "INVOLVED_IN",
 ]);
-
-// Map of normalized character name -> actual ST avatar filename.
-// Populated from /character-cards; only names present here get an avatarUrl,
-// which eliminates 404 spam for DB characters with no matching ST card.
 let avatarFileByName = new Map();
+
+// Graph data structures
+let graphNodes = [];     // [{id, label, fullLabel, type, size, color, x, y, z, pointSize, ...metadata}]
+let graphEdges = [];     // [{id, source, target, type, label, sentiment, intensity}]
+let nodeById = new Map(); // id -> graphNodes index
+let adjacency = new Map(); // nodeId -> [{edge, neighborId, neighborData}]
+
+// Three.js state
+let scene, camera, renderer, composer, controls, labelRenderer;
+let nodePointsMesh = null;
+let edgeLinesMesh = null;
+let raycaster, mouse;
+let hoverIndex = -1;
+let charLabelObjects = []; // CSS2DObject references for cleanup
+
+const DEFAULT_CAMERA_Z = 800;
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+let time = 0;
+
+// ── Utilities ───────────────────────────────────────────────────
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function normalizeCharName(s) {
   return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -85,373 +94,500 @@ function avatarUrlFor(name) {
   return `${API_BASE}/character-image/${encodeURIComponent(file)}`;
 }
 
-// Register fCoSE layout if available
-if (typeof cytoscape !== "undefined" && typeof cytoscapeFcose !== "undefined") {
-  cytoscape.use(cytoscapeFcose);
+function sentimentClass(s) {
+  if (s > 0.3) return "sentiment-positive";
+  if (s < -0.3) return "sentiment-negative";
+  return "sentiment-neutral";
 }
 
-// ── Cytoscape init ──────────────────────────────────────────────
+// ── Three.js initialization ─────────────────────────────────────
 
-function initCytoscape() {
-  cy = cytoscape({
-    container: document.getElementById("cy"),
-    wheelSensitivity: 0.3,
-    minZoom: 0.05,
-    maxZoom: 8,
-    style: [
-      // ──────────────────────────────────────────────────────
-      // DEFAULT NODE — flat dim disc, hidden label
-      // ──────────────────────────────────────────────────────
-      {
-        selector: "node",
-        style: {
-          "background-color": COLORS.fact,
-          "background-opacity": 0.85,
-          width: "data(size)",
-          height: "data(size)",
-          label: "data(label)",
-          "text-valign": "bottom",
-          "text-halign": "center",
-          "text-margin-y": 4,
-          "font-size": "0px",
-          "font-family": "Inter",
-          "font-weight": "400",
-          color: COLORS.textDim,
-          "text-outline-width": 2,
-          "text-outline-color": COLORS.bg,
-          "text-outline-opacity": 1,
-          "border-width": 0,
-          "border-color": COLORS.edge,
-          "transition-property":
-            "opacity, border-width, border-color, width, height, font-size, background-opacity",
-          "transition-duration": "0.18s",
-        },
-      },
+function initThreeJS() {
+  const container = document.getElementById('cy');
 
-      // ── Facts (tiny grey dots) ─────────────────────────────
-      {
-        selector: "node[type='fact']",
-        style: {
-          "background-color": COLORS.fact,
-          "background-opacity": 0.6,
-          shape: "ellipse",
-        },
-      },
+  // Scene
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x181818);
+  scene.fog = new THREE.FogExp2(0x181818, 0.0012);
 
-      // ── Items (tan hexagons) ───────────────────────────────
-      {
-        selector: "node[type='item']",
-        style: {
-          "background-color": COLORS.item,
-          "background-opacity": 0.9,
-          shape: "hexagon",
-        },
-      },
+  // Camera
+  camera = new THREE.PerspectiveCamera(
+    60,
+    container.clientWidth / container.clientHeight,
+    1,
+    5000
+  );
+  camera.position.set(0, 0, DEFAULT_CAMERA_Z);
 
-      // ── Plot threads (terracotta diamonds) ─────────────────
-      {
-        selector: "node[type='plot_thread']",
-        style: {
-          "background-color": COLORS.plot_thread,
-          "background-opacity": 0.9,
-          shape: "diamond",
-        },
-      },
+  // Renderer
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.toneMapping = THREE.ReinhardToneMapping;
+  renderer.toneMappingExposure = 1.5;
+  container.appendChild(renderer.domElement);
 
-      // ── Locations (sage round rects) ───────────────────────
-      {
-        selector: "node[type='location']",
-        style: {
-          "background-color": COLORS.location,
-          "background-opacity": 0.9,
-          shape: "round-rectangle",
-        },
-      },
+  // CSS2D label renderer
+  labelRenderer = new CSS2DRenderer();
+  labelRenderer.setSize(container.clientWidth, container.clientHeight);
+  labelRenderer.domElement.style.position = 'absolute';
+  labelRenderer.domElement.style.top = '0';
+  labelRenderer.domElement.style.left = '0';
+  labelRenderer.domElement.style.pointerEvents = 'none';
+  container.appendChild(labelRenderer.domElement);
 
-      // ── Events (amber rectangles) — minor by default ─────
-      {
-        selector: "node[type='event']",
-        style: {
-          "background-color": COLORS.event,
-          "background-opacity": 0.85,
-          shape: "round-rectangle",
-        },
-      },
+  // Post-processing
+  composer = new EffectComposer(renderer);
+  const renderPass = new RenderPass(scene, camera);
+  composer.addPass(renderPass);
 
-      // ── MAJOR events (coral, highlighted) ──────────────────
-      {
-        selector: "node[type='event'][significance >= 4]",
-        style: {
-          "background-color": COLORS.eventMajor,
-          "background-opacity": 1,
-          shape: "round-rectangle",
-          "border-width": 1,
-          "border-color": COLORS.accentHover,
-        },
-      },
+  const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(container.clientWidth, container.clientHeight),
+    1.5,   // strength
+    0.5,   // radius
+    0.15   // threshold
+  );
+  composer.addPass(bloomPass);
 
-      // ── Characters (white ellipses with avatars) ───────────
-      {
-        selector: "node[type='character']",
-        style: {
-          "background-color": COLORS.character,
-          "background-opacity": 1,
-          "background-fit": "cover",
-          "background-clip": "node",
-          shape: "ellipse",
-          "border-width": 1,
-          "border-color": COLORS.edgeBright,
-        },
-      },
-      // Only apply background-image when an avatarUrl actually exists;
-      // Cytoscape fetches the URL eagerly, so an undefined value would
-      // otherwise spam 404s for DB characters without matching ST cards.
-      {
-        selector: "node[type='character'][avatarUrl]",
-        style: {
-          "background-image": "data(avatarUrl)",
-        },
-      },
+  // Controls — constrained to near-2D to prevent disorientation.
+  // Camera can tilt slightly but won't flip upside down or go behind.
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.rotateSpeed = 0.5;
+  controls.zoomSpeed = 1.2;
+  controls.minDistance = 50;
+  controls.maxDistance = 3000;
+  controls.minPolarAngle = Math.PI * 0.25; // limit vertical tilt
+  controls.maxPolarAngle = Math.PI * 0.75;
 
-      // ── Story arcs (coral outlined rectangles) ─────────────
-      {
-        selector: "node[type='story_arc']",
-        style: {
-          "background-color": COLORS.bg,
-          "background-opacity": 1,
-          shape: "round-rectangle",
-          "font-weight": "700",
-          "border-width": 2,
-          "border-color": COLORS.accent,
-          "text-outline-color": COLORS.bg,
-        },
-      },
+  // Raycaster — generous threshold so nodes are easy to click
+  raycaster = new THREE.Raycaster();
+  raycaster.params.Points.threshold = 15;
+  mouse = new THREE.Vector2();
 
-      // ── RP group (compound parent grouping nodes per chat_id) ─
-      // Visually subdued container that fCoSE uses to cluster an RP's
-      // characters, events, and arcs together so multi-RP graphs don't
-      // overlap.
-      {
-        selector: "node[type='rp_group']",
-        style: {
-          shape: "round-rectangle",
-          "background-color": "#222",
-          "background-opacity": 0.08,
-          "border-width": 1,
-          "border-color": COLORS.edgeBright,
-          "border-opacity": 0.5,
-          "border-style": "dashed",
-          label: "data(label)",
-          "text-valign": "top",
-          "text-halign": "center",
-          "text-margin-y": -4,
-          "font-size": "6px",
-          "font-weight": "500",
-          color: COLORS.textDim,
-          "text-outline-width": 2,
-          "text-outline-color": COLORS.bg,
-          padding: "18px",
-          "min-width": "40px",
-          "min-height": "40px",
-          "z-compound-depth": "bottom",
-          "events": "no",
-        },
-      },
+  // Events
+  container.addEventListener('mousemove', onMouseMove, false);
+  container.addEventListener('click', onClick, false);
 
-      // ── Player character (coral ring) ──────────────────────
-      {
-        selector: "node[?isPC]",
-        style: {
-          "border-width": 2,
-          "border-color": COLORS.accent,
-        },
-      },
-
-      // ──────────────────────────────────────────────────────
-      // EDGES — thin dim lines by default
-      // ──────────────────────────────────────────────────────
-      {
-        selector: "edge",
-        style: {
-          "curve-style": "straight",
-          "target-arrow-shape": "none",
-          "line-color": COLORS.edge,
-          width: 1,
-          opacity: 0.7,
-          "transition-property": "opacity, line-color, width",
-          "transition-duration": "0.18s",
-        },
-      },
-      // CAUSED — directional coral chains
-      {
-        selector: "edge[type='CAUSED']",
-        style: {
-          "line-color": COLORS.edgeCausal,
-          "target-arrow-color": COLORS.edgeCausal,
-          "target-arrow-shape": "triangle",
-          "arrow-scale": 1.1,
-          width: 1.5,
-          opacity: 0.85,
-          "curve-style": "bezier",
-        },
-      },
-      // CONTAINS_EVENT — arc skeleton
-      {
-        selector: "edge[type='CONTAINS_EVENT']",
-        style: {
-          "line-color": COLORS.accent,
-          opacity: 0.25,
-          width: 1,
-          "line-style": "dashed",
-        },
-      },
-      {
-        selector: "edge[type='CONTAINS_EVENT'][?isAnchor]",
-        style: {
-          "line-color": COLORS.accent,
-          opacity: 0.9,
-          width: 2,
-          "line-style": "solid",
-        },
-      },
-      // FEELS_ABOUT — status-coded (subtle)
-      {
-        selector: "edge[type='FEELS_ABOUT'][sentiment > 0.3]",
-        style: {
-          "line-color": COLORS.positive,
-          opacity: 0.55,
-          width: "mapData(intensity, 0, 1, 1, 2.5)",
-        },
-      },
-      {
-        selector: "edge[type='FEELS_ABOUT'][sentiment < -0.3]",
-        style: {
-          "line-color": COLORS.negative,
-          opacity: 0.55,
-          width: "mapData(intensity, 0, 1, 1, 2.5)",
-        },
-      },
-      {
-        selector: "edge[type='FEELS_ABOUT'][sentiment >= -0.3][sentiment <= 0.3]",
-        style: {
-          "line-color": COLORS.neutral,
-          opacity: 0.4,
-        },
-      },
-
-      // ──────────────────────────────────────────────────────
-      // INTERACTION STATES
-      // ──────────────────────────────────────────────────────
-      {
-        selector: ".hovered",
-        style: {
-          "border-width": 2,
-          "border-color": COLORS.accent,
-          "background-opacity": 1,
-          "font-size": "5px",
-        },
-      },
-      {
-        selector: ".neighbor",
-        style: {
-          "border-width": 1,
-          "border-color": COLORS.accent,
-          "background-opacity": 1,
-          "font-size": "4px",
-        },
-      },
-      {
-        selector: "edge.neighbor-edge",
-        style: {
-          "line-color": COLORS.accent,
-          opacity: 1,
-          width: 1.5,
-        },
-      },
-      {
-        selector: ".dimmed",
-        style: { opacity: 0.06 },
-      },
-      {
-        selector: ".search-match",
-        style: {
-          "border-width": 2,
-          "border-color": COLORS.accent,
-          "background-opacity": 1,
-          "font-size": "6px",
-        },
-      },
-    ],
-    layout: { name: "preset" },
+  window.addEventListener('resize', () => {
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setSize(w, h);
+    labelRenderer.setSize(w, h);
+    composer.setSize(w, h);
   });
 
-  // Tap handlers
-  cy.on("tap", "node", (evt) => {
-    const d = evt.target.data();
-    if (d.type === "rp_group") return;
-    showDetailPanel(d);
-  });
-  cy.on("tap", "edge", (evt) => showEdgeDetail(evt.target.data()));
-  cy.on("tap", (evt) => { if (evt.target === cy) hideDetailPanel(); });
+  animate();
+}
 
-  // Hover: highlight neighborhood
-  cy.on("mouseover", "node", (evt) => {
-    const node = evt.target;
-    const nbh = node.closedNeighborhood();
-    cy.elements().not(nbh).addClass("dimmed");
-    nbh.nodes().not(node).addClass("neighbor");
-    nbh.edges().addClass("neighbor-edge");
-    node.addClass("hovered");
-  });
-  cy.on("mouseout", "node", (evt) => {
-    cy.elements().removeClass("dimmed neighbor hovered neighbor-edge");
-    if (activeCharacter) applyCharacterFilter();
-  });
+// ── Glow texture ────────────────────────────────────────────────
 
-  // Progressive label reveal — important nodes first, then all. RP group
-  // labels stay visible once zoomed in so an RP boundary is legible.
-  //
-  // Perf note: the previous version called cy.style().selector(...).update()
-  // multiple times on every "zoom" event. Cytoscape fires "zoom" continuously
-  // during scroll-wheel and pinch input, so on a 600+ node graph that meant
-  // dozens of full style recalculations per second of scrolling — the
-  // dominant source of mindmap jank. Two optimizations:
-  //   1. Debounce: collapse a burst of zoom events into one style refresh
-  //      ~60ms after the user stops scrolling. The visible result is the
-  //      same; the cost drops by 10-20×.
-  //   2. Track the active label "tier" and skip the .update() entirely
-  //      when the tier hasn't changed since the last fire (e.g. a fine
-  //      pinch within zoom > 3.0 doesn't re-apply the same selectors).
-  let zoomDebounceTimer = null;
-  let lastZoomTier = null;
-  cy.on("zoom", () => {
-    if (zoomDebounceTimer) clearTimeout(zoomDebounceTimer);
-    zoomDebounceTimer = setTimeout(() => {
-      zoomDebounceTimer = null;
-      const zoom = cy.zoom();
-      const tier = zoom > 3.0 ? 3 : zoom > 1.8 ? 2 : zoom > 1.0 ? 1 : 0;
-      if (tier === lastZoomTier) return;
-      lastZoomTier = tier;
-      const s = cy.style();
-      if (tier === 3) {
-        s.selector("node").style({ "font-size": "4px" }).update();
-        s.selector("node[type='rp_group']").style({ "font-size": "7px" }).update();
-      } else if (tier === 2) {
-        s.selector("node").style({ "font-size": "0px" }).update();
-        s.selector("node[type='character']").style({ "font-size": "4px" }).update();
-        s.selector("node[type='story_arc']").style({ "font-size": "5px" }).update();
-        s.selector("node[type='event'][significance >= 4]").style({ "font-size": "3px" }).update();
-        s.selector("node[type='rp_group']").style({ "font-size": "6px" }).update();
-      } else if (tier === 1) {
-        s.selector("node").style({ "font-size": "0px" }).update();
-        s.selector("node[type='story_arc']").style({ "font-size": "4px" }).update();
-        s.selector("node[type='rp_group']").style({ "font-size": "6px" }).update();
-      } else {
-        s.selector("node").style({ "font-size": "0px" }).update();
-        s.selector("node[type='rp_group']").style({ "font-size": "5px" }).update();
+function createGlowTexture() {
+  const size = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const half = size / 2;
+  const gradient = ctx.createRadialGradient(half, half, 0, half, half, half);
+  gradient.addColorStop(0, 'rgba(255,255,255,1)');
+  gradient.addColorStop(0.15, 'rgba(255,255,255,0.8)');
+  gradient.addColorStop(0.4, 'rgba(255,255,255,0.3)');
+  gradient.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+  return new THREE.CanvasTexture(canvas);
+}
+
+// ── Node color and sizing ───────────────────────────────────────
+
+function nodeColor(type, significance, isPC) {
+  if (type === 'character' && isPC) return 0xFF8870; // coral-tinted for PCs
+  switch (type) {
+    case 'character': return 0xe8e8e8;
+    case 'event': return significance >= 4 ? 0xFF5841 : 0xd4a574;
+    case 'story_arc': return 0xFF5841;
+    case 'location': return 0x7d9a82;
+    case 'item': return 0xa88b6a;
+    case 'plot_thread': return 0xc77d5c;
+    case 'fact': return 0x444444;
+    default: return 0x555555;
+  }
+}
+
+function nodePointSize(type, degree, significance, isPC) {
+  if (type === 'character' && isPC) return Math.min(65, 40 + Math.log(degree + 1) * 5);
+  if (type === 'character') return Math.min(40, 20 + Math.log(degree + 1) * 4);
+  if (type === 'story_arc') return 10;
+  if (type === 'event') return significance >= 4 ? 8 : 4;
+  return 3;
+}
+
+// ── Force layout ────────────────────────────────────────────────
+
+async function runForceLayout(nodes, edges) {
+  if (nodes.length === 0) return;
+
+  // Delete any existing x/y/z so d3-force-3d initializes positions
+  // properly (phyllotaxis spiral). If they're 0, d3 thinks they're
+  // "set" and skips init — 975 nodes all at origin = symmetric forces
+  // that cancel out, producing a collapsed blob.
+  for (const n of nodes) {
+    delete n.x; delete n.y; delete n.z;
+    delete n.vx; delete n.vy; delete n.vz;
+  }
+
+  // Use d3-force-3d for proper Barnes-Hut O(N log N) layout.
+  const d3 = await import('https://cdn.jsdelivr.net/npm/d3-force-3d@3/+esm');
+
+  // Filter out structural edges for layout
+  const layoutLinks = edges
+    .filter(e => e.type !== 'CONTAINS_EVENT' && e.type !== 'CAUSED')
+    .map(e => ({ source: e.source, target: e.target }));
+
+  const simulation = d3.forceSimulation(nodes, 3)
+    .force("charge", d3.forceManyBody()
+      .strength(n => n.type === 'character' ? -300 : -80)
+      .distanceMax(600))
+    .force("link", d3.forceLink(layoutLinks)
+      .id(d => d.id)
+      .distance(100)
+      .strength(0.3))
+    .force("center", d3.forceCenter())
+    .force("collide", d3.forceCollide()
+      .radius(d => d.pointSize * 0.8)
+      .strength(0.7))
+    .stop();
+
+  // Run synchronously — Barnes-Hut is fast enough for 975 nodes
+  const ticks = 300;
+  for (let i = 0; i < ticks; i++) {
+    simulation.tick();
+    // Yield every 50 ticks to keep browser responsive
+    if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
+  }
+}
+
+// ── Build Three.js geometry ─────────────────────────────────────
+
+function buildNodeGeometry() {
+  if (graphNodes.length === 0) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
+    geo.setAttribute('size', new THREE.Float32BufferAttribute([], 1));
+    const material = new THREE.PointsMaterial({ size: 1 });
+    return new THREE.Points(geo, material);
+  }
+
+  const positions = new Float32Array(graphNodes.length * 3);
+  const colors = new Float32Array(graphNodes.length * 3);
+  const sizes = new Float32Array(graphNodes.length);
+  const baseColors = new Float32Array(graphNodes.length * 3);
+
+  for (let i = 0; i < graphNodes.length; i++) {
+    const n = graphNodes[i];
+    positions[i * 3] = n.x;
+    positions[i * 3 + 1] = n.y;
+    positions[i * 3 + 2] = n.z;
+
+    const color = new THREE.Color(n.color);
+    colors[i * 3] = color.r;
+    colors[i * 3 + 1] = color.g;
+    colors[i * 3 + 2] = color.b;
+    baseColors[i * 3] = color.r;
+    baseColors[i * 3 + 1] = color.g;
+    baseColors[i * 3 + 2] = color.b;
+
+    sizes[i] = n.pointSize;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+  geo.userData = { baseColors };
+
+  const material = new THREE.ShaderMaterial({
+    uniforms: {
+      glowTexture: { value: createGlowTexture() },
+    },
+    vertexShader: `
+      attribute float size;
+      varying vec3 vColor;
+      void main() {
+        vColor = color;
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = size * (400.0 / -mvPosition.z);
+        gl_Position = projectionMatrix * mvPosition;
       }
-    }, 60);
+    `,
+    fragmentShader: `
+      uniform sampler2D glowTexture;
+      varying vec3 vColor;
+      void main() {
+        vec4 texColor = texture2D(glowTexture, gl_PointCoord);
+        gl_FragColor = vec4(vColor, 1.0) * texColor;
+        if (gl_FragColor.a < 0.01) discard;
+      }
+    `,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    vertexColors: true,
   });
+
+  return new THREE.Points(geo, material);
+}
+
+function buildEdgeGeometry() {
+  const visibleEdges = graphEdges.filter(e => activeEdgeTypes.has(e.type));
+  if (visibleEdges.length === 0) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
+    geo.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
+    return new THREE.LineSegments(geo, new THREE.LineBasicMaterial());
+  }
+
+  const positions = new Float32Array(visibleEdges.length * 6);
+  const colors = new Float32Array(visibleEdges.length * 6);
+
+  for (let i = 0; i < visibleEdges.length; i++) {
+    const e = visibleEdges[i];
+    const si = nodeById.get(e.source);
+    const ti = nodeById.get(e.target);
+    if (si === undefined || ti === undefined) continue;
+    const s = graphNodes[si], t = graphNodes[ti];
+
+    positions[i * 6] = s.x; positions[i * 6 + 1] = s.y; positions[i * 6 + 2] = s.z;
+    positions[i * 6 + 3] = t.x; positions[i * 6 + 4] = t.y; positions[i * 6 + 5] = t.z;
+
+    let edgeColor;
+    if (e.type === 'FEELS_ABOUT') {
+      edgeColor = e.sentiment > 0.3 ? 0x6ac47a : e.sentiment < -0.3 ? 0xe05555 : 0x7a8594;
+    } else if (e.type === 'CAUSED') {
+      edgeColor = 0xFF5841;
+    } else if (e.type === 'CONTAINS_EVENT') {
+      edgeColor = 0xFF5841;
+    } else {
+      edgeColor = 0x333333;
+    }
+    const c = new THREE.Color(edgeColor);
+    colors[i * 6] = c.r; colors[i * 6 + 1] = c.g; colors[i * 6 + 2] = c.b;
+    colors[i * 6 + 3] = c.r; colors[i * 6 + 4] = c.g; colors[i * 6 + 5] = c.b;
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+  const material = new THREE.LineBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.07,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+
+  return new THREE.LineSegments(geo, material);
+}
+
+// ── Character labels (CSS2D) ────────────────────────────────────
+
+function buildCharacterLabels() {
+  // Remove old labels
+  for (const obj of charLabelObjects) {
+    if (obj.parent) obj.parent.remove(obj);
+    if (obj.element && obj.element.parentNode) {
+      obj.element.parentNode.removeChild(obj.element);
+    }
+  }
+  charLabelObjects = [];
+
+  // Sort characters by degree (most connected first) for label priority
+  const chars = graphNodes
+    .filter(n => n.type === 'character')
+    .sort((a, b) => b.degree - a.degree);
+
+  for (const n of chars) {
+    const div = document.createElement('div');
+    div.className = 'node-label-3d';
+    div.textContent = n.label || n.fullLabel || '';
+    const labelObj = new CSS2DObject(div);
+    labelObj.position.set(n.x, n.y - n.pointSize * 0.3, n.z);
+    labelObj.userData = { degree: n.degree, nodeId: n.id };
+    scene.add(labelObj);
+    charLabelObjects.push(labelObj);
+  }
+}
+
+// Label collision avoidance — hide labels that overlap higher-priority ones.
+// Runs every ~200ms in the animation loop (not every frame — DOM is slow).
+let lastLabelCull = 0;
+function cullOverlappingLabels() {
+  const now = performance.now();
+  if (now - lastLabelCull < 200) return;
+  lastLabelCull = now;
+
+  // Already sorted by priority (degree) from buildCharacterLabels
+  const occupied = [];
+  for (const labelObj of charLabelObjects) {
+    const el = labelObj.element;
+    if (!el || !el.parentNode) continue;
+
+    // Temporarily show to measure
+    el.style.visibility = 'visible';
+    const rect = el.getBoundingClientRect();
+
+    // Check distance from camera — hide labels that are too far
+    const dist = camera.position.distanceTo(labelObj.position);
+    if (dist > 1200) {
+      el.style.visibility = 'hidden';
+      continue;
+    }
+
+    // Check overlap with already-placed labels
+    const overlaps = occupied.some(r =>
+      rect.left < r.right + 4 && rect.right > r.left - 4 &&
+      rect.top < r.bottom + 2 && rect.bottom > r.top - 2
+    );
+
+    if (overlaps) {
+      el.style.visibility = 'hidden';
+    } else {
+      occupied.push(rect);
+    }
+  }
+}
+
+// ── Highlight / reset ───────────────────────────────────────────
+
+function highlightNode(idx) {
+  if (!nodePointsMesh) return;
+  const colors = nodePointsMesh.geometry.attributes.color;
+  // Brighten to white
+  colors.array[idx * 3] = 1.0;
+  colors.array[idx * 3 + 1] = 1.0;
+  colors.array[idx * 3 + 2] = 1.0;
+  colors.needsUpdate = true;
+}
+
+function resetHighlights() {
+  if (!nodePointsMesh) return;
+  const colors = nodePointsMesh.geometry.attributes.color;
+  const base = nodePointsMesh.geometry.userData.baseColors;
+  if (!base) return;
+  for (let i = 0; i < base.length; i++) {
+    colors.array[i] = base[i];
+  }
+  colors.needsUpdate = true;
+}
+
+// ── Mouse interaction ───────────────────────────────────────────
+
+function onMouseMove(event) {
+  const container = document.getElementById('cy');
+  const rect = container.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  const label = document.getElementById('hover-label');
+
+  if (!nodePointsMesh || graphNodes.length === 0) {
+    label.style.display = 'none';
+    return;
+  }
+
+  const intersects = raycaster.intersectObject(nodePointsMesh);
+
+  if (intersects.length > 0) {
+    // Pick the largest/most important node among hits — characters
+    // have huge glow radius so small nodes inside their halo get
+    // picked first by distance. Sort by pointSize descending instead.
+    intersects.sort((a, b) => {
+      const na = graphNodes[a.index], nb = graphNodes[b.index];
+      return (nb.pointSize || 0) - (na.pointSize || 0);
+    });
+    const idx = intersects[0].index;
+    const node = graphNodes[idx];
+    label.textContent = node.fullLabel || node.label || node.id;
+    label.style.display = 'block';
+    label.style.left = (event.clientX - rect.left + 12) + 'px';
+    label.style.top = (event.clientY - rect.top - 8) + 'px';
+    container.style.cursor = 'pointer';
+
+    if (hoverIndex !== idx) {
+      resetHighlights();
+      hoverIndex = idx;
+      highlightNode(idx);
+    }
+  } else {
+    label.style.display = 'none';
+    container.style.cursor = 'grab';
+    if (hoverIndex >= 0) {
+      resetHighlights();
+      hoverIndex = -1;
+    }
+  }
+}
+
+function onClick(event) {
+  const container = document.getElementById('cy');
+  const rect = container.getBoundingClientRect();
+  const clickMouse = new THREE.Vector2(
+    ((event.clientX - rect.left) / rect.width) * 2 - 1,
+    -((event.clientY - rect.top) / rect.height) * 2 + 1
+  );
+
+  raycaster.setFromCamera(clickMouse, camera);
+
+  if (!nodePointsMesh || graphNodes.length === 0) {
+    hideDetailPanel();
+    return;
+  }
+
+  const intersects = raycaster.intersectObject(nodePointsMesh);
+  if (intersects.length > 0) {
+    intersects.sort((a, b) => {
+      const na = graphNodes[a.index], nb = graphNodes[b.index];
+      return (nb.pointSize || 0) - (na.pointSize || 0);
+    });
+    const idx = intersects[0].index;
+    const node = graphNodes[idx];
+    showDetailPanel(node);
+    flyToNode(node);
+  } else {
+    hideDetailPanel();
+  }
+}
+
+// ── Animation loop ──────────────────────────────────────────────
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+
+  // Gentle ambient drift (skip if reduced motion)
+  if (!reducedMotion && nodePointsMesh && graphNodes.length > 0) {
+    time += 0.001;
+    const pos = nodePointsMesh.geometry.attributes.position;
+    for (let i = 0; i < graphNodes.length; i++) {
+      const n = graphNodes[i];
+      const drift = 0.15;
+      pos.array[i * 3] = n.x + Math.sin(time + n.x * 0.01) * drift;
+      pos.array[i * 3 + 1] = n.y + Math.cos(time + n.y * 0.01) * drift;
+      pos.array[i * 3 + 2] = n.z + Math.sin(time * 0.7 + n.z * 0.01) * drift;
+    }
+    pos.needsUpdate = true;
+  }
+
+  cullOverlappingLabels();
+  composer.render();
+  labelRenderer.render(scene, camera);
 }
 
 // ── Data loading ────────────────────────────────────────────────
@@ -470,7 +606,7 @@ async function loadGraphData(scope = "global", params = {}) {
     if (!res.ok) throw new Error(`API error: ${res.status}`);
     const data = await res.json();
     allData = data;
-    renderGraph(data);
+    await renderGraph(data);
   } catch (err) {
     console.error("[ChronicleDB] Graph load error:", err);
   } finally {
@@ -478,11 +614,6 @@ async function loadGraphData(scope = "global", params = {}) {
   }
 }
 
-// Populate the chat filter dropdown from /chats. User can pick a single chat
-// to scope every subsequent /graph query; "" means unscoped (all chats).
-// Default selection is the most recent chat (remembered via localStorage)
-// so opening the mindmap auto-scopes to the chat the user is actively
-// working in. "All chats" stays available as an explicit opt-out.
 async function loadChatFilterOptions() {
   const select = document.getElementById("chat-filter");
   if (!select) return;
@@ -520,205 +651,116 @@ async function loadChatFilterOptions() {
   });
 }
 
-function renderGraph(data) {
-  cy.elements().remove();
+// ── Graph rendering ─────────────────────────────────────────────
 
-  // Build set of valid node IDs
+async function renderGraph(data) {
+  // Clear previous geometry
+  if (nodePointsMesh) { scene.remove(nodePointsMesh); nodePointsMesh = null; }
+  if (edgeLinesMesh) { scene.remove(edgeLinesMesh); edgeLinesMesh = null; }
+  for (const obj of charLabelObjects) {
+    if (obj.parent) obj.parent.remove(obj);
+  }
+  charLabelObjects = [];
+
+  // Build valid node set
   const nodeIds = new Set(data.nodes.map((n) => n.id));
-
-  // Filter edges to only ones where both endpoints exist
   const validEdges = data.edges.filter(
     (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
   );
 
-  // Calculate node sizes by connection count
+  // Connection counts
   const connectionCount = new Map();
   for (const e of validEdges) {
     connectionCount.set(e.source, (connectionCount.get(e.source) || 0) + 1);
     connectionCount.set(e.target, (connectionCount.get(e.target) || 0) + 1);
   }
 
-  // ── RP grouping ──────────────────────────────────────────────
-  // Characters have no chat_id of their own, so derive it from their
-  // connected events/arcs (which do). Events/arcs use their own chat_id.
-  // Compound parent nodes per chat_id let fCoSE cluster each RP together.
-  const nodeById = new Map(data.nodes.map((n) => [n.id, n]));
-  const charChatVotes = new Map(); // charId -> Map<chatId, count>
+  // Build graphNodes
+  graphNodes = [];
+  nodeById = new Map();
 
-  function voteChat(charId, chatId) {
-    if (!charId || !chatId) return;
-    if (!charChatVotes.has(charId)) charChatVotes.set(charId, new Map());
-    const tally = charChatVotes.get(charId);
-    tally.set(chatId, (tally.get(chatId) || 0) + 1);
-  }
+  for (let i = 0; i < data.nodes.length; i++) {
+    const node = data.nodes[i];
+    if (node.type === 'rp_group') continue; // Skip compound parent nodes
 
-  for (const edge of validEdges) {
-    if (edge.type !== "PARTICIPATED_IN" && edge.type !== "INVOLVED_IN") continue;
-    const a = nodeById.get(edge.source);
-    const b = nodeById.get(edge.target);
-    if (!a || !b) continue;
-    if (a.type === "character") voteChat(a.id, b.metadata?.chat_id);
-    if (b.type === "character") voteChat(b.id, a.metadata?.chat_id);
-  }
-
-  const chatIdForChar = new Map();
-  for (const [cid, tally] of charChatVotes) {
-    let best = null;
-    let bestN = 0;
-    for (const [chat, n] of tally) {
-      if (n > bestN) { best = chat; bestN = n; }
-    }
-    if (best) chatIdForChar.set(cid, best);
-  }
-
-  function groupIdFor(node) {
-    if (node.type === "character") return chatIdForChar.get(node.id) || null;
-    if (node.type === "event" || node.type === "story_arc") {
-      return node.metadata?.chat_id || null;
-    }
-    return null;
-  }
-
-  const groupIdsUsed = new Set();
-  for (const n of data.nodes) {
-    const g = groupIdFor(n);
-    if (g) groupIdsUsed.add(g);
-  }
-
-  const elements = [];
-
-  for (const gid of groupIdsUsed) {
-    const short = String(gid).split(/[\/\\ ]/).pop().slice(0, 48);
-    elements.push({
-      group: "nodes",
-      data: {
-        id: `rp:${gid}`,
-        label: short,
-        fullLabel: gid,
-        type: "rp_group",
-      },
-    });
-  }
-
-  for (const node of data.nodes) {
     const degree = connectionCount.get(node.id) || 0;
-    const isCharacter = node.type === "character";
-    const isEvent = node.type === "event";
-    const isArc = node.type === "story_arc";
     const significance = node.metadata?.significance || node.metadata?.importance || 3;
-
-    // Compact sizing — roughly half of the pre-fix values to reduce
-    // the visual footprint of character icons (Bug 3).
-    let size;
-    if (isArc) {
-      size = Math.min(20, 12 + (significance - 3) * 2 + Math.log(degree + 1) * 1.2);
-    } else if (isEvent) {
-      if (significance >= 4) {
-        size = 9 + (significance - 4) * 4;
-      } else {
-        size = 4 + significance * 0.7;
-      }
-    } else if (isCharacter) {
-      size = Math.min(14, 8 + Math.log(degree + 1) * 1.2);
-    } else {
-      size = Math.min(6, 3 + Math.log(degree + 1) * 0.9);
-    }
-
-    // Labels: characters and story arcs always visible; events visible for significance >= 4
     const fullLabel = node.label || "";
-    let canvasLabel = "";
-    if (isCharacter) canvasLabel = fullLabel;
-    else if (isArc) canvasLabel = fullLabel;
-    else if (isEvent && significance >= 4) canvasLabel = (fullLabel || "").slice(0, 30);
+    const label = node.type === 'character' ? fullLabel : "";
+    const isPC = node.metadata?.is_player_character ?? false;
+    const color = nodeColor(node.type, significance, isPC);
+    const pointSize = nodePointSize(node.type, degree, significance, isPC);
 
-    const gid = groupIdFor(node);
-
-    const nodeData = {
+    const gn = {
       ...node.metadata,
       id: node.id,
-      label: canvasLabel,
-      fullLabel: fullLabel,
+      label,
+      fullLabel,
       type: node.type,
-      size,
+      color,
+      pointSize,
       degree,
       significance,
       isPC: node.metadata?.is_player_character ?? false,
-      avatarUrl: isCharacter ? avatarUrlFor(fullLabel) : undefined,
+      avatarUrl: node.type === 'character' ? avatarUrlFor(fullLabel) : undefined,
     };
-    if (gid) nodeData.parent = `rp:${gid}`;
 
-    elements.push({ group: "nodes", data: nodeData });
+    nodeById.set(node.id, graphNodes.length);
+    graphNodes.push(gn);
   }
 
-  for (const edge of validEdges) {
-    elements.push({
-      group: "edges",
-      data: {
-        id: edge.id,
-        source: edge.source,
-        target: edge.target,
-        type: edge.type,
-        label: edge.label || "",
-        sentiment: edge.sentiment ?? 0,
-        intensity: edge.intensity ?? 0.5,
-      },
-    });
+  // Build graphEdges
+  graphEdges = validEdges.map(edge => ({
+    id: edge.id,
+    source: edge.source,
+    target: edge.target,
+    type: edge.type,
+    label: edge.label || "",
+    sentiment: edge.sentiment ?? 0,
+    intensity: edge.intensity ?? 0.5,
+  }));
+
+  // Build adjacency map
+  adjacency = new Map();
+  for (const e of graphEdges) {
+    const si = nodeById.get(e.source);
+    const ti = nodeById.get(e.target);
+    if (si === undefined || ti === undefined) continue;
+
+    if (!adjacency.has(e.source)) adjacency.set(e.source, []);
+    adjacency.get(e.source).push({ edge: e, neighborId: e.target, neighborData: graphNodes[ti] });
+
+    if (!adjacency.has(e.target)) adjacency.set(e.target, []);
+    adjacency.get(e.target).push({ edge: e, neighborId: e.source, neighborData: graphNodes[si] });
   }
 
-  cy.add(elements);
-  runLayout();
-}
+  // Run force layout
+  console.log(`[ChronicleDB] Running force layout on ${graphNodes.length} nodes, ${graphEdges.length} edges...`);
+  const layoutStart = performance.now();
+  await runForceLayout(graphNodes, graphEdges);
+  console.log(`[ChronicleDB] Layout complete in ${((performance.now() - layoutStart) / 1000).toFixed(1)}s`);
 
-function runLayout() {
-  // Layout perf budget — fCoSE is O(N²) per iteration, so on real chats
-  // (hundreds of nodes, thousands of edges) the previous defaults
-  // (animate: true / 800 ms / 2500 iter / quality: default) blew the
-  // browser tab. Three changes that compound:
-  //   - animate: false skips per-frame re-renders during convergence;
-  //     the layout computes in place and the user sees one final paint.
-  //   - quality: "draft" runs ~2x faster than "default" with visually
-  //     indistinguishable results above ~200 nodes.
-  //   - numIter: 1000 (down from 2500) — fCoSE converges enough for
-  //     visual purposes by ~600-800 iter; the extra 1700 are diminishing
-  //     returns that mostly cost wall time.
-  // Net effect on a 1000-node graph: ~30s → ~3s, no browser stall.
-  const nodeCount = cy.nodes().length;
-  const heavy = nodeCount > 200;
-  const layoutConfig = cytoscape("layout", "fcose")
-    ? {
-        name: "fcose",
-        quality: heavy ? "draft" : "default",
-        animate: false,
-        randomize: true,
-        nodeRepulsion: 6000,
-        idealEdgeLength: 80,
-        edgeElasticity: 0.45,
-        gravity: 0.35,
-        gravityCompound: 1.5,
-        gravityRangeCompound: 3.0,
-        nestingFactor: 0.1,
-        numIter: heavy ? 1000 : 2500,
-        tile: true,
-        packComponents: true,
-        padding: 60,
-      }
-    : {
-        name: "cose",
-        animate: false,
-        nodeRepulsion: 8000,
-        idealEdgeLength: 80,
-        edgeElasticity: 0.45,
-        gravity: 0.35,
-        numIter: heavy ? 1000 : 2500,
-        padding: 60,
-      };
+  // Build Three.js objects
+  nodePointsMesh = buildNodeGeometry();
+  scene.add(nodePointsMesh);
 
-  const layout = cy.layout(layoutConfig);
-  layout.on("layoutstop", () => {
-    // Force initial label state based on current zoom
-    cy.emit("zoom");
-  });
-  layout.run();
+  edgeLinesMesh = buildEdgeGeometry();
+  scene.add(edgeLinesMesh);
+
+  buildCharacterLabels();
+
+  // Center camera on graph
+  if (graphNodes.length > 0) {
+    let cx = 0, cy = 0, cz = 0;
+    for (const n of graphNodes) { cx += n.x; cy += n.y; cz += n.z; }
+    cx /= graphNodes.length; cy /= graphNodes.length; cz /= graphNodes.length;
+    controls.target.set(cx, cy, cz);
+    camera.position.set(cx, cy, cz + DEFAULT_CAMERA_Z);
+    controls.update();
+  }
+
+  // Yield a frame so the loading spinner can dismiss
+  await new Promise((r) => requestAnimationFrame(r));
 }
 
 function showLoading(visible) {
@@ -749,7 +791,6 @@ async function showDetailPanel(data) {
     }
   }
   html += `<h2>${escapeHtml(title)}</h2>`;
-  // escape: data.type comes from DB node rows (extracted LLM output)
   html += `<div class="detail-type">${escapeHtml(data.type || "node")}</div>`;
 
   if (data.description) html += `<p class="detail-desc">${escapeHtml(data.description)}</p>`;
@@ -760,124 +801,111 @@ async function showDetailPanel(data) {
   if (data.significance) html += `<div class="detail-row"><span class="detail-key">Significance</span><span class="detail-val">${data.significance}/5</span></div>`;
   if (data.degree !== undefined) html += `<div class="detail-row"><span class="detail-key">Connections</span><span class="detail-val">${data.degree}</span></div>`;
 
-  // Connected nodes — grouped by edge type
-  const node = cy.getElementById(data.id);
-  if (node.length) {
-    const edges = node.connectedEdges();
-    if (edges.length > 0) {
-      // Group by edge type, dedupe by (type, neighbor_id)
-      // Prevents showing "Antagonist" twice when feels_about exists both directions
-      const groups = new Map();
-      const seenByType = new Map(); // type -> Set<neighborId>
-      edges.forEach((edge) => {
-        const ed = edge.data();
-        const otherId = edge.source().id() === data.id ? edge.target().id() : edge.source().id();
-        const otherNode = cy.getElementById(otherId);
-        if (!otherNode.length) return;
+  // Connected nodes via adjacency map
+  const neighbors = adjacency.get(data.id) || [];
+  if (neighbors.length > 0) {
+    // Group by edge type, dedupe by (type, neighbor_id)
+    const groups = new Map();
+    const seenByType = new Map();
 
-        if (!seenByType.has(ed.type)) seenByType.set(ed.type, new Set());
-        const seenSet = seenByType.get(ed.type);
-        if (seenSet.has(otherId)) return; // already shown this neighbor for this edge type
-        seenSet.add(otherId);
+    for (const { edge, neighborId, neighborData } of neighbors) {
+      if (!seenByType.has(edge.type)) seenByType.set(edge.type, new Set());
+      const seenSet = seenByType.get(edge.type);
+      if (seenSet.has(neighborId)) continue;
+      seenSet.add(neighborId);
 
-        const otherData = otherNode.data();
-        const otherLabel = otherData.fullLabel || otherData.label || otherData.content || otherData.summary || otherId;
+      const otherLabel = neighborData.fullLabel || neighborData.label || neighborData.content || neighborData.summary || neighborId;
 
-        if (!groups.has(ed.type)) groups.set(ed.type, []);
-        groups.get(ed.type).push({
-          label: otherLabel.slice(0, 80),
-          type: otherData.type,
-          sentiment: ed.sentiment,
-          edgeLabel: ed.label,
-          significance: otherData.significance || 0,
-          neighborId: otherId,
-        });
+      if (!groups.has(edge.type)) groups.set(edge.type, []);
+      groups.get(edge.type).push({
+        label: otherLabel.slice(0, 80),
+        type: neighborData.type,
+        sentiment: edge.sentiment,
+        edgeLabel: edge.label,
+        significance: neighborData.significance || 0,
+        neighborId,
       });
+    }
 
-      // Sort PARTICIPATED_IN events by significance (descending) — major events first
-      if (groups.has("PARTICIPATED_IN")) {
-        groups.get("PARTICIPATED_IN").sort((a, b) => (b.significance || 0) - (a.significance || 0));
+    // Sort PARTICIPATED_IN events by significance (descending)
+    if (groups.has("PARTICIPATED_IN")) {
+      groups.get("PARTICIPATED_IN").sort((a, b) => (b.significance || 0) - (a.significance || 0));
+    }
+
+    const typeDisplayNames = {
+      FEELS_ABOUT: "Relationships",
+      KNOWS: "Knows",
+      PARTICIPATED_IN: "Events",
+      WITNESSED: "Witnessed",
+      LOCATED_AT: "Locations",
+    };
+
+    for (const [edgeType, items] of groups) {
+      html += `<h3>${escapeHtml(typeDisplayNames[edgeType] || edgeType)} <span class="detail-count">${items.length}</span></h3>`;
+      html += `<ul class="detail-list">`;
+      const shown = items.slice(0, 15);
+      for (const it of shown) {
+        const sentClass = sentimentClass(it.sentiment);
+        const dotColor =
+          it.type === "character"   ? COLORS.tier1 :
+          it.type === "story_arc"   ? COLORS.accent :
+          it.type === "event"       ? COLORS.tier2 :
+          it.type === "location"    ? COLORS.tier2 :
+          it.type === "item"        ? COLORS.tier3 :
+          it.type === "plot_thread" ? COLORS.tier3 :
+          it.type === "fact"        ? COLORS.tier4 :
+          COLORS.tier3;
+        const isMajor = edgeType === "PARTICIPATED_IN" && (it.significance || 0) >= 4;
+        const liClass = `${sentClass}${isMajor ? " major-event" : ""}`;
+        html += `<li class="${liClass}"><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(it.label)}</span></li>`;
       }
+      if (items.length > 15) {
+        html += `<li class="detail-more">+ ${items.length - 15} more</li>`;
+      }
+      html += `</ul>`;
+    }
+  }
 
-      const typeDisplayNames = {
-        FEELS_ABOUT: "Relationships",
-        KNOWS: "Knows",
-        PARTICIPATED_IN: "Events",
-        WITNESSED: "Witnessed",
-        LOCATED_AT: "Locations",
-      };
-
-      for (const [edgeType, items] of groups) {
-        // escape: edgeType falls through to DB-originated relationship name when not in typeDisplayNames
-        html += `<h3>${escapeHtml(typeDisplayNames[edgeType] || edgeType)} <span class="detail-count">${items.length}</span></h3>`;
-        html += `<ul class="detail-list">`;
-        // Limit to first 15 to avoid flooding
-        const shown = items.slice(0, 15);
-        for (const it of shown) {
-          const sentClass = sentimentClass(it.sentiment);
-          // Tiered neutral dots — differentiation via brightness, not hue
-          const dotColor =
-            it.type === "character"   ? COLORS.tier1 :
-            it.type === "story_arc"   ? COLORS.accent :
-            it.type === "event"       ? COLORS.tier2 :
-            it.type === "location"    ? COLORS.tier2 :
-            it.type === "item"        ? COLORS.tier3 :
-            it.type === "plot_thread" ? COLORS.tier3 :
-            it.type === "fact"        ? COLORS.tier4 :
-            COLORS.tier3;
-          // Mark high-significance events as "major" — coral left border
-          const isMajor = edgeType === "PARTICIPATED_IN" && (it.significance || 0) >= 4;
-          const liClass = `${sentClass}${isMajor ? " major-event" : ""}`;
-          html += `<li class="${liClass}"><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(it.label)}</span></li>`;
-        }
-        if (items.length > 15) {
-          html += `<li class="detail-more">+ ${items.length - 15} more</li>`;
-        }
-        html += `</ul>`;
+  // ── Story Arcs section (character nodes) ─────────────────────
+  if (data.type === "character") {
+    // Find events this character participated in
+    const charEventIds = new Set();
+    const myNeighbors = adjacency.get(data.id) || [];
+    for (const { edge, neighborId, neighborData } of myNeighbors) {
+      if (edge.type === "PARTICIPATED_IN" && neighborData.type === "event") {
+        charEventIds.add(neighborId);
       }
     }
 
-    // ── Story Arcs section (character nodes) ─────────────────────
-    // Find arcs in the graph that contain any of this character's events
-    if (data.type === "character") {
-      const charEventIds = new Set();
-      node.connectedEdges().forEach((e) => {
-        if (e.data("type") === "PARTICIPATED_IN") {
-          const otherId = e.source().id() === data.id ? e.target().id() : e.source().id();
-          const other = cy.getElementById(otherId);
-          if (other.length && other.data("type") === "event") charEventIds.add(otherId);
-        }
+    // Find arcs that contain any of those events
+    const arcs = [];
+    const seenArcs = new Set();
+    for (let i = 0; i < graphNodes.length; i++) {
+      const n = graphNodes[i];
+      if (n.type !== 'story_arc' || seenArcs.has(n.id)) continue;
+
+      const arcNeighbors = adjacency.get(n.id) || [];
+      const containsCharEvent = arcNeighbors.some(({ edge, neighborId }) => {
+        return edge.type === 'CONTAINS_EVENT' && charEventIds.has(neighborId);
       });
 
-      const arcs = [];
-      const seenArcs = new Set();
-      cy.nodes().forEach((n) => {
-        if (n.data("type") !== "story_arc" || seenArcs.has(n.id())) return;
-        // Does this arc contain any of the character's events?
-        const containsCharEvent = n.connectedEdges().some((e) => {
-          if (e.data("type") !== "CONTAINS_EVENT") return false;
-          const evId = e.source().id() === n.id() ? e.target().id() : e.source().id();
-          return charEventIds.has(evId);
+      if (containsCharEvent) {
+        seenArcs.add(n.id);
+        arcs.push({
+          title: n.fullLabel || n.label || n.id,
+          importance: n.importance || 3,
         });
-        if (containsCharEvent) {
-          seenArcs.add(n.id());
-          const ad = n.data();
-          arcs.push({
-            title: ad.fullLabel || ad.label || ad.title || n.id(),
-            importance: ad.importance || 3,
-          });
-        }
-      });
-
-      if (arcs.length > 0) {
-        arcs.sort((a, b) => (b.importance || 0) - (a.importance || 0));
-        html += `<h3>Story Arcs <span class="detail-count">${arcs.length}</span></h3>`;
-        html += `<ul class="detail-list">`;
-        for (const arc of arcs) {
-          html += `<li><span class="detail-dot" style="background:${COLORS.accent}"></span><span class="detail-item-label">${escapeHtml(arc.title)} <span class="detail-meta">★${arc.importance}</span></span></li>`;
-        }
-        html += `</ul>`;
       }
+    }
+
+    if (arcs.length > 0) {
+      arcs.sort((a, b) => (b.importance || 0) - (a.importance || 0));
+      html += `<h3>Story Arcs <span class="detail-count">${arcs.length}</span></h3>`;
+      html += `<ul class="detail-list">`;
+      for (const arc of arcs) {
+        html += `<li><span class="detail-dot" style="background:${COLORS.accent}"></span><span class="detail-item-label">${escapeHtml(arc.title)} <span class="detail-meta">${escapeHtml('\u2605' + arc.importance)}</span></span></li>`;
+      }
+      html += `</ul>`;
     }
   }
 
@@ -890,7 +918,6 @@ async function showDetailPanel(data) {
       if (res.ok) {
         const traits = await res.json();
         if (traits.length > 0) {
-          // Group by category (preserve insertion order from server's ORDER BY)
           const byCategory = {};
           for (const t of traits) {
             if (!byCategory[t.category]) byCategory[t.category] = [];
@@ -907,7 +934,6 @@ async function showDetailPanel(data) {
                 physical: "#b8b8b8",
                 faction: "#FF5841",
               }[cat] || "#6a6a6a";
-              // escape: cat is the trait category from DB rows (LLM-extracted, untrusted)
               html += `<li><span class="detail-dot" style="background:${dotColor}"></span><span class="detail-item-label">${escapeHtml(traitContent)} <span class="detail-meta">${escapeHtml(cat)}</span></span></li>`;
             }
           }
@@ -921,28 +947,24 @@ async function showDetailPanel(data) {
 
   content.innerHTML = html;
   panel.classList.remove("hidden");
-}
-
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  panel.focus();
+  panel._escHandler = function (e) {
+    if (e.key === "Escape") hideDetailPanel();
+  };
+  panel.addEventListener("keydown", panel._escHandler);
 }
 
 function showEdgeDetail(data) {
   const panel = document.getElementById("detail-panel");
   const content = document.getElementById("detail-content");
 
-  const src = cy.getElementById(data.source).data("label") || data.source;
-  const tgt = cy.getElementById(data.target).data("label") || data.target;
+  const si = nodeById.get(data.source);
+  const ti = nodeById.get(data.target);
+  const src = si !== undefined ? (graphNodes[si].fullLabel || graphNodes[si].label || data.source) : data.source;
+  const tgt = ti !== undefined ? (graphNodes[ti].fullLabel || graphNodes[ti].label || data.target) : data.target;
   const sentClass = sentimentClass(data.sentiment);
 
-  // escape: src/tgt come from node labels (character names, event summaries),
-  // data.type is a DB relationship name, data.label is the LLM-extracted edge label.
-  let html = `<h2>${escapeHtml(src)} → ${escapeHtml(tgt)}</h2>`;
+  let html = `<h2>${escapeHtml(src)} \u2192 ${escapeHtml(tgt)}</h2>`;
   html += `<div class="detail-type">${escapeHtml(data.type)}</div>`;
   if (data.label) html += `<p class="detail-desc">${escapeHtml(data.label)}</p>`;
   if (data.sentiment !== undefined) html += `<div class="detail-row"><span>Sentiment</span><b class="${sentClass}">${data.sentiment.toFixed(2)}</b></div>`;
@@ -953,19 +975,23 @@ function showEdgeDetail(data) {
 
   content.innerHTML = html;
   panel.classList.remove("hidden");
+  panel.focus();
+  panel._escHandler = function (e) {
+    if (e.key === "Escape") hideDetailPanel();
+  };
+  panel.addEventListener("keydown", panel._escHandler);
 }
 
 function hideDetailPanel() {
-  document.getElementById("detail-panel").classList.add("hidden");
+  const panel = document.getElementById("detail-panel");
+  if (panel._escHandler) {
+    panel.removeEventListener("keydown", panel._escHandler);
+    panel._escHandler = null;
+  }
+  panel.classList.add("hidden");
 }
 
-function sentimentClass(s) {
-  if (s > 0.3) return "sentiment-positive";
-  if (s < -0.3) return "sentiment-negative";
-  return "sentiment-neutral";
-}
-
-// ── Character sidebar (ST character cards) ──────────────────────
+// ── Character sidebar ───────────────────────────────────────────
 
 async function loadCharacterSidebar() {
   try {
@@ -984,7 +1010,6 @@ function renderCharacterSidebar(cards) {
   const container = document.getElementById("character-list");
   container.innerHTML = "";
 
-  // Rebuild the avatar filename lookup used by the graph and detail panel.
   avatarFileByName = new Map();
   for (const card of cards) {
     avatarFileByName.set(normalizeCharName(card.name), card.filename);
@@ -994,7 +1019,6 @@ function renderCharacterSidebar(cards) {
     const div = document.createElement("div");
     div.className = "char-card";
     div.dataset.name = card.name;
-    // escape: card.name comes from user-imported character cards
     const safeName = escapeHtml(card.name);
     const safeInitial = escapeHtml(card.name.charAt(0).toUpperCase());
     div.innerHTML = `
@@ -1008,15 +1032,23 @@ function renderCharacterSidebar(cards) {
   }
 }
 
-function selectCharacter(name) {
+async function selectCharacter(name) {
   activeCharacter = name;
   document.querySelectorAll(".char-card").forEach((c) => {
     c.classList.toggle("active", c.dataset.name === name);
   });
   document.getElementById("btn-show-all").classList.remove("active");
-
-  // Load this character's neighborhood
-  loadGraphData("character", { character: name, depth: 3 });
+  await loadGraphData("character", { character: name, depth: 3 });
+  // Fly camera to the selected character — try name match, fall back to
+  // highest-degree character node (the selected character is typically
+  // the most-connected node in their scoped subgraph)
+  flyToNode(name);
+  if (!graphNodes.find(n => (n.fullLabel || '').toLowerCase().includes(name.toLowerCase()))) {
+    const bestChar = graphNodes
+      .filter(n => n.type === 'character')
+      .sort((a, b) => b.degree - a.degree)[0];
+    if (bestChar) flyToNode(bestChar);
+  }
 }
 
 function clearCharacterSelection() {
@@ -1026,17 +1058,11 @@ function clearCharacterSelection() {
   loadGraphData("global");
 }
 
-function applyCharacterFilter() {
-  if (!activeCharacter) return;
-  // Additional in-graph filtering if needed
-}
-
 // ── Edge filter chips ───────────────────────────────────────────
 
 function initEdgeChips() {
   document.querySelectorAll(".chip[data-edge]").forEach((chip) => {
     chip.addEventListener("click", () => {
-      // data-edge can be comma-separated (e.g., "PARTICIPATED_IN,OCCURRED_AT")
       const types = chip.dataset.edge.split(",").map((t) => t.trim());
       const isActive = chip.classList.contains("active");
       if (isActive) {
@@ -1046,78 +1072,169 @@ function initEdgeChips() {
         types.forEach((t) => activeEdgeTypes.add(t));
         chip.classList.add("active");
       }
+      chip.setAttribute("aria-pressed", String(!isActive));
       applyEdgeFilter();
     });
   });
 }
 
 function applyEdgeFilter() {
-  cy.edges().forEach((edge) => {
-    const show = activeEdgeTypes.has(edge.data("type"));
-    edge.style("display", show ? "element" : "none");
-  });
+  if (edgeLinesMesh) scene.remove(edgeLinesMesh);
+  edgeLinesMesh = buildEdgeGeometry();
+  scene.add(edgeLinesMesh);
+}
+
+// ── Camera fly-to ──────────────────────────────────────────────
+
+function flyToNode(nodeOrName) {
+  let target;
+  if (typeof nodeOrName === 'string') {
+    const nameLower = nodeOrName.toLowerCase();
+    // Try exact match first, then includes, then character type match
+    target = graphNodes.find(n =>
+      (n.fullLabel || n.label || '').toLowerCase() === nameLower
+    ) || graphNodes.find(n =>
+      (n.fullLabel || n.label || '').toLowerCase().includes(nameLower)
+    ) || graphNodes.find(n =>
+      n.type === 'character' && nameLower.includes((n.fullLabel || n.label || '').toLowerCase())
+    );
+  } else {
+    target = nodeOrName;
+  }
+  if (!target) {
+    console.warn('[ChronicleDB] flyToNode: no match for', nodeOrName);
+    return;
+  }
+  const targetPos = new THREE.Vector3(target.x, target.y, target.z);
+  const camDist = 250;
+  const camTarget = targetPos.clone().add(new THREE.Vector3(0, 0, camDist));
+  const animate = () => {
+    const d = controls.target.distanceTo(targetPos);
+    controls.target.lerp(targetPos, 0.1);
+    camera.position.lerp(camTarget, 0.1);
+    if (d > 2) requestAnimationFrame(animate);
+  };
+  animate();
+}
+
+// ── Search ──────────────────────────────────────────────────────
+
+function searchAndFocus(query) {
+  const matches = graphNodes.filter(n =>
+    (n.fullLabel || n.label || '').toLowerCase().includes(query)
+  );
+  if (matches.length > 0) {
+    flyToNode(matches[0]);
+  }
+  return matches.length;
 }
 
 // ── Toolbar wiring ──────────────────────────────────────────────
 
 function initToolbar() {
   document.getElementById("btn-show-all").addEventListener("click", clearCharacterSelection);
+
+  // Fit: reset camera to default
   document.getElementById("btn-fit").addEventListener("click", () => {
-    cy.animate({ fit: { padding: 60 }, duration: 400 });
+    const animateFit = () => {
+      const target = new THREE.Vector3(0, 0, 0);
+      const camPos = new THREE.Vector3(0, 0, DEFAULT_CAMERA_Z);
+      const d1 = controls.target.distanceTo(target);
+      const d2 = camera.position.distanceTo(camPos);
+      controls.target.lerp(target, 0.12);
+      camera.position.lerp(camPos, 0.12);
+      if (d1 > 1 || d2 > 1) requestAnimationFrame(animateFit);
+    };
+    animateFit();
   });
-  document.getElementById("btn-layout").addEventListener("click", runLayout);
+
+  // Re-layout
+  document.getElementById("btn-layout").addEventListener("click", async () => {
+    if (graphNodes.length === 0) return;
+    showLoading(true);
+    // Yield a frame so the spinner renders
+    await new Promise(r => requestAnimationFrame(r));
+
+    await runForceLayout(graphNodes, graphEdges);
+
+    // Rebuild geometry
+    if (nodePointsMesh) scene.remove(nodePointsMesh);
+    nodePointsMesh = buildNodeGeometry();
+    scene.add(nodePointsMesh);
+
+    if (edgeLinesMesh) scene.remove(edgeLinesMesh);
+    edgeLinesMesh = buildEdgeGeometry();
+    scene.add(edgeLinesMesh);
+
+    buildCharacterLabels();
+    showLoading(false);
+  });
+
+  // Export PNG
   document.getElementById("btn-export").addEventListener("click", () => {
-    const png = cy.png({ bg: COLORS.bg, full: true, scale: 2 });
+    // Render one clean frame
+    composer.render();
+    const dataUrl = renderer.domElement.toDataURL('image/png');
     const link = document.createElement("a");
     link.download = "chronicledb-graph.png";
-    link.href = png;
+    link.href = dataUrl;
     link.click();
   });
 
   // Search
-  document.getElementById("search-input").addEventListener("input", (e) => {
-    const query = e.target.value.toLowerCase().trim();
-    cy.elements().removeClass("search-match dimmed");
+  const searchInput = document.getElementById("search-input");
+  const searchCount = document.getElementById("search-count");
+  let searchDebounce = null;
 
-    if (!query) return;
+  searchInput.addEventListener("input", (e) => {
+    if (searchDebounce) clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+      searchDebounce = null;
+      const query = e.target.value.toLowerCase().trim();
 
-    const matches = cy.nodes().filter((n) => {
-      const label = (n.data("label") || "").toLowerCase();
-      return label.includes(query);
-    });
+      // Reset highlights
+      resetHighlights();
 
-    if (matches.length > 0) {
-      cy.elements().not(matches.closedNeighborhood()).addClass("dimmed");
-      matches.addClass("search-match");
-      cy.animate({ fit: { eles: matches, padding: 80 }, duration: 500 });
+      if (!query) {
+        if (searchCount) searchCount.textContent = "";
+        return;
+      }
+
+      const count = searchAndFocus(query);
+      if (searchCount) {
+        searchCount.textContent = `${count} found`;
+      }
+    }, 180);
+  });
+
+  searchInput.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      searchInput.value = "";
+      searchInput.dispatchEvent(new Event("input"));
+      searchInput.blur();
     }
   });
 
   // Close detail panel
   document.getElementById("btn-close-panel").addEventListener("click", hideDetailPanel);
 
-  // Timeline slider (basic percentage-based filter for now)
-  document.getElementById("time-slider").addEventListener("input", (e) => {
-    const pct = Number(e.target.value);
-    const label = document.getElementById("time-label");
-    if (pct >= 100) {
-      label.textContent = "All time";
-      cy.elements().removeClass("dimmed");
-      return;
+  // Global Escape
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      const panel = document.getElementById("detail-panel");
+      if (panel && !panel.classList.contains("hidden")) {
+        hideDetailPanel();
+      }
     }
-    label.textContent = `${pct}%`;
   });
 }
 
 // ── Init ────────────────────────────────────────────────────────
 
 (async function bootstrap() {
-  initCytoscape();
+  initThreeJS();
   initEdgeChips();
   initToolbar();
-  // Await sidebar load first so avatarFileByName is populated before the
-  // graph renders — otherwise the first layout fires off 404s.
-  await loadCharacterSidebar();
-  await loadChatFilterOptions();
+  await Promise.all([loadCharacterSidebar(), loadChatFilterOptions()]);
   await loadGraphData("global");
 })();

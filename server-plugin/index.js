@@ -72,6 +72,23 @@ function markDisconnected(err) {
   };
 }
 
+function readOptionalQueryString(query, key) {
+  const raw = query && typeof query[key] === "string"
+    ? query[key].trim()
+    : "";
+  return raw.length > 0 ? raw : null;
+}
+
+function readOptionalChatId(query) {
+  return readOptionalQueryString(query, "chat_id");
+}
+
+function readOptionalChatIds(query) {
+  const raw = readOptionalChatId(query);
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
   const pool = db.getPool(activeSettings);
   const { rows: [verify] } = await pool.query(
@@ -947,9 +964,7 @@ async function init(router) {
       // Accept chat_id as single value or comma-separated list. When set,
       // every edge query filters to the given chat(s); characters and
       // locations reached by those edges still render as nodes.
-      const chatIds = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id.split(",").map((s) => s.trim()).filter(Boolean)
-        : null;
+      const chatIds = readOptionalChatIds(req.query);
 
       // Hard-reject global scope with no chat filter. Without this the user
       // gets an empty payload from the db-level guard and has no idea why.
@@ -994,9 +1009,7 @@ async function init(router) {
       // can scope character traits to the currently-selected chat filter.
       // Unscoped (no chat_id) still returns all traits for the character —
       // the "show everything about X" fallback behavior the page defaults to.
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
+      const chatId = readOptionalChatId(req.query);
       // User-visible trait read: filter out merged variant rows so the
       // same trait never surfaces twice. Path 1's canonical-row dedup
       // pipeline keeps merged rows in place for provenance, but they
@@ -1024,9 +1037,7 @@ async function init(router) {
     try {
       const name = req.query.name;
       if (!name) return res.status(400).json({ error: "name required" });
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
+      const chatId = readOptionalChatId(req.query);
       const stats = await db.getCharacterPanelStats(settings, name, chatId);
       res.json(stats);
     } catch (err) {
@@ -1039,9 +1050,7 @@ async function init(router) {
       const name = req.query.name;
       if (!name) return res.status(400).json({ error: "name required" });
       const limit = parseInt(req.query.limit, 10) || 5;
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
+      const chatId = readOptionalChatId(req.query);
       const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
       res.json(events);
     } catch (err) {
@@ -1053,9 +1062,7 @@ async function init(router) {
     try {
       const name = req.query.name;
       if (!name) return res.status(400).json({ error: "name required" });
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
+      const chatId = readOptionalChatId(req.query);
       const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
       res.json(rels);
     } catch (err) {

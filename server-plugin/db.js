@@ -4,6 +4,7 @@ const { resolve } = require("path");
 const { createHash } = require("crypto");
 const { buildOrTsquery } = require("../shared/ts-query");
 const { GOLDBERG_100, NRC_EMOTION, NRC_VAD } = require("../shared/trait-lexicons");
+const { setWithBoundedEviction } = require("./bounded-map");
 
 let pool = null;
 let poolConfigHash = "";
@@ -467,18 +468,17 @@ const TRAIT_VERIFY_COSINE = 0.80;
 // `${canonical_id}::${normalized_candidate}`. Cleared on restart.
 //
 // M13: bounded by TRAIT_VERIFY_CACHE_MAX so a long-running process
-// ingesting many chats can't grow the Map without bound. On insert,
+// ingesting many chats can't grow the Map without bound. On write,
 // if the Map is at capacity we drop the oldest entry (Map preserves
-// insertion order), which is a cheap approximate LRU for the
-// write-only cache.
+// insertion order).
 const TRAIT_VERIFY_CACHE_MAX = 1000;
 const traitVerifyCache = new Map();
 function setTraitVerifyCache(key, val) {
-  if (traitVerifyCache.size >= TRAIT_VERIFY_CACHE_MAX) {
-    const first = traitVerifyCache.keys().next().value;
-    if (first !== undefined) traitVerifyCache.delete(first);
-  }
-  traitVerifyCache.set(key, val);
+  setWithBoundedEviction(traitVerifyCache, key, val, TRAIT_VERIFY_CACHE_MAX, {
+    // Preserve legacy semantics: this cache historically evicted even when
+    // writing an existing key at capacity.
+    evictOnUpdateAtCapacity: true,
+  });
 }
 
 async function upsertTrait(

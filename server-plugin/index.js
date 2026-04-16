@@ -15,6 +15,7 @@ const {
 const { retrieve, formatMemoryBlock } = require("./retriever");
 const { ingestLorebook, listLorebooks } = require("./lorebook");
 const { safeResolveUnder } = require("./path-safety");
+const { setWithBoundedEviction } = require("./bounded-map");
 const { resolveStDataRoot } = require("./st-paths");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { resolve: pathResolve, dirname: pathDirname } = require("path");
@@ -285,24 +286,21 @@ async function init(router) {
   // /extract calls for the same chat can't double-rebuild.
   // Resets on plugin restart, which is fine — the worst case is the very
   // first /extract after restart waits a few extra messages to fire.
+  const ARC_REBUILD_CACHE_MAX = 200;
   const arcRebuildLastCount = new Map(); // chatId -> int
   const arcRebuildInFlight = new Set();  // chatId
 
   // Bounded eviction. Both maps accumulate one entry per chat_id forever,
   // so a long-running ST process with many chats grows unboundedly. Cap at
-  // 200 entries and evict the oldest (Map preserves insertion order, so
+  // ARC_REBUILD_CACHE_MAX entries and evict the oldest (Map preserves insertion order, so
   // `keys().next().value` is the least-recently-inserted). Use this wrapper
   // instead of `arcRebuildLastCount.set(chatId, n)` directly.
   function setArcRebuildCount(chatId, n) {
-    const MAX = 200;
-    if (arcRebuildLastCount.size >= MAX && !arcRebuildLastCount.has(chatId)) {
-      const first = arcRebuildLastCount.keys().next().value;
-      arcRebuildLastCount.delete(first);
+    setWithBoundedEviction(arcRebuildLastCount, chatId, n, ARC_REBUILD_CACHE_MAX, {
       // Set.delete(value) is a no-op if the value isn't present, so this is
       // safe even when the evicted chat has no in-flight rebuild.
-      arcRebuildInFlight.delete(first);
-    }
-    arcRebuildLastCount.set(chatId, n);
+      onEvict: (evictedChatId) => arcRebuildInFlight.delete(evictedChatId),
+    });
   }
 
   // Per-(chatId, messageIndex) extract mutex. When two /extract calls

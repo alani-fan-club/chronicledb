@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChronicleDB — Persistent Memory for Roleplay</title>
+  <meta name="description" content="Graph + vector memory store for SillyTavern. Characters remember, relationships evolve, stories persist.">
+  <meta property="og:title" content="ChronicleDB — Persistent Memory for Roleplay">
+  <meta property="og:description" content="Graph + vector memory store for SillyTavern. Characters remember, relationships evolve, stories persist.">
+  <meta property="og:type" content="website">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@700&display=swap" rel="stylesheet">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9646;</text></svg>">
+  <style>
+    :root {
+      --black: #000;
+      --white: #e8e8e8;
+      --white-bright: #fff;
+      --gray: #888;
+      --gray-dim: #666;
+      --gray-rule: #1a1a1a;
+      --accent: #3bceac;
+      --accent-dim: #2a9a7e;
+      --cherry: #e0303e;
+      --cherry-glow: color-mix(in srgb, #e0303e 25%, transparent);
+      --font-mono: "JetBrains Mono", "SF Mono", "Fira Code", monospace;
+      --font-display: "Space Grotesk", "SF Pro Display", system-ui, sans-serif;
+      --max-width: 760px;
+      --ease-out-expo: cubic-bezier(.16, 1, .3, 1);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    ::selection { background: var(--accent); color: var(--black); }
+
+    body {
+      font-family: var(--font-mono);
+      font-size: .875rem;
+      line-height: 1.7;
+      color: var(--white);
+      background: var(--black);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* CRT dot grid */
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(color-mix(in srgb, var(--accent) 6%, transparent) 1px, transparent 1px);
+      background-size: 24px 24px;
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    /* Scanlines */
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,.03) 2px,
+        rgba(0,0,0,.03) 4px
+      );
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    .site-container {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+      position: relative;
+      z-index: 2;
+    }
+
+    /* ── Nav ──────────────────────────────────────── */
+
+    .site-nav {
+      display: flex;
+      gap: 2rem;
+      padding: 1rem 0 2rem;
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .15em;
+      border-bottom: 1px solid var(--gray-rule);
+    }
+
+    .site-nav a {
+      color: var(--gray);
+      text-decoration: none;
+      transition: color .2s ease;
+    }
+
+    .site-nav a::before { content: "> "; color: var(--gray-dim); }
+
+    .site-nav a:hover { color: var(--accent); }
+
+    /* ── Hero ─────────────────────────────────────── */
+
+    .hero {
+      padding: 5rem 0 4rem;
+      text-align: center;
+      position: relative;
+    }
+
+    .hero-micro {
+      font-size: .5rem;
+      text-transform: uppercase;
+      letter-spacing: .25em;
+      color: var(--gray-dim);
+      position: absolute;
+    }
+
+    .hero-micro--top-right { top: 2rem; right: 0; }
+    .hero-micro--bottom-left { bottom: 1rem; left: 0; }
+
+    .hero h1 {
+      font-family: var(--font-display);
+      font-size: clamp(2.5rem, 7vw, 4.5rem);
+      font-weight: 700;
+      line-height: 1.1;
+      color: var(--white-bright);
+      margin-bottom: .75rem;
+    }
+
+    .hero h1 .accent { color: var(--accent); }
+    .hero h1 .cherry { color: var(--cherry); }
+    .hero h1 .cursor {
+      color: var(--accent);
+      animation: cursor-blink 1s steps(2) infinite;
+    }
+
+    @keyframes cursor-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+    .hero-tagline {
+      font-size: .8rem;
+      color: var(--gray);
+      letter-spacing: .05em;
+    }
+
+    .hero-tagline .sep { color: var(--gray-dim); }
+
+    .hero-desc {
+      margin-top: 1.5rem;
+      font-size: .875rem;
+      color: var(--white);
+      line-height: 1.8;
+      max-width: 560px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .hero-actions {
+      margin-top: 2rem;
+      display: flex;
+      gap: 1rem;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      text-decoration: none;
+      padding: .6em 1.8em;
+      border: 1px solid;
+      transition: all .25s var(--ease-out-expo);
+    }
+
+    .btn-primary {
+      color: var(--black);
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .btn-primary:hover {
+      background: var(--white-bright);
+      border-color: var(--white-bright);
+      box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 30%, transparent);
+    }
+
+    .btn-ghost {
+      color: var(--accent);
+      background: transparent;
+      border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    }
+
+    .btn-ghost:hover {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 8%, transparent);
+    }
+
+    /* ── Section chrome ───────────────────────────── */
+
+    .section-label {
+      font-size: .65rem;
+      text-transform: uppercase;
+      letter-spacing: .2em;
+      color: var(--accent);
+      padding: .3em 0;
+      margin: 4rem 0 2rem;
+      border-top: 1px solid var(--gray-rule);
+    }
+
+    .section-label .count { color: var(--gray-dim); }
+
+    h2 {
+      font-family: var(--font-display);
+      font-size: clamp(1.25rem, 3vw, 1.75rem);
+      font-weight: 700;
+      color: var(--white-bright);
+      line-height: 1.2;
+      margin-bottom: 1rem;
+    }
+
+    h3 {
+      font-size: .85rem;
+      font-weight: 500;
+      color: var(--white-bright);
+      margin-bottom: .5rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    p { margin-bottom: 1rem; color: var(--white); }
+    p.muted { color: var(--gray); font-size: .8rem; }
+
+    /* ── Feature cards ────────────────────────────── */
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1px;
+      background: var(--gray-rule);
+      border: 1px solid var(--gray-rule);
+      margin: 1.5rem 0 2rem;
+    }
+
+    .feature-card {
+      background: var(--black);
+      padding: 1.5rem;
+      position: relative;
+      transition: background .2s ease;
+    }
+
+    .feature-card:hover {
+      background: color-mix(in srgb, var(--accent) 3%, var(--black));
+    }
+
+    .feature-card::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 3px;
+      height: 100%;
+      background: var(--accent);
+      opacity: 0;
+      transition: opacity .2s ease;
+    }
+
+    .feature-card:hover::before { opacity: 1; }
+
+    .feature-card h3 {
+      font-size: .75rem;
+      margin-bottom: .4rem;
+    }
+
+    .feature-card p {
+      font-size: .8rem;
+      color: var(--gray);
+      margin-bottom: 0;
+      line-height: 1.6;
+    }
+
+    .feature-tag {
+      display: inline-block;
+      font-size: .6rem;
+      color: var(--accent);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+      border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+      padding: .1em .45em;
+      margin-right: .3rem;
+      margin-top: .5rem;
+    }
+
+    @media (min-width: 600px) {
+      .feature-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    /* ── Install steps ────────────────────────────── */
+
+    .steps { counter-reset: step; }
+
+    .step {
+      position: relative;
+      padding: 1.5rem 0 1.5rem 3rem;
+      border-bottom: 1px solid var(--gray-rule);
+    }
+
+    .step::before {
+      counter-increment: step;
+      content: counter(step, decimal-leading-zero);
+      position: absolute;
+      left: 0;
+      top: 1.5rem;
+      font-size: .65rem;
+      color: var(--accent);
+      letter-spacing: .1em;
+      font-weight: 700;
+    }
+
+    .step h3 {
+      font-size: .8rem;
+      margin-bottom: .5rem;
+    }
+
+    .step p {
+      font-size: .8rem;
+      color: var(--gray);
+      margin-bottom: .5rem;
+    }
+
+    .step .note {
+      font-size: .7rem;
+      color: var(--gray-dim);
+      border-left: 2px solid var(--gray-rule);
+      padding-left: .75rem;
+      margin-top: .5rem;
+    }
+
+    .step .note.warn {
+      border-left-color: var(--cherry);
+      color: color-mix(in srgb, var(--cherry) 80%, var(--white));
+    }
+
+    /* ── Code blocks ──────────────────────────────── */
+
+    pre {
+      font-family: var(--font-mono);
+      font-size: .75rem;
+      line-height: 1.6;
+      background: #0a0a0a;
+      border: 1px solid var(--gray-rule);
+      padding: 1rem 1.25rem;
+      overflow-x: auto;
+      margin: .75rem 0;
+      position: relative;
+    }
+
+    pre::before {
+      content: attr(data-lang);
+      position: absolute;
+      top: .4rem;
+      right: .6rem;
+      font-size: .55rem;
+      text-transform: uppercase;
+      letter-spacing: .15em;
+      color: var(--gray-dim);
+    }
+
+    pre::after {
+      content: "";
+      display: block;
+      height: 4px;
+      margin-top: .5rem;
+      background: repeating-conic-gradient(color-mix(in srgb, var(--accent) 15%, transparent) 0% 25%, transparent 0% 50%) 0 0 / 3px 3px;
+    }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: .8rem;
+      background: #111;
+      padding: .1em .35em;
+      border-radius: 2px;
+    }
+
+    pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
+
+    .cmd { color: var(--accent); }
+    .cmt { color: var(--gray-dim); }
+    .str { color: #e8c547; }
+
+    /* ── Config table ─────────────────────────────── */
+
+    .config-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .75rem;
+      margin: 1rem 0;
+    }
+
+    .config-table th {
+      text-align: left;
+      font-size: .65rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      color: var(--accent);
+      padding: .5rem .75rem;
+      border-bottom: 1px solid var(--gray-rule);
+      font-weight: 500;
+    }
+
+    .config-table td {
+      padding: .5rem .75rem;
+      border-bottom: 1px solid var(--gray-rule);
+      color: var(--gray);
+      vertical-align: top;
+    }
+
+    .config-table td:first-child { color: var(--white); font-weight: 500; }
+
+    /* ── Architecture diagram ─────────────────────── */
+
+    .arch-box {
+      border: 1px solid var(--gray-rule);
+      padding: 2rem;
+      margin: 1.5rem 0;
+      text-align: center;
+      font-size: .7rem;
+      color: var(--gray);
+      letter-spacing: .05em;
+      line-height: 2.2;
+      background: #050505;
+    }
+
+    .arch-box .node {
+      display: inline-block;
+      border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+      background: color-mix(in srgb, var(--accent) 6%, transparent);
+      color: var(--white);
+      padding: .2em .7em;
+      margin: .2em;
+      font-weight: 500;
+    }
+
+    .arch-box .arrow {
+      color: var(--gray-dim);
+      margin: 0 .3em;
+    }
+
+    .arch-box .layer {
+      display: block;
+      margin: .3rem 0;
+    }
+
+    /* ── Checklist ─────────────────────────────────── */
+
+    .checklist {
+      list-style: none;
+      margin: 1rem 0;
+    }
+
+    .checklist li {
+      padding: .4rem 0 .4rem 1.5rem;
+      position: relative;
+      font-size: .8rem;
+      color: var(--gray);
+    }
+
+    .checklist li::before {
+      content: "[ ]";
+      position: absolute;
+      left: 0;
+      color: var(--gray-dim);
+      font-size: .7rem;
+    }
+
+    .checklist li.done::before {
+      content: "[x]";
+      color: var(--accent);
+    }
+
+    /* ── FAQ / accordion ──────────────────────────── */
+
+    .faq-item {
+      border-bottom: 1px solid var(--gray-rule);
+      padding: 1rem 0;
+    }
+
+    .faq-q {
+      font-size: .8rem;
+      font-weight: 500;
+      color: var(--white-bright);
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .faq-q::after {
+      content: "+";
+      color: var(--accent);
+      font-size: 1rem;
+      transition: transform .2s ease;
+    }
+
+    .faq-item.open .faq-q::after { transform: rotate(45deg); }
+
+    .faq-a {
+      font-size: .8rem;
+      color: var(--gray);
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height .3s var(--ease-out-expo), padding .3s ease;
+      padding-top: 0;
+    }
+
+    .faq-item.open .faq-a {
+      max-height: 500px;
+      padding-top: .75rem;
+    }
+
+    /* ── Footer ───────────────────────────────────── */
+
+    .site-footer {
+      border-top: 1px solid var(--gray-rule);
+      padding-top: 2rem;
+      margin-top: 4rem;
+      text-align: center;
+    }
+
+    .footer-links {
+      display: flex;
+      justify-content: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      font-size: .7rem;
+      text-transform: uppercase;
+      letter-spacing: .12em;
+      margin-bottom: 1.5rem;
+    }
+
+    .footer-links a {
+      color: var(--gray-dim);
+      text-decoration: none;
+      transition: color .2s ease;
+    }
+
+    .footer-links a:hover { color: var(--accent); }
+
+    .footer-copy {
+      font-size: .65rem;
+      color: var(--gray-dim);
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+
+    .footer-status {
+      font-size: .5rem;
+      color: var(--gray-dim);
+      letter-spacing: .2em;
+      text-transform: uppercase;
+      margin-top: .75rem;
+    }
+
+    .footer-status .dot { color: var(--accent); }
+
+    /* ── Responsive ───────────────────────────────── */
+
+    @media (max-width: 640px) {
+      .site-nav { gap: 1rem; flex-wrap: wrap; }
+      .hero { padding: 3rem 0 2.5rem; }
+      .hero-micro { display: none; }
+      .step { padding-left: 2.5rem; }
+      .arch-box { padding: 1rem; }
+      .feature-grid { grid-template-columns: 1fr; }
+      body { font-size: 1rem; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="site-container">
+
+    <!-- Nav -->
+    <nav class="site-nav">
+      <a href="https://alanifan.club/">Home</a>
+      <a href="https://github.com/alani-fan-club/chronicledb">GitHub</a>
+      <a href="https://discord.gg/alanifanclub">Discord</a>
+    </nav>
+
+    <!-- Hero -->
+    <header class="hero">
+      <span class="hero-micro hero-micro--top-right">SYS://CHRONICLE <span style="color:var(--accent)">&#9679;</span></span>
+      <h1><span class="cherry">C</span>HRONI<span class="cherry">CLE</span><span class="accent">DB</span><span class="cursor" aria-hidden="true">&#9646;</span></h1>
+      <p class="hero-tagline">
+        Persistent Memory for Roleplay <span class="sep">//</span> SillyTavern Plugin
+      </p>
+      <p class="hero-desc">
+        A graph + vector memory store that makes your characters <em>actually remember</em>.
+        Relationships evolve, events persist, knowledge stays consistent, and stories build
+        on themselves across sessions.
+      </p>
+      <div class="hero-actions">
+        <a href="#install" class="btn btn-primary">Install Guide</a>
+        <a href="https://github.com/alani-fan-club/chronicledb" class="btn btn-ghost">View Source</a>
+      </div>
+      <span class="hero-micro hero-micro--bottom-left">NODE: ACTIVE &#9698; v1.0</span>
+    </header>
+
+    <!-- What it does -->
+    <div class="section-label">What ChronicleDB Does <span class="count">[overview]</span></div>
+
+    <p>
+      Every message you exchange gets analyzed by a lightweight LLM. Characters, events, traits,
+      relationships, locations, items, and plot threads are extracted into a PostgreSQL graph with
+      vector embeddings for semantic search. When it's time for the AI to reply, the most relevant
+      memories are retrieved and injected into context &mdash; so the model knows what happened,
+      who said what, and how characters feel about each other.
+    </p>
+
+    <div class="arch-box">
+      <span class="layer">
+        <span class="node">SillyTavern Chat</span>
+        <span class="arrow">&rarr;</span>
+        <span class="node">Extraction LLM</span>
+        <span class="arrow">&rarr;</span>
+        <span class="node">Graph + Vector Store</span>
+      </span>
+      <span class="layer">
+        <span class="node">AI Generation</span>
+        <span class="arrow">&larr;</span>
+        <span class="node">Hybrid Retrieval (RRF)</span>
+        <span class="arrow">&larr;</span>
+        <span class="node">PostgreSQL + pgvector</span>
+      </span>
+    </div>
+
+    <!-- Features -->
+    <div class="section-label">Features <span class="count">[12 modules]</span></div>
+
+    <div class="feature-grid">
+      <div class="feature-card">
+        <h3>Character Traits</h3>
+        <p>Extracts stable personality traits, skills, and backstory. Deduplicates across sessions via kNN cosine matching and LLM verification &mdash; so "cunning" and "shrewd" collapse into one canonical trait.</p>
+        <span class="feature-tag">Path 1-5 Pipeline</span>
+      </div>
+      <div class="feature-card">
+        <h3>Relationships</h3>
+        <p>Tracks how characters feel about each other with sentiment, intensity, and descriptions. Evolves as the story progresses.</p>
+        <span class="feature-tag">Per-chat scoped</span>
+      </div>
+      <div class="feature-card">
+        <h3>Events &amp; Timeline</h3>
+        <p>Every significant event is recorded with participants, causal chains, significance scores, verbatim source quotes, and in-story time markers.</p>
+        <span class="feature-tag">World clock aware</span>
+      </div>
+      <div class="feature-card">
+        <h3>Story Arcs</h3>
+        <p>Discovers narrative structure automatically via Louvain community detection on a weighted event graph. Three-level hierarchy: super-arcs, arcs, and episodes.</p>
+        <span class="feature-tag">Structural</span>
+        <span class="feature-tag">LLM-named</span>
+      </div>
+      <div class="feature-card">
+        <h3>Knowledge Boundaries</h3>
+        <p>Tracks what each character knows and doesn't know. Prevents information leakage across character perspectives with epistemic masking.</p>
+        <span class="feature-tag">Per-character POV</span>
+      </div>
+      <div class="feature-card">
+        <h3>Hybrid Retrieval</h3>
+        <p>Six-bucket search fusing dense vectors + lexical across memories, events, dialogue quotes, and scene snapshots. Reciprocal Rank Fusion with recency boost.</p>
+        <span class="feature-tag">RRF fusion</span>
+      </div>
+      <div class="feature-card">
+        <h3>World State</h3>
+        <p>Key-value facts about the world with temporal validity. Tracks locations, items, ownership, and location adjacency for spatial awareness.</p>
+        <span class="feature-tag">Bi-temporal</span>
+      </div>
+      <div class="feature-card">
+        <h3>Dialogue Quotes</h3>
+        <p>Indexes verbatim dialogue with full-text and trigram search. Answer "what did Alice say about the prophecy?" with the exact quote.</p>
+        <span class="feature-tag">tsvector + trgm</span>
+      </div>
+      <div class="feature-card">
+        <h3>Auto-Ingest</h3>
+        <p>Memory builds automatically as you chat &mdash; no manual steps. Configurable padding window keeps recent messages raw until they're far enough back to safely ingest.</p>
+        <span class="feature-tag">Swipe-safe</span>
+      </div>
+      <div class="feature-card">
+        <h3>Per-Character Memory</h3>
+        <p>Each character remembers only the chats you select. Switch between persistent, isolated, and read-only modes per character.</p>
+        <span class="feature-tag">Chat picker</span>
+      </div>
+      <div class="feature-card">
+        <h3>Mind Map</h3>
+        <p>Interactive Cytoscape.js visualization of the character relationship graph, events, locations, and traits. See your story's structure at a glance.</p>
+        <span class="feature-tag">Visual</span>
+      </div>
+      <div class="feature-card">
+        <h3>LLM Call Monitor</h3>
+        <p>Debug panel showing every extraction and embedding request with provider, model, latency, and status. Spot rate limits and stalls instantly.</p>
+        <span class="feature-tag">Debug surface</span>
+      </div>
+    </div>
+
+    <!-- Supported providers -->
+    <div class="section-label">Supported Providers <span class="count">[any OpenAI-compatible]</span></div>
+
+    <p>ChronicleDB works with any LLM and embedding provider that speaks the OpenAI or Gemini API format. A cheap, fast model is all you need &mdash; extraction doesn't require frontier intelligence.</p>
+
+    <table class="config-table">
+      <thead>
+        <tr><th>Provider</th><th>Extraction</th><th>Embeddings</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Google Gemini</td><td>gemini-2.5-flash-lite</td><td>gemini-embedding-2-preview</td></tr>
+        <tr><td>Vertex AI (Express)</td><td>Any Gemini model</td><td>text-embedding-004 / 005</td></tr>
+        <tr><td>OpenAI</td><td>gpt-4o-mini</td><td>text-embedding-3-small</td></tr>
+        <tr><td>Ollama / LM Studio</td><td>Any local model</td><td>Any 768-dim model</td></tr>
+        <tr><td>OpenRouter / LiteLLM</td><td>Any routed model</td><td>Any compatible endpoint</td></tr>
+        <tr><td>Mistral / Voyage</td><td>&mdash;</td><td>mistral-embed / voyage-3</td></tr>
+      </tbody>
+    </table>
+
+    <p class="muted">Embedding dimension is fixed at 768 in the schema. Pick a model that natively outputs 768 dims, or one that supports the <code>dimensions</code> parameter (OpenAI 3-small/3-large and Vertex 004/005 do).</p>
+
+    <!-- Install guide -->
+    <div class="section-label" id="install">Installation Guide <span class="count">[5 steps]</span></div>
+
+    <p>The install script automates everything. It detects your platform, installs PostgreSQL + pgvector if needed, clones the repo, symlinks into SillyTavern, and creates the database. You'll be chatting with memory in under 5 minutes.</p>
+
+    <!-- Prerequisites -->
+    <h2>Prerequisites</h2>
+
+    <ul class="checklist">
+      <li class="done">macOS or Linux (Windows users: use WSL2)</li>
+      <li class="done">SillyTavern installed and working</li>
+      <li class="done">Node.js 18 or newer</li>
+      <li>A Gemini or OpenAI API key (free tier works)</li>
+    </ul>
+
+    <p class="muted">PostgreSQL and pgvector are installed automatically if missing. You don't need to set them up beforehand.</p>
+
+    <!-- Steps -->
+    <h2>Step by Step</h2>
+
+    <div class="steps">
+      <div class="step">
+        <h3>Run the installer</h3>
+        <p>One command. It will ask where your SillyTavern lives if it can't auto-detect it.</p>
+        <pre data-lang="bash"><code><span class="cmd">curl</span> -fsSL https://raw.githubusercontent.com/alani-fan-club/chronicledb/master/install.sh | <span class="cmd">bash</span></code></pre>
+        <p class="note">
+          The script is idempotent &mdash; safe to re-run if anything goes wrong. It installs PostgreSQL via Homebrew (macOS) or apt (Linux), enables pgvector and pg_trgm extensions, creates the <code>chronicledb</code> database, and symlinks the plugin into SillyTavern.
+        </p>
+      </div>
+
+      <div class="step">
+        <h3>Restart SillyTavern</h3>
+        <p>Stop and start SillyTavern so it picks up the new plugin. You should see this in the console:</p>
+        <pre data-lang="log"><code>[ChronicleDB] Initializing server plugin...
+[ChronicleDB] Mind map path: /path/to/chronicledb/src/ui
+[ChronicleDB] Server plugin ready.</code></pre>
+        <p class="note">If you don't see these lines, check that <code>enableServerPlugins: true</code> is set in your SillyTavern <code>config.yaml</code>. The installer does this automatically, but a config file merge during an ST update could revert it.</p>
+      </div>
+
+      <div class="step">
+        <h3>Open the settings panel</h3>
+        <p>In SillyTavern, scroll down in the Extensions sidebar and expand the <strong>ChronicleDB</strong> drawer. You'll see the connection status, database settings, and API configuration.</p>
+        <p>The database fields should be pre-filled with the defaults from the installer (<code>localhost:5432</code>, database <code>chronicledb</code>). Click <strong>Connect &amp; initialize</strong> to verify the connection.</p>
+        <p class="note">If you see a username mismatch warning ("Connected as X but configured Y"), Postgres trust auth is accepting any username. Either fix <code>pg_hba.conf</code> to require password auth, or update the username to match what Postgres logged you in as.</p>
+      </div>
+
+      <div class="step">
+        <h3>Configure your LLM</h3>
+        <p>Under <strong>Memory model</strong>, paste your API key and select a model. Under <strong>Embedding model</strong>, do the same (or leave the key blank to reuse the extraction key).</p>
+        <table class="config-table">
+          <thead><tr><th>Field</th><th>Recommended Value</th></tr></thead>
+          <tbody>
+            <tr><td>API Type</td><td>Gemini (free tier is fine)</td></tr>
+            <tr><td>API Key</td><td>Your Gemini or OpenAI key</td></tr>
+            <tr><td>Extraction Model</td><td><code>gemini-2.5-flash-lite</code></td></tr>
+            <tr><td>Embedding Model</td><td><code>gemini-embedding-2-preview</code></td></tr>
+            <tr><td>Embedding Dimension</td><td><code>768</code> (default, don't change)</td></tr>
+          </tbody>
+        </table>
+        <p class="note warn">Don't use expensive models for extraction. A $0.01/M-token model is plenty &mdash; the extraction prompt is structured and doesn't need frontier reasoning. Save your budget for the actual roleplay model.</p>
+      </div>
+
+      <div class="step">
+        <h3>Start chatting</h3>
+        <p>That's it. With <strong>Auto-build memory</strong> enabled (on by default), ChronicleDB starts extracting and storing memories as you chat. You'll see a toast notification on each new chat confirming memory is active.</p>
+        <p>Under <strong>Behavior</strong>, you can tune:</p>
+        <table class="config-table">
+          <thead><tr><th>Setting</th><th>Default</th><th>What it does</th></tr></thead>
+          <tbody>
+            <tr><td>Update every N replies</td><td>1</td><td>How often extraction fires. Increase to reduce API calls.</td></tr>
+            <tr><td>Memory budget (tokens)</td><td>3000</td><td>Max tokens injected into context. Higher = more memory, fewer tokens for the story.</td></tr>
+            <tr><td>Keep last N raw</td><td>5</td><td>Padding window. Recent messages stay in ST's native context and aren't ingested yet, so swiping is safe.</td></tr>
+            <tr><td>Refresh arcs every N</td><td>30</td><td>Incremental arc rebuild frequency. 0 disables auto-rebuild.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- What to remember -->
+    <div class="section-label">Memory Types <span class="count">[toggles]</span></div>
+
+    <p>You control what ChronicleDB remembers via toggles in the settings panel. All are enabled by default.</p>
+
+    <table class="config-table">
+      <thead><tr><th>Toggle</th><th>What it captures</th></tr></thead>
+      <tbody>
+        <tr><td>Relationships</td><td>Who knows who, how they feel about each other, sentiment + intensity</td></tr>
+        <tr><td>Events &amp; Timeline</td><td>What happened, when, who was involved, causal chains</td></tr>
+        <tr><td>Character Knowledge</td><td>What each character knows and doesn't &mdash; prevents info leakage</td></tr>
+        <tr><td>World State</td><td>Locations, items, ownership, world facts with validity windows</td></tr>
+      </tbody>
+    </table>
+
+    <!-- FAQ -->
+    <div class="section-label">Common Questions <span class="count">[faq]</span></div>
+
+    <div class="faq-item">
+      <div class="faq-q">Does this send my chats to an external API?</div>
+      <div class="faq-a">
+        The extraction and embedding models process your chat text. If you use Gemini or OpenAI, that text goes to their API. If you run Ollama or LM Studio locally, everything stays on your machine. The PostgreSQL database is always local. ChronicleDB never phones home &mdash; it's a SillyTavern plugin that talks only to the endpoints you configure.
+      </div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">How much does it cost?</div>
+      <div class="faq-a">
+        Gemini's free tier handles most usage. Flash Lite extraction costs ~$0.01 per 1M tokens. Gemini embeddings are free. If you use OpenAI, text-embedding-3-small is $0.02 per 1M tokens. A typical chat session costs less than a penny.
+      </div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Does it work on Windows?</div>
+      <div class="faq-a">
+        The installer targets macOS and Linux. On Windows, install WSL2 (Ubuntu), then run the install script inside WSL. SillyTavern itself runs on Windows, but the plugin's server side (PostgreSQL + pgvector) needs a Unix environment.
+      </div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">What happens when I swipe or regenerate?</div>
+      <div class="faq-a">
+        The padding window (default: 5 messages) keeps recent turns out of the graph entirely. If you swipe or edit within that window, nothing needs cleanup. For older messages that were already ingested, ChronicleDB detects the swipe and surgically deletes the old extraction before re-extracting the new content.
+      </div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">Can I use a cloud database instead of local PostgreSQL?</div>
+      <div class="faq-a">
+        Yes. Any PostgreSQL 14+ instance with pgvector works. Neon, Supabase, and Railway all support pgvector out of the box. Just update the host, port, database, user, and password fields in the settings panel. The installer's auto-setup is local-only, but the plugin doesn't care where the database lives.
+      </div>
+    </div>
+
+    <div class="faq-item">
+      <div class="faq-q">How do I import existing chats?</div>
+      <div class="faq-a">
+        Open the <strong>Character memory</strong> section in settings, select a character, and click <strong>Build memory from all</strong>. ChronicleDB reads every past chat file for that character and batch-processes them through the extraction pipeline. Depending on chat length and your API speed, this can take a few minutes.
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="site-footer">
+      <div class="footer-links">
+        <a href="https://github.com/alani-fan-club/chronicledb">GitHub</a>
+        <a href="https://alanifan.club/">Blog</a>
+        <a href="https://discord.gg/alanifanclub">Discord</a>
+        <a href="https://alanifan.club/projects">Projects</a>
+      </div>
+      <p class="footer-copy">CHRONICLEDB -- ALANI FAN CLUB // HUMAN RESEARCH COLLECTIVE</p>
+      <div class="footer-status"><span class="dot">&#9646;</span> STATUS: ONLINE -- MEMORY NOMINAL</div>
+    </footer>
+
+  </div>
+
+  <script>
+    // FAQ accordion
+    document.querySelectorAll('.faq-q').forEach(q => {
+      q.addEventListener('click', () => {
+        q.closest('.faq-item').classList.toggle('open');
+      });
+    });
+  </script>
+</body>
+</html>

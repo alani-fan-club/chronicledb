@@ -1,22 +1,12 @@
 #!/usr/bin/env node
 // One-shot backfill for memory_embeddings rows missing context_prefix.
 // Safe to re-run: only touches rows where context_prefix IS NULL.
-require("dotenv").config({ path: require("path").join(__dirname, "..", "eval", ".env") });
-const { Pool } = require("pg");
+const { loadScriptSettings, createPoolFromSettings } = require("./script-settings");
 const { generateSituatingBlurb } = require("./extractor");
 
-const settings = {
-  extractionApiKey: process.env.GEMINI_API_KEY,
-  geminiApiKey: process.env.GEMINI_API_KEY,
-  contextModel: process.env.GEMINI_CONTEXT_MODEL || "gemini-2.5-flash-lite",
-};
-
 async function main() {
-  const pool = new Pool({
-    host: "localhost",
-    database: "chronicledb",
-    user: process.env.PGUSER || "samantha",
-  });
+  const { settings } = loadScriptSettings();
+  const pool = createPoolFromSettings(settings);
 
   const chatFilter = process.argv[2] || "%Protagonist%";
   const { rows: targets } = await pool.query(

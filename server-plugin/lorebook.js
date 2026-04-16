@@ -5,29 +5,9 @@
 
 const { readFileSync, readdirSync } = require("fs");
 const { join, resolve, basename } = require("path");
-const { resolve: pathResolveAbs, sep: pathSep } = require("path");
 const db = require("./db");
+const { safeResolveUnder } = require("./path-safety");
 const { resolveStDataRoot } = require("./st-paths");
-
-// Path-traversal guard: verify that a user-supplied filename, when joined to
-// `baseDir`, stays inside `baseDir`. Rejects obvious traversal tokens upfront
-// and then confirms the resolved absolute path is a descendant of the
-// resolved absolute base. Throws on any violation; callers catch and return
-// 400 to the HTTP surface.
-function safeResolveUnder(baseDir, userPath) {
-  if (typeof userPath !== "string" || userPath.length === 0) {
-    throw new Error("filename required");
-  }
-  if (userPath.includes("..") || userPath.includes("\0") || userPath.includes("/") || userPath.includes("\\")) {
-    throw new Error(`unsafe filename: "${userPath}"`);
-  }
-  const absBase = pathResolveAbs(baseDir);
-  const absFinal = pathResolveAbs(absBase, userPath);
-  if (!absFinal.startsWith(absBase + pathSep) && absFinal !== absBase) {
-    throw new Error(`path traversal blocked: "${userPath}" resolved outside "${absBase}"`);
-  }
-  return absFinal;
-}
 
 /**
  * List available lorebooks from the ST worlds directory.

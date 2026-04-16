@@ -6,21 +6,23 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "vitest"
+    "test": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "pg": "^8.13.1",
-    "pgvector": "^0.2.0",
-    "openai": "^4.77.0",
     "cytoscape": "^3.30.4",
     "express": "^4.21.1",
+    "openai": "^4.77.0",
     "p-queue": "^8.0.1",
+    "pg": "^8.13.1",
+    "pgvector": "^0.2.0",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.2",
     "@types/pg": "^8.11.10",
+    "@vitest/coverage-v8": "^2.1.9",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"

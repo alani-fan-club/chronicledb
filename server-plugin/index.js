@@ -14,30 +14,20 @@ const {
 } = require("./extractor");
 const { retrieve, formatMemoryBlock } = require("./retriever");
 const { ingestLorebook, listLorebooks } = require("./lorebook");
+const { safeResolveUnder } = require("./path-safety");
+const { setWithBoundedEviction } = require("./bounded-map");
 const { resolveStDataRoot } = require("./st-paths");
-const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
-const { resolve: pathResolve, dirname: pathDirname } = require("path");
-const { resolve: pathResolveAbs, sep: pathSep } = require("path");
-
-// Path-traversal guard: verify that a user-supplied filename, when joined to
-// `baseDir`, stays inside `baseDir`. Rejects obvious traversal tokens upfront
-// and then confirms the resolved absolute path is a descendant of the
-// resolved absolute base. Throws on any violation; callers catch and return
-// 400 to the HTTP surface.
-function safeResolveUnder(baseDir, userPath) {
-  if (typeof userPath !== "string" || userPath.length === 0) {
-    throw new Error("filename required");
-  }
-  if (userPath.includes("..") || userPath.includes("\0") || userPath.includes("/") || userPath.includes("\\")) {
-    throw new Error(`unsafe filename: "${userPath}"`);
-  }
-  const absBase = pathResolveAbs(baseDir);
-  const absFinal = pathResolveAbs(absBase, userPath);
-  if (!absFinal.startsWith(absBase + pathSep) && absFinal !== absBase) {
-    throw new Error(`path traversal blocked: "${userPath}" resolved outside "${absBase}"`);
-  }
-  return absFinal;
-}
+const {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  realpathSync,
+  createReadStream,
+} = require("fs");
+const { resolve: pathResolve, dirname: pathDirname, join: pathJoin } = require("path");
 
 let settings = {};
 // Tracks live DB state so /status can report it without touching the pool.
@@ -91,6 +81,118 @@ function markDisconnected(err) {
   };
 }
 
+function readOptionalQueryString(query, key) {
+  const raw = query && typeof query[key] === "string"
+    ? query[key].trim()
+    : "";
+  return raw.length > 0 ? raw : null;
+}
+
+function readOptionalChatId(query) {
+  return readOptionalQueryString(query, "chat_id");
+}
+
+function readOptionalChatIds(query) {
+  const raw = readOptionalChatId(query);
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function readRequiredRequestValue(res, source, key) {
+  const value = source && source[key];
+  if (value) return value;
+  res.status(400).json({ error: `${key} required` });
+  return null;
+}
+
+function sendInternalError(res, err) {
+  res.status(500).json({ error: err.message });
+}
+
+function sendBadRequest(res, message) {
+  return res.status(400).json({ error: message });
+}
+
+function withInternalError(handler, options = {}) {
+  const { onError } = options;
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (err) {
+      if (typeof onError === "function") {
+        onError(err, req, res);
+      }
+      if (!res.headersSent) {
+        sendInternalError(res, err);
+      }
+    }
+  };
+}
+
+async function queryRows(sql, params = []) {
+  const { rows } = await db.getPool(settings).query(sql, params);
+  return rows;
+}
+
+function resolveStChatsDir() {
+  return pathResolve(resolveStDataRoot(settings), "chats");
+}
+
+function resolveStCharactersDir() {
+  return pathResolve(resolveStDataRoot(settings), "characters");
+}
+
+function findMatchingChatDirectoryName(chatsBase, characterName) {
+  const entries = readdirSync(chatsBase);
+  return entries.find((entry) => entry === characterName || entry.startsWith(characterName)) || null;
+}
+
+function stripJsonlSuffix(value) {
+  return (value || "").replace(/\.jsonl$/, "");
+}
+
+function readOptionalIntegerQuery(query, key, fallback, radix) {
+  const raw = query ? query[key] : undefined;
+  const parsed = typeof radix === "number" ? parseInt(raw, radix) : parseInt(raw);
+  return parsed || fallback;
+}
+
+function safeResolveUnderOrBadRequest(res, basePath, requestedPath) {
+  try {
+    return safeResolveUnder(basePath, requestedPath);
+  } catch (err) {
+    sendBadRequest(res, err.message);
+    return null;
+  }
+}
+
+async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
+  const pool = db.getPool(activeSettings);
+  const { rows: [verify] } = await pool.query(
+    `SELECT current_user AS u, current_database() AS d`,
+  );
+
+  const expectedUser = (activeSettings.pgUser || "").trim();
+  const expectedDb = (activeSettings.pgDatabase || "").trim();
+
+  if (expectedUser && verify.u !== expectedUser) {
+    throw new Error(
+      `Connected as "${verify.u}" but settings configured user "${expectedUser}". ` +
+      `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
+      `password auth, or update the user field to "${verify.u}" to match what Postgres ` +
+      `actually logged you in as.`,
+    );
+  }
+  if (expectedDb && verify.d !== expectedDb) {
+    throw new Error(
+      `Connected to database "${verify.d}" but settings configured "${expectedDb}". ` +
+      `Check the database name field.`,
+    );
+  }
+
+  return verify;
+}
+
 async function tryAutoConnect() {
   if (!settings.pgHost || !settings.pgDatabase) {
     connectionState = { connected: false, error: null, initializedAt: null };
@@ -107,26 +209,7 @@ async function tryAutoConnect() {
     // surface a hard error if either drifts. This catches the
     // "I had a wrong username for the database and the plugin didn't
     // catch it" failure mode reported by friends during install.
-    const pool = db.getPool(settings);
-    const { rows: [verify] } = await pool.query(
-      `SELECT current_user AS u, current_database() AS d`,
-    );
-    const expectedUser = (settings.pgUser || "").trim();
-    const expectedDb = (settings.pgDatabase || "").trim();
-    if (expectedUser && verify.u !== expectedUser) {
-      throw new Error(
-        `Database connected as "${verify.u}" but settings configured user "${expectedUser}". ` +
-        `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
-        `password auth, or update the user field to "${verify.u}" to match what Postgres ` +
-        `actually logged you in as.`,
-      );
-    }
-    if (expectedDb && verify.d !== expectedDb) {
-      throw new Error(
-        `Connected to database "${verify.d}" but settings configured "${expectedDb}". ` +
-        `Check the database name field.`,
-      );
-    }
+    const verify = await fetchAndVerifyConfiguredDbIdentity(settings);
     connectionState = {
       connected: true,
       error: null,
@@ -180,12 +263,10 @@ async function init(router) {
   }
 
   // ── Serve mind map UI ────────────────────────────────────────
-  const { resolve, dirname } = require("path");
-  const { realpathSync } = require("fs");
   const express = require("express");
   // Resolve through symlink to find the actual project root
   const pluginRealDir = realpathSync(__dirname);
-  const mapPath = resolve(pluginRealDir, "..", "src", "ui");
+  const mapPath = pathResolve(pluginRealDir, "..", "src", "ui");
   console.log("[ChronicleDB] Mind map path:", mapPath);
   router.use("/map", express.static(mapPath));
 
@@ -252,50 +333,30 @@ async function init(router) {
 
   // ── Schema init ──────────────────────────────────────────────
 
-  router.post("/init-db", async (_req, res) => {
-    try {
-      await db.initSchema(settings);
-      // Same trust-auth verification as tryAutoConnect — a user clicking
-      // "Connect & initialize" with a wrong username typo should see a
-      // clear error in the UI, not a green checkmark followed by silent
-      // query failures later.
-      const pool = db.getPool(settings);
-      const { rows: [verify] } = await pool.query(
-        `SELECT current_user AS u, current_database() AS d`,
-      );
-      const expectedUser = (settings.pgUser || "").trim();
-      const expectedDb = (settings.pgDatabase || "").trim();
-      if (expectedUser && verify.u !== expectedUser) {
-        throw new Error(
-          `Connected as "${verify.u}" but you configured user "${expectedUser}". ` +
-          `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
-          `password auth, or change the user field to "${verify.u}" to match what ` +
-          `Postgres logged you in as.`,
-        );
-      }
-      if (expectedDb && verify.d !== expectedDb) {
-        throw new Error(
-          `Connected to database "${verify.d}" but you configured "${expectedDb}". ` +
-          `Check the database name field.`,
-        );
-      }
-      connectionState = {
-        connected: true,
-        error: null,
-        initializedAt: new Date().toISOString(),
-      };
-      // Persist the fact that we've initialized so subsequent ST boots
-      // know to auto-reconnect. The UI also sets this flag, but doing it
-      // here too means standalone /init-db POSTs still work.
-      settings.initialized = true;
-      saveCachedSettings(settings);
-      res.json({ ok: true, user: verify.u, database: verify.d });
-    } catch (err) {
+  router.post("/init-db", withInternalError(async (_req, res) => {
+    await db.initSchema(settings);
+    // Same trust-auth verification as tryAutoConnect — a user clicking
+    // "Connect & initialize" with a wrong username typo should see a
+    // clear error in the UI, not a green checkmark followed by silent
+    // query failures later.
+    const verify = await fetchAndVerifyConfiguredDbIdentity(settings);
+    connectionState = {
+      connected: true,
+      error: null,
+      initializedAt: new Date().toISOString(),
+    };
+    // Persist the fact that we've initialized so subsequent ST boots
+    // know to auto-reconnect. The UI also sets this flag, but doing it
+    // here too means standalone /init-db POSTs still work.
+    settings.initialized = true;
+    saveCachedSettings(settings);
+    res.json({ ok: true, user: verify.u, database: verify.d });
+  }, {
+    onError: (err) => {
       connectionState = { connected: false, error: err.message, initializedAt: null };
       console.error("[ChronicleDB] DB init error:", err);
-      res.status(500).json({ error: err.message });
-    }
-  });
+    },
+  }));
 
   // ── Extraction endpoint ──────────────────────────────────────
   // Called by UI ext after GENERATION_ENDED (async, non-blocking)
@@ -305,24 +366,21 @@ async function init(router) {
   // /extract calls for the same chat can't double-rebuild.
   // Resets on plugin restart, which is fine — the worst case is the very
   // first /extract after restart waits a few extra messages to fire.
+  const ARC_REBUILD_CACHE_MAX = 200;
   const arcRebuildLastCount = new Map(); // chatId -> int
   const arcRebuildInFlight = new Set();  // chatId
 
   // Bounded eviction. Both maps accumulate one entry per chat_id forever,
   // so a long-running ST process with many chats grows unboundedly. Cap at
-  // 200 entries and evict the oldest (Map preserves insertion order, so
+  // ARC_REBUILD_CACHE_MAX entries and evict the oldest (Map preserves insertion order, so
   // `keys().next().value` is the least-recently-inserted). Use this wrapper
   // instead of `arcRebuildLastCount.set(chatId, n)` directly.
   function setArcRebuildCount(chatId, n) {
-    const MAX = 200;
-    if (arcRebuildLastCount.size >= MAX && !arcRebuildLastCount.has(chatId)) {
-      const first = arcRebuildLastCount.keys().next().value;
-      arcRebuildLastCount.delete(first);
+    setWithBoundedEviction(arcRebuildLastCount, chatId, n, ARC_REBUILD_CACHE_MAX, {
       // Set.delete(value) is a no-op if the value isn't present, so this is
       // safe even when the evicted chat has no in-flight rebuild.
-      arcRebuildInFlight.delete(first);
-    }
-    arcRebuildLastCount.set(chatId, n);
+      onEvict: (evictedChatId) => arcRebuildInFlight.delete(evictedChatId),
+    });
   }
 
   // Per-(chatId, messageIndex) extract mutex. When two /extract calls
@@ -337,7 +395,7 @@ async function init(router) {
   // hook always corresponds to the user's currently-active swipe.
   const extractMutex = new Map(); // key: `${chatId}::${messageIndex}` -> Promise
 
-  router.post("/extract", async (req, res) => {
+  router.post("/extract", withInternalError(async (req, res) => {
     const { characterName, userName, messages, chatId, messageIndex } = req.body;
     const mutexKey = chatId && typeof messageIndex === "number"
       ? `${chatId}::${messageIndex}`
@@ -464,17 +522,6 @@ async function init(router) {
           console.warn(`[ChronicleDB] Arc-rebuild counter check failed: ${err.message}`);
         }
       }
-    } catch (err) {
-      console.error("[ChronicleDB] Extraction error:", err);
-      // Connectivity failures (DB down, pool can't connect) flip the
-      // plugin's connectionState so the UI's /status poll sees the outage
-      // immediately instead of waiting for an idle-client error to bubble
-      // up through pool.on('error').
-      if (isDbConnectivityError(err)) markDisconnected(err);
-      // res.json may have already been sent if we got past step 3 — guard.
-      if (!res.headersSent) {
-        res.status(500).json({ error: err.message });
-      }
     } finally {
       // Release the per-message mutex so the next /extract for the same
       // (chatId, messageIndex) can proceed. Done in `finally` so failures,
@@ -495,7 +542,16 @@ async function init(router) {
         } catch (_) { /* never block the request on cleanup */ }
       }
     }
-  });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Extraction error:", err);
+      // Connectivity failures (DB down, pool can't connect) flip the
+      // plugin's connectionState so the UI's /status poll sees the outage
+      // immediately instead of waiting for an idle-client error to bubble
+      // up through pool.on('error').
+      if (isDbConnectivityError(err)) markDisconnected(err);
+    },
+  }));
 
   // ── Swipe cleanup endpoint ───────────────────────────────────
   // Called by the UI extension when the user changes the active swipe on an
@@ -518,238 +574,217 @@ async function init(router) {
   //    deleting events — same pattern as the manual reingest scripts.
   //  - The next /extract for the new active swipe will rewrite events with
   //    new content-addressed ids, so re-extraction is the rebuild step.
-  router.post("/clear-message-extractions", async (req, res) => {
-    try {
-      const { chatId, messageIndex } = req.body;
-      if (!chatId || typeof messageIndex !== "number") {
-        return res.status(400).json({ error: "chatId and messageIndex required" });
-      }
-      const pool = db.getPool(settings);
-      // Order matters: participated_in references events.id without ON
-      // DELETE CASCADE, so we have to clear those rows before deleting the
-      // events themselves (same pattern the manual reingest scripts use).
-      await pool.query(
-        `DELETE FROM participated_in
-         WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
-        [chatId, messageIndex],
-      );
-      const eventsRes = await pool.query(
-        `DELETE FROM events WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-        [chatId, messageIndex],
-      );
-      const memRes = await pool.query(
-        `DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-        [chatId, messageIndex],
-      );
-      const quoteRes = await pool.query(
-        `DELETE FROM dialogue_quotes WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-        [chatId, messageIndex],
-      );
-      const snapRes = await pool.query(
-        `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
-        [chatId, messageIndex],
-      );
-      // Trait cleanup: traits now carry source_message_index (added in the
-      // schema migration that introduced this column). Rows pre-dating the
-      // column have NULL and are intentionally skipped — we don't know
-      // which message they came from. Future swipes on the same message
-      // clean up cleanly because new traits are tagged at write time.
-      const traitRes = await pool.query(
-        `DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2 RETURNING id`,
-        [chatId, messageIndex],
-      );
-      res.json({
-        ok: true,
-        deleted: {
-          events: eventsRes.rowCount,
-          memory_embeddings: memRes.rowCount,
-          dialogue_quotes: quoteRes.rowCount,
-          context_snapshots: snapRes.rowCount,
-          traits: traitRes.rowCount,
-        },
-      });
-    } catch (err) {
-      console.error("[ChronicleDB] /clear-message-extractions error:", err);
-      res.status(500).json({ error: err.message });
+  router.post("/clear-message-extractions", withInternalError(async (req, res) => {
+    const { chatId, messageIndex } = req.body;
+    if (!chatId || typeof messageIndex !== "number") {
+      return sendBadRequest(res, "chatId and messageIndex required");
     }
-  });
+    const pool = db.getPool(settings);
+    // Order matters: participated_in references events.id without ON
+    // DELETE CASCADE, so we have to clear those rows before deleting the
+    // events themselves (same pattern the manual reingest scripts use).
+    await pool.query(
+      `DELETE FROM participated_in
+       WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
+      [chatId, messageIndex],
+    );
+    const eventsRes = await pool.query(
+      `DELETE FROM events WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+      [chatId, messageIndex],
+    );
+    const memRes = await pool.query(
+      `DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+      [chatId, messageIndex],
+    );
+    const quoteRes = await pool.query(
+      `DELETE FROM dialogue_quotes WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+      [chatId, messageIndex],
+    );
+    const snapRes = await pool.query(
+      `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+      [chatId, messageIndex],
+    );
+    // Trait cleanup: traits now carry source_message_index (added in the
+    // schema migration that introduced this column). Rows pre-dating the
+    // column have NULL and are intentionally skipped — we don't know
+    // which message they came from. Future swipes on the same message
+    // clean up cleanly because new traits are tagged at write time.
+    const traitRes = await pool.query(
+      `DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2 RETURNING id`,
+      [chatId, messageIndex],
+    );
+    res.json({
+      ok: true,
+      deleted: {
+        events: eventsRes.rowCount,
+        memory_embeddings: memRes.rowCount,
+        dialogue_quotes: quoteRes.rowCount,
+        context_snapshots: snapRes.rowCount,
+        traits: traitRes.rowCount,
+      },
+    });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] /clear-message-extractions error:", err);
+    },
+  }));
 
   // ── Retrieval endpoint ───────────────────────────────────────
   // Called by UI ext before GENERATION_STARTED
 
-  router.post("/retrieve", async (req, res) => {
-    try {
-      const {
-        chatId,
-        characterName,
-        activeCharacters,
-        recentText,
-        sessionId,
-        maxTokens,
-        budgetProfile,
-        budgetOverrides,
-        pov,
-      } = req.body;
+  router.post("/retrieve", withInternalError(async (req, res) => {
+    const {
+      chatId,
+      characterName,
+      activeCharacters,
+      recentText,
+      sessionId,
+      maxTokens,
+      budgetProfile,
+      budgetOverrides,
+      pov,
+    } = req.body;
 
-      // Load per-character config to know which chats to remember
-      const charConfig = characterName
-        ? await db.getCharacterMemoryConfig(settings, characterName)
-        : { sessionMode: "persistent", selectedChats: [] };
+    // Load per-character config to know which chats to remember
+    const charConfig = characterName
+      ? await db.getCharacterMemoryConfig(settings, characterName)
+      : { sessionMode: "persistent", selectedChats: [] };
 
-      // Honor the chat picker. If the user hasn't picked any chats, fall back
-      // to the current chatId so retrieval is at least scoped to this chat
-      // (avoids cross-chat pollution between e.g. ChatB and Protagonist).
-      const configuredChats = Array.isArray(charConfig.selectedChats) ? charConfig.selectedChats : [];
-      const selectedChats = configuredChats.length > 0
-        ? configuredChats
-        : (chatId ? [chatId] : []);
+    // Honor the chat picker. If the user hasn't picked any chats, fall back
+    // to the current chatId so retrieval is at least scoped to this chat
+    // (avoids cross-chat pollution between e.g. ChatB and Protagonist).
+    const configuredChats = Array.isArray(charConfig.selectedChats) ? charConfig.selectedChats : [];
+    const selectedChats = configuredChats.length > 0
+      ? configuredChats
+      : (chatId ? [chatId] : []);
 
-      // AGARS per-character epistemic mask: optional `pov` payload on
-      // the /retrieve request threads through to retriever.js as a
-      // post-filter over the omniscient result. When the caller omits
-      // `pov`, retrieve() behaves bit-for-bit as before.
-      //
-      // Shape: `{ characterName: string, upToMessageIndex?: number }`.
-      // Defensive normalization: accept either a string characterName
-      // or nothing; an empty string is treated as "no POV" so the
-      // downstream call can no-op without a special case.
-      const povArg = (pov && typeof pov === "object" && typeof pov.characterName === "string" && pov.characterName.trim().length > 0)
-        ? {
-            characterName: pov.characterName.trim(),
-            upToMessageIndex: typeof pov.upToMessageIndex === "number" ? pov.upToMessageIndex : undefined,
-          }
-        : undefined;
+    // AGARS per-character epistemic mask: optional `pov` payload on
+    // the /retrieve request threads through to retriever.js as a
+    // post-filter over the omniscient result. When the caller omits
+    // `pov`, retrieve() behaves bit-for-bit as before.
+    //
+    // Shape: `{ characterName: string, upToMessageIndex?: number }`.
+    // Defensive normalization: accept either a string characterName
+    // or nothing; an empty string is treated as "no POV" so the
+    // downstream call can no-op without a special case.
+    const povArg = (pov && typeof pov === "object" && typeof pov.characterName === "string" && pov.characterName.trim().length > 0)
+      ? {
+          characterName: pov.characterName.trim(),
+          upToMessageIndex: typeof pov.upToMessageIndex === "number" ? pov.upToMessageIndex : undefined,
+        }
+      : undefined;
 
-      const result = await retrieve(settings, {
-        chatId,
-        activeCharacters: activeCharacters || [],
-        recentText: recentText || "",
-        sessionMode: charConfig.sessionMode || "persistent",
-        sessionId,
-        selectedChats, // scoped chat IDs (defaults to [chatId] when no preference set)
-        budgetProfile,
-        budgetOverrides,
-        pov: povArg,
-      });
+    const result = await retrieve(settings, {
+      chatId,
+      activeCharacters: activeCharacters || [],
+      recentText: recentText || "",
+      sessionMode: charConfig.sessionMode || "persistent",
+      sessionId,
+      selectedChats, // scoped chat IDs (defaults to [chatId] when no preference set)
+      budgetProfile,
+      budgetOverrides,
+      pov: povArg,
+    });
 
-      // Precedence for the render ceiling:
-      //   1. explicit req.body.maxTokens (legacy one-off override)
-      //   2. result.budgets.maxTokens (from the resolved profile, which
-      //      already honors settings.maxInjectionTokens and explicit
-      //      per-field budgetOverrides)
-      //   3. 1500 fallback (unchanged)
-      // retriever.js::formatMemoryBlock already prefers result.budgets
-      // when no maxTokens is passed, so we only pass a value when the
-      // caller explicitly asked for one.
-      const memoryBlock = typeof maxTokens === "number"
-        ? formatMemoryBlock(result, maxTokens)
-        : formatMemoryBlock(result);
-      res.json({ result, memoryBlock });
-    } catch (err) {
+    // Precedence for the render ceiling:
+    //   1. explicit req.body.maxTokens (legacy one-off override)
+    //   2. result.budgets.maxTokens (from the resolved profile, which
+    //      already honors settings.maxInjectionTokens and explicit
+    //      per-field budgetOverrides)
+    //   3. 1500 fallback (unchanged)
+    // retriever.js::formatMemoryBlock already prefers result.budgets
+    // when no maxTokens is passed, so we only pass a value when the
+    // caller explicitly asked for one.
+    const memoryBlock = typeof maxTokens === "number"
+      ? formatMemoryBlock(result, maxTokens)
+      : formatMemoryBlock(result);
+    res.json({ result, memoryBlock });
+  }, {
+    onError: (err) => {
       console.error("[ChronicleDB] Retrieval error:", err);
       if (isDbConnectivityError(err)) markDisconnected(err);
-      res.status(500).json({ error: err.message });
-    }
-  });
+    },
+  }));
 
   // ── Per-character memory config ────────────────────────────────
   // Tied to character card: stores which chats this character remembers
 
-  router.get("/character-config/:characterName", async (req, res) => {
-    try {
-      const config = await db.getCharacterMemoryConfig(settings, req.params.characterName);
-      res.json(config);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character-config/:characterName", withInternalError(async (req, res) => {
+    const config = await db.getCharacterMemoryConfig(settings, req.params.characterName);
+    res.json(config);
+  }));
 
-  router.post("/character-config/:characterName", async (req, res) => {
-    try {
-      await db.saveCharacterMemoryConfig(settings, {
-        characterName: req.params.characterName,
-        sessionMode: req.body.sessionMode,
-        selectedChats: req.body.selectedChats,
-      });
-      res.json({ ok: true });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.post("/character-config/:characterName", withInternalError(async (req, res) => {
+    await db.saveCharacterMemoryConfig(settings, {
+      characterName: req.params.characterName,
+      sessionMode: req.body.sessionMode,
+      selectedChats: req.body.selectedChats,
+    });
+    res.json({ ok: true });
+  }));
 
   // ── List chats for a character (reads ST data dir) ───────────
 
-  router.get("/chats/:characterName", async (req, res) => {
-    try {
-      const { readdirSync, statSync } = require("fs");
-      const { join, resolve } = require("path");
+  router.get("/chats/:characterName", withInternalError(async (req, res) => {
+    const chatsBase = resolveStChatsDir();
+    const charName = req.params.characterName;
+    const matchingDir = findMatchingChatDirectoryName(chatsBase, charName);
 
-      const dataRoot = resolveStDataRoot(settings);
-      const chatsBase = resolve(dataRoot, "chats");
-      const charName = req.params.characterName;
-      const entries = readdirSync(chatsBase);
-      const matchingDir = entries.find((e) => e === charName || e.startsWith(charName));
+    if (!matchingDir) return res.json([]);
 
-      if (!matchingDir) return res.json([]);
+    const dirPath = pathJoin(chatsBase, matchingDir);
+    if (!statSync(dirPath).isDirectory()) return res.json([]);
 
-      const dirPath = join(chatsBase, matchingDir);
-      if (!statSync(dirPath).isDirectory()) return res.json([]);
-
-      const chatFiles = readdirSync(dirPath)
-        .filter((f) => f.endsWith(".jsonl"))
-        .sort()
-        .map((f) => {
-          const stat = statSync(join(dirPath, f));
-          const dateMatch = f.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
-          // Count actual message lines (subtract 1 for metadata header)
-          let messageCount;
-          try {
-            const content = require("fs").readFileSync(join(dirPath, f), "utf-8");
-            messageCount = content.split("\n").filter((l) => l.trim()).length - 1;
-          } catch {
-            messageCount = Math.max(1, Math.floor(stat.size / 2000));
-          }
-          return {
-            filename: f,
-            chatId: f.replace(".jsonl", ""),
-            date: dateMatch ? dateMatch[1] : "",
-            size: stat.size,
-            messageEstimate: Math.max(0, messageCount),
-          };
-        });
-
-      // Enrich with ingestion status
-      try {
-        const p = db.getPool(settings);
-        const { rows: statuses } = await p.query(
-          `SELECT chat_file, status, batches_done, ingested_at FROM ingestion_status WHERE character_name = $1`,
-          [charName],
-        );
-        const statusMap = new Map(statuses.map((s) => [s.chat_file, s]));
-        for (const chat of chatFiles) {
-          const s = statusMap.get(chat.filename);
-          if (s) {
-            chat.ingested = s.status === "done";
-            chat.ingestStatus = s.status;
-            chat.ingestedAt = s.ingested_at;
-            chat.batchesDone = s.batches_done;
-          }
+    const chatFiles = readdirSync(dirPath)
+      .filter((f) => f.endsWith(".jsonl"))
+      .sort()
+      .map((f) => {
+        const stat = statSync(pathJoin(dirPath, f));
+        const dateMatch = f.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
+        // Count actual message lines (subtract 1 for metadata header)
+        let messageCount;
+        try {
+          const content = readFileSync(pathJoin(dirPath, f), "utf-8");
+          messageCount = content.split("\n").filter((l) => l.trim()).length - 1;
+        } catch {
+          messageCount = Math.max(1, Math.floor(stat.size / 2000));
         }
-      } catch { /* status table might not exist yet */ }
+        return {
+          filename: f,
+          chatId: stripJsonlSuffix(f),
+          date: dateMatch ? dateMatch[1] : "",
+          size: stat.size,
+          messageEstimate: Math.max(0, messageCount),
+        };
+      });
 
-      res.json(chatFiles);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+    // Enrich with ingestion status
+    try {
+      const statuses = await queryRows(
+        `SELECT chat_file, status, batches_done, ingested_at FROM ingestion_status WHERE character_name = $1`,
+        [charName],
+      );
+      const statusMap = new Map(statuses.map((s) => [s.chat_file, s]));
+      for (const chat of chatFiles) {
+        const s = statusMap.get(chat.filename);
+        if (s) {
+          chat.ingested = s.status === "done";
+          chat.ingestStatus = s.status;
+          chat.ingestedAt = s.ingested_at;
+          chat.batchesDone = s.batches_done;
+        }
+      }
+    } catch { /* status table might not exist yet */ }
+
+    res.json(chatFiles);
+  }));
 
   // ── Chat ingestion (backfill a specific chat file) ───────────
 
-  router.post("/ingest-chat", async (req, res) => {
-    try {
+  router.post("/ingest-chat", withInternalError(async (req, res) => {
       const { characterName, filename } = req.body;
       if (!characterName || !filename) {
-        return res.status(400).json({ error: "characterName and filename required" });
+        return sendBadRequest(res, "characterName and filename required");
       }
       // Reject traversal-y characterName up front. The directory-picking
       // logic below uses a fuzzy `startsWith` match on `characterName`, so
@@ -761,19 +796,13 @@ async function init(router) {
           || characterName.includes("\0")
           || characterName.includes("/")
           || characterName.includes("\\")) {
-        return res.status(400).json({ error: `unsafe characterName: "${characterName}"` });
+        return sendBadRequest(res, `unsafe characterName: "${characterName}"`);
       }
 
-      const { readFileSync } = require("fs");
-      const { resolve } = require("path");
-
-      const dataRoot = resolveStDataRoot(settings);
-      const chatsBase = resolve(dataRoot, "chats");
+      const chatsBase = resolveStChatsDir();
 
       // Find matching directory
-      const { readdirSync } = require("fs");
-      const entries = readdirSync(chatsBase);
-      const matchingDir = entries.find((e) => e === characterName || e.startsWith(characterName));
+      const matchingDir = findMatchingChatDirectoryName(chatsBase, characterName);
       if (!matchingDir) return res.status(404).json({ error: "Character chat dir not found" });
 
       // Re-verify the selected directory actually lives under chatsBase
@@ -781,23 +810,19 @@ async function init(router) {
       // defense-in-depth against a compromised ST data dir or a follower
       // symlink). Then resolve the chat JSONL filename safely under that
       // directory so `filename` can't escape either.
-      let matchedDir;
-      let filePath;
-      try {
-        matchedDir = safeResolveUnder(chatsBase, matchingDir);
-        filePath = safeResolveUnder(matchedDir, filename);
-      } catch (e) {
-        return res.status(400).json({ error: e.message });
-      }
+      const matchedDir = safeResolveUnderOrBadRequest(res, chatsBase, matchingDir);
+      if (!matchedDir) return;
+      const filePath = safeResolveUnderOrBadRequest(res, matchedDir, filename);
+      if (!filePath) return;
       const raw = readFileSync(filePath, "utf-8");
       const lines = raw.split("\n").filter((l) => l.trim());
-      if (lines.length === 0) return res.status(400).json({ error: "Empty chat file" });
+      if (lines.length === 0) return sendBadRequest(res, "Empty chat file");
 
       // Parse metadata from first line
       const metadata = JSON.parse(lines[0]);
       const charName = metadata.character_name || characterName;
       const userName = metadata.user_name || "User";
-      const chatId = filename.replace(".jsonl", "");
+      const chatId = stripJsonlSuffix(filename);
 
       // Parse messages
       const messages = [];
@@ -913,29 +938,25 @@ async function init(router) {
         batchesProcessed: extracted,
         batchesTotal: totalBatches,
       });
-    } catch (err) {
+  }, {
+    onError: (err) => {
       console.error("[ChronicleDB] Ingest chat error:", err);
-      res.status(500).json({ error: err.message });
-    }
-  });
+    },
+  }));
 
   // ── Lorebook ingestion ───────────────────────────────────────
 
-  router.get("/lorebooks", async (_req, res) => {
-    try {
-      const books = listLorebooks(settings);
-      res.json(books);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/lorebooks", withInternalError(async (_req, res) => {
+    const books = listLorebooks(settings);
+    res.json(books);
+  }));
 
-  router.post("/lorebooks/ingest", async (req, res) => {
-    try {
-      const { filename } = req.body;
-      const result = await ingestLorebook(settings, filename, embed);
-      res.json(result);
-    } catch (err) {
+  router.post("/lorebooks/ingest", withInternalError(async (req, res) => {
+    const { filename } = req.body;
+    const result = await ingestLorebook(settings, filename, embed);
+    res.json(result);
+  }, {
+    onError: (err, _req, res) => {
       // ingestLorebook() throws validation errors from the path-traversal
       // guard with recognizable prefixes. Map those to 400; anything else
       // is a real server failure and returns 500.
@@ -943,198 +964,149 @@ async function init(router) {
       if (msg.startsWith("unsafe filename:")
           || msg.startsWith("path traversal blocked:")
           || msg === "filename required") {
-        return res.status(400).json({ error: msg });
+        sendBadRequest(res, msg);
+        return;
       }
       console.error("[ChronicleDB] Lorebook ingest error:", err);
-      res.status(500).json({ error: err.message });
-    }
-  });
+    },
+  }));
 
   // ── All-chats list for the mind map filter dropdown ─────────
 
-  router.get("/chats", async (req, res) => {
-    try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query(
-        `SELECT DISTINCT chat_file AS chat_id, character_name, ingested_at
-         FROM ingestion_status
-         WHERE status = 'done'
-         ORDER BY ingested_at DESC NULLS LAST, chat_file`,
-      );
-      res.json(rows.map((r) => ({
-        chatId: (r.chat_id || "").replace(/\.jsonl$/, ""),
-        character: r.character_name,
-        label: `${r.character_name} — ${(r.chat_id || "").replace(/\.jsonl$/, "")}`,
-      })));
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/chats", withInternalError(async (req, res) => {
+    const rows = await queryRows(
+      `SELECT DISTINCT chat_file AS chat_id, character_name, ingested_at
+       FROM ingestion_status
+       WHERE status = 'done'
+       ORDER BY ingested_at DESC NULLS LAST, chat_file`,
+    );
+    res.json(rows.map((r) => ({
+      chatId: stripJsonlSuffix(r.chat_id || ""),
+      character: r.character_name,
+      label: `${r.character_name} — ${stripJsonlSuffix(r.chat_id || "")}`,
+    })));
+  }));
 
   // ── Graph data for mind map ──────────────────────────────────
 
-  router.get("/graph", async (req, res) => {
-    try {
-      const scope = req.query.scope || "global";
-      const depth = parseInt(req.query.depth) || 3;
-      // Accept chat_id as single value or comma-separated list. When set,
-      // every edge query filters to the given chat(s); characters and
-      // locations reached by those edges still render as nodes.
-      const chatIds = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id.split(",").map((s) => s.trim()).filter(Boolean)
-        : null;
+  router.get("/graph", withInternalError(async (req, res) => {
+    const scope = req.query.scope || "global";
+    const depth = readOptionalIntegerQuery(req.query, "depth", 3);
+    // Accept chat_id as single value or comma-separated list. When set,
+    // every edge query filters to the given chat(s); characters and
+    // locations reached by those edges still render as nodes.
+    const chatIds = readOptionalChatIds(req.query);
 
-      // Hard-reject global scope with no chat filter. Without this the user
-      // gets an empty payload from the db-level guard and has no idea why.
-      // The db.getGraphData guard stays in place as defense-in-depth.
-      if (scope === "global" && (!chatIds || chatIds.length === 0)) {
-        return res.status(400).json({
-          error: "scope=global requires a chat_id query parameter to avoid unbounded payloads. Pass ?chat_id=... or use scope=character.",
-        });
-      }
-
-      let data;
-
-      if (scope === "character" && req.query.character) {
-        data = await db.traverseFromCharacter(settings, req.query.character, depth, chatIds);
-      } else {
-        data = await db.getGraphData(settings, { scope, character: req.query.character, chatIds });
-      }
-      res.json(data);
-    } catch (err) {
-      console.error("[ChronicleDB] Graph query error:", err);
-      res.status(500).json({ error: err.message });
+    // Hard-reject global scope with no chat filter. Without this the user
+    // gets an empty payload from the db-level guard and has no idea why.
+    // The db.getGraphData guard stays in place as defense-in-depth.
+    if (scope === "global" && (!chatIds || chatIds.length === 0)) {
+      return res.status(400).json({
+        error: "scope=global requires a chat_id query parameter to avoid unbounded payloads. Pass ?chat_id=... or use scope=character.",
+      });
     }
-  });
+
+    let data;
+
+    if (scope === "character" && req.query.character) {
+      data = await db.traverseFromCharacter(settings, req.query.character, depth, chatIds);
+    } else {
+      data = await db.getGraphData(settings, { scope, character: req.query.character, chatIds });
+    }
+    res.json(data);
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Graph query error:", err);
+    },
+  }));
 
   // ── Characters list (for mind map dropdown) ──────────────────
 
-  router.get("/characters", async (req, res) => {
-    try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query(`SELECT name FROM characters ORDER BY name`);
-      res.json(rows.map((r) => r.name));
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/characters", withInternalError(async (req, res) => {
+    const rows = await queryRows(`SELECT name FROM characters ORDER BY name`);
+    res.json(rows.map((r) => r.name));
+  }));
 
-  router.get("/character/:name/traits", async (req, res) => {
-    try {
-      const p = db.getPool(settings);
-      const charId = db.slugify(req.params.name);
-      // Accept chat_id as a filter so the standalone mindmap detail panel
-      // can scope character traits to the currently-selected chat filter.
-      // Unscoped (no chat_id) still returns all traits for the character —
-      // the "show everything about X" fallback behavior the page defaults to.
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
-      // User-visible trait read: filter out merged variant rows so the
-      // same trait never surfaces twice. Path 1's canonical-row dedup
-      // pipeline keeps merged rows in place for provenance, but they
-      // must never reach the UI.
-      const sql = chatId
-        ? `SELECT category, content, source_chat FROM traits
-           WHERE character_id = $1 AND source_chat = $2 AND canonical_id IS NULL
-           ORDER BY category, content`
-        : `SELECT category, content, source_chat FROM traits
-           WHERE character_id = $1 AND canonical_id IS NULL
-           ORDER BY category, content`;
-      const params = chatId ? [charId, chatId] : [charId];
-      const { rows } = await p.query(sql, params);
-      res.json(rows);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character/:name/traits", withInternalError(async (req, res) => {
+    const charId = db.slugify(req.params.name);
+    // Accept chat_id as a filter so the standalone mindmap detail panel
+    // can scope character traits to the currently-selected chat filter.
+    // Unscoped (no chat_id) still returns all traits for the character —
+    // the "show everything about X" fallback behavior the page defaults to.
+    const chatId = readOptionalChatId(req.query);
+    // User-visible trait read: filter out merged variant rows so the
+    // same trait never surfaces twice. Path 1's canonical-row dedup
+    // pipeline keeps merged rows in place for provenance, but they
+    // must never reach the UI.
+    const sql = chatId
+      ? `SELECT category, content, source_chat FROM traits
+         WHERE character_id = $1 AND source_chat = $2 AND canonical_id IS NULL
+         ORDER BY category, content`
+      : `SELECT category, content, source_chat FROM traits
+         WHERE character_id = $1 AND canonical_id IS NULL
+         ORDER BY category, content`;
+    const params = chatId ? [charId, chatId] : [charId];
+    const rows = await queryRows(sql, params);
+    res.json(rows);
+  }));
 
   // ── Character memory panel ───────────────────────────────────
   // Feeds the per-character "Memory Management" section in the ST
   // character card sidebar (separate from the global settings panel).
 
-  router.get("/character-stats", async (req, res) => {
-    try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
-      const stats = await db.getCharacterPanelStats(settings, name, chatId);
-      res.json(stats);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character-stats", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const chatId = readOptionalChatId(req.query);
+    const stats = await db.getCharacterPanelStats(settings, name, chatId);
+    res.json(stats);
+  }));
 
-  router.get("/character-recent-events", async (req, res) => {
-    try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
-      const limit = parseInt(req.query.limit, 10) || 5;
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
-      const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
-      res.json(events);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character-recent-events", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const limit = readOptionalIntegerQuery(req.query, "limit", 5, 10);
+    const chatId = readOptionalChatId(req.query);
+    const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
+    res.json(events);
+  }));
 
-  router.get("/character-relationships", async (req, res) => {
-    try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
-      const chatId = typeof req.query.chat_id === "string" && req.query.chat_id.trim().length > 0
-        ? req.query.chat_id
-        : null;
-      const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
-      res.json(rels);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character-relationships", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const chatId = readOptionalChatId(req.query);
+    const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
+    res.json(rels);
+  }));
 
-  router.get("/character-memory-config", async (req, res) => {
-    try {
-      const name = req.query.name;
-      if (!name) return res.status(400).json({ error: "name required" });
-      const config = await db.getCharacterMemoryConfig(settings, name);
-      res.json({ sessionMode: config.sessionMode || "persistent" });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character-memory-config", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const config = await db.getCharacterMemoryConfig(settings, name);
+    res.json({ sessionMode: config.sessionMode || "persistent" });
+  }));
 
-  router.post("/character-memory-config", async (req, res) => {
-    try {
-      const { name, sessionMode } = req.body || {};
-      if (!name) return res.status(400).json({ error: "name required" });
-      // Preserve the user's chat picker selection — saveCharacterMemoryConfig
-      // rewrites the whole row, so we have to read-modify-write.
-      const existing = await db.getCharacterMemoryConfig(settings, name);
-      await db.saveCharacterMemoryConfig(settings, {
-        characterName: name,
-        sessionMode: sessionMode || existing.sessionMode || "persistent",
-        selectedChats: existing.selectedChats || [],
-      });
-      res.json({ ok: true });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.post("/character-memory-config", withInternalError(async (req, res) => {
+    const { sessionMode } = req.body || {};
+    const name = readRequiredRequestValue(res, req.body, "name");
+    if (!name) return;
+    // Preserve the user's chat picker selection — saveCharacterMemoryConfig
+    // rewrites the whole row, so we have to read-modify-write.
+    const existing = await db.getCharacterMemoryConfig(settings, name);
+    await db.saveCharacterMemoryConfig(settings, {
+      characterName: name,
+      sessionMode: sessionMode || existing.sessionMode || "persistent",
+      selectedChats: existing.selectedChats || [],
+    });
+    res.json({ ok: true });
+  }));
 
-  router.post("/character-clear-memories", async (req, res) => {
-    try {
-      const { name } = req.body || {};
-      if (!name) return res.status(400).json({ error: "name required" });
-      const cleared = await db.clearCharacterMemories(settings, name);
-      res.json({ ok: true, cleared });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.post("/character-clear-memories", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.body, "name");
+    if (!name) return;
+    const cleared = await db.clearCharacterMemories(settings, name);
+    res.json({ ok: true, cleared });
+  }));
 
   // ── Character summary-embedding rollup ───────────────────────
   // Admin endpoint: iterate every character and rebuild its
@@ -1144,94 +1116,68 @@ async function init(router) {
   // (Path 1). Per-row updates are no-ops until any trait embeddings
   // exist, at which point the aggregate starts populating.
 
-  router.post("/recompute-character-summaries", async (req, res) => {
-    try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query("SELECT id FROM characters");
-      let updated = 0;
-      for (const row of rows) {
-        await db.recomputeCharacterSummary(settings, row.id);
-        updated++;
-      }
-      res.json({ updated });
-    } catch (err) {
-      console.error("[ChronicleDB] Recompute summaries error:", err);
-      res.status(500).json({ error: err.message });
+  router.post("/recompute-character-summaries", withInternalError(async (req, res) => {
+    const rows = await queryRows("SELECT id FROM characters");
+    let updated = 0;
+    for (const row of rows) {
+      await db.recomputeCharacterSummary(settings, row.id);
+      updated++;
     }
-  });
+    res.json({ updated });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Recompute summaries error:", err);
+    },
+  }));
 
   // ── Character cards (all ST character PNGs) ──────────────────
 
-  router.get("/character-cards", async (req, res) => {
-    try {
-      const { readdirSync } = require("fs");
-      const { resolve } = require("path");
-      const dataRoot = resolveStDataRoot(settings);
-      const charsDir = resolve(dataRoot, "characters");
-      const files = readdirSync(charsDir)
-        .filter((f) => f.endsWith(".png"))
-        .sort()
-        .map((f) => ({
-          filename: f,
-          name: f.replace(".png", ""),
-          // Card PNG served by ST at this path
-          imagePath: `/characters/${encodeURIComponent(f)}`,
-        }));
-      res.json(files);
-    } catch (err) {
+  router.get("/character-cards", withInternalError(async (req, res) => {
+    const charsDir = resolveStCharactersDir();
+    const files = readdirSync(charsDir)
+      .filter((f) => f.endsWith(".png"))
+      .sort()
+      .map((f) => ({
+        filename: f,
+        name: f.replace(".png", ""),
+        // Card PNG served by ST at this path
+        imagePath: `/characters/${encodeURIComponent(f)}`,
+      }));
+    res.json(files);
+  }, {
+    onError: (err) => {
       console.error("[ChronicleDB] Character cards error:", err);
-      res.status(500).json({ error: err.message });
-    }
-  });
+    },
+  }));
 
   // Proxy character PNGs so the mind map page can access them
-  router.get("/character-image/:filename", async (req, res) => {
-    try {
-      const { resolve } = require("path");
-      const { createReadStream, existsSync } = require("fs");
-      const dataRoot = resolveStDataRoot(settings);
-      const charsDir = resolve(dataRoot, "characters");
-      let imgPath;
-      try {
-        // Reject `..`, forward/back slashes, NUL bytes up front, and
-        // confirm the resolved path stays under `charsDir`. A request for
-        // `../../etc/passwd` throws here and becomes a 400.
-        imgPath = safeResolveUnder(charsDir, req.params.filename);
-      } catch (e) {
-        return res.status(400).json({ error: e.message });
-      }
-      if (!existsSync(imgPath)) return res.status(404).send("Not found");
-      res.setHeader("Content-Type", "image/png");
-      createReadStream(imgPath).pipe(res);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/character-image/:filename", withInternalError(async (req, res) => {
+    const charsDir = resolveStCharactersDir();
+    // Reject `..`, forward/back slashes, NUL bytes up front, and
+    // confirm the resolved path stays under `charsDir`. A request for
+    // `../../etc/passwd` throws here and becomes a 400.
+    const imgPath = safeResolveUnderOrBadRequest(res, charsDir, req.params.filename);
+    if (!imgPath) return;
+    if (!existsSync(imgPath)) return res.status(404).send("Not found");
+    res.setHeader("Content-Type", "image/png");
+    createReadStream(imgPath).pipe(res);
+  }));
 
   // ── Memory CRUD ──────────────────────────────────────────────
 
-  router.get("/memories/:chatId", async (req, res) => {
-    try {
-      const p = db.getPool(settings);
-      const { rows } = await p.query(
-        `SELECT * FROM memory_embeddings WHERE chat_id = $1 ORDER BY created_at DESC`,
-        [req.params.chatId],
-      );
-      res.json(rows);
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.get("/memories/:chatId", withInternalError(async (req, res) => {
+    const rows = await queryRows(
+      `SELECT * FROM memory_embeddings WHERE chat_id = $1 ORDER BY created_at DESC`,
+      [req.params.chatId],
+    );
+    res.json(rows);
+  }));
 
-  router.delete("/memories/:id", async (req, res) => {
-    try {
-      const p = db.getPool(settings);
-      await p.query(`DELETE FROM memory_embeddings WHERE id = $1`, [req.params.id]);
-      res.json({ ok: true });
-    } catch (err) {
-      res.status(500).json({ error: err.message });
-    }
-  });
+  router.delete("/memories/:id", withInternalError(async (req, res) => {
+    const p = db.getPool(settings);
+    await p.query(`DELETE FROM memory_embeddings WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  }));
 
   // ── Debug: recent LLM calls ──────────────────────────────────
   // In-memory ring buffer surface for the settings panel. Empty until

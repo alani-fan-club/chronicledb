@@ -22,3 +22,9 @@ IMPROVEMENTS.md
 RESEARCH.md
 RETRIEVAL_TODO.md
 CODE_REVIEW.md
+
+# Claude
+.claude/
+
+# Coverage
+coverage/

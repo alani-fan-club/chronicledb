@@ -45,25 +45,15 @@
  *   node server-plugin/backfill-trait-embeddings.js
  */
 
-require("dotenv").config({ path: require("path").join(__dirname, "..", "eval", ".env") });
-const { Pool } = require("pg");
+const { loadScriptSettings, createPoolFromSettings } = require("./script-settings");
 const { embedBatch } = require("./extractor");
-
-const settings = {
-  geminiApiKey: process.env.GEMINI_API_KEY,
-  geminiEmbeddingModel: process.env.GEMINI_EMBEDDING_MODEL || "gemini-embedding-2-preview",
-  geminiEmbeddingDimension: parseInt(process.env.GEMINI_EMBEDDING_DIM || "768"),
-};
 
 const EMBED_BATCH_SIZE = 50;
 const MERGE_THRESHOLD = 0.88;
 
 async function main() {
-  const pool = new Pool({
-    host: "localhost",
-    database: "chronicledb",
-    user: process.env.PGUSER || "samantha",
-  });
+  const { settings } = loadScriptSettings();
+  const pool = createPoolFromSettings(settings);
 
   // ── Phase 0: Before-state counts ─────────────────────────────
   const { rows: beforeTotal } = await pool.query(
@@ -255,19 +245,11 @@ async function main() {
   console.log(
     `[backfill-trait-embeddings] Phase 3: refreshing summary_embedding for ${allCharQuery.rows.length} characters`,
   );
-  // Synthesize the settings object recomputeCharacterSummary needs
-  // (just pg connection settings — no embedding API).
-  const rollupSettings = {
-    pgHost: "localhost",
-    pgPort: 5432,
-    pgDatabase: "chronicledb",
-    pgUser: process.env.PGUSER || "samantha",
-  };
   let rollupOk = 0;
   let rollupFail = 0;
   for (const row of allCharQuery.rows) {
     try {
-      await recomputeCharacterSummary(rollupSettings, row.character_id);
+      await recomputeCharacterSummary(settings, row.character_id);
       rollupOk++;
     } catch (err) {
       console.warn(`[backfill-trait-embeddings] rollup ${row.character_id} failed: ${err.message}`);

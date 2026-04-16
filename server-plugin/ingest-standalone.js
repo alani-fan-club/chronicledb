@@ -3,31 +3,12 @@
 const { readFileSync } = require("fs");
 const { resolve, basename } = require("path");
 const db = require("./db");
+const { loadScriptSettings } = require("./script-settings");
 const {
   extract,
   applyExtractionToGraph,
   applyMessagesToVectorStore,
 } = require("./extractor");
-
-function loadConfig() {
-  const cfgPath = resolve(__dirname, "..", "chronicledb.config.json");
-  const cfg = JSON.parse(readFileSync(cfgPath, "utf-8"));
-  return {
-    pgHost: process.env.PGHOST || cfg.database?.host || "localhost",
-    pgPort: parseInt(process.env.PGPORT || cfg.database?.port || "5432"),
-    pgDatabase: process.env.PGDATABASE || cfg.database?.database || "chronicledb",
-    pgUser: process.env.PGUSER || cfg.database?.user || process.env.USER,
-    pgPassword: process.env.PGPASSWORD || cfg.database?.password || "",
-    geminiApiKey: process.env.GEMINI_API_KEY || cfg.embedding?.apiKey || "",
-    extractionApiKey: process.env.GEMINI_API_KEY || cfg.embedding?.apiKey || "",
-    extractionApiType: "gemini",
-    extractionModel: process.env.GEMINI_LLM_MODEL || "gemini-2.5-flash-lite",
-    contextModel: process.env.GEMINI_CONTEXT_MODEL || "gemini-2.5-flash-lite",
-    geminiEmbeddingModel: cfg.embedding?.model || "gemini-embedding-2-preview",
-    geminiEmbeddingDimension: cfg.embedding?.dimension || 768,
-    stDataRoot: cfg.sillytavern?.dataRoot || "",
-  };
-}
 
 function parseArgs() {
   const args = {};
@@ -50,7 +31,12 @@ function buildBatches(messages, batchSize) {
 }
 
 async function run() {
-  const settings = loadConfig();
+  const { settings } = loadScriptSettings({
+    // Preserve previous ingest behavior: require chronicledb.config.json.
+    requiredConfig: true,
+    // Ingest standalone historically did not auto-load eval/.env.
+    loadEnv: false,
+  });
   const args = parseArgs();
   if (!args.file) {
     console.error("Usage: node ingest-standalone.js --file <path.jsonl> [--character NAME] [--batch-size 10] [--context-window 4]");

@@ -16,6 +16,7 @@ const { retrieve, formatMemoryBlock } = require("./retriever");
 const { ingestLorebook, listLorebooks } = require("./lorebook");
 const { safeResolveUnder } = require("./path-safety");
 const { setWithBoundedEviction } = require("./bounded-map");
+const { fetchAndVerifyConfiguredDbIdentity } = require("./db-identity");
 const { resolveStDataRoot } = require("./st-paths");
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { resolve: pathResolve, dirname: pathDirname } = require("path");
@@ -72,6 +73,32 @@ function markDisconnected(err) {
   };
 }
 
+const AUTO_CONNECT_IDENTITY_MESSAGES = {
+  userMismatchMessage: (actualUser, expectedUser) => (
+    `Database connected as "${actualUser}" but settings configured user "${expectedUser}". ` +
+    `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
+    `password auth, or update the user field to "${actualUser}" to match what Postgres ` +
+    `actually logged you in as.`
+  ),
+  databaseMismatchMessage: (actualDb, expectedDb) => (
+    `Connected to database "${actualDb}" but settings configured "${expectedDb}". ` +
+    `Check the database name field.`
+  ),
+};
+
+const INIT_DB_IDENTITY_MESSAGES = {
+  userMismatchMessage: (actualUser, expectedUser) => (
+    `Connected as "${actualUser}" but you configured user "${expectedUser}". ` +
+    `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
+    `password auth, or change the user field to "${actualUser}" to match what ` +
+    `Postgres logged you in as.`
+  ),
+  databaseMismatchMessage: (actualDb, expectedDb) => (
+    `Connected to database "${actualDb}" but you configured "${expectedDb}". ` +
+    `Check the database name field.`
+  ),
+};
+
 async function tryAutoConnect() {
   if (!settings.pgHost || !settings.pgDatabase) {
     connectionState = { connected: false, error: null, initializedAt: null };
@@ -89,25 +116,11 @@ async function tryAutoConnect() {
     // "I had a wrong username for the database and the plugin didn't
     // catch it" failure mode reported by friends during install.
     const pool = db.getPool(settings);
-    const { rows: [verify] } = await pool.query(
-      `SELECT current_user AS u, current_database() AS d`,
+    const verify = await fetchAndVerifyConfiguredDbIdentity(
+      pool,
+      settings,
+      AUTO_CONNECT_IDENTITY_MESSAGES,
     );
-    const expectedUser = (settings.pgUser || "").trim();
-    const expectedDb = (settings.pgDatabase || "").trim();
-    if (expectedUser && verify.u !== expectedUser) {
-      throw new Error(
-        `Database connected as "${verify.u}" but settings configured user "${expectedUser}". ` +
-        `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
-        `password auth, or update the user field to "${verify.u}" to match what Postgres ` +
-        `actually logged you in as.`,
-      );
-    }
-    if (expectedDb && verify.d !== expectedDb) {
-      throw new Error(
-        `Connected to database "${verify.d}" but settings configured "${expectedDb}". ` +
-        `Check the database name field.`,
-      );
-    }
     connectionState = {
       connected: true,
       error: null,
@@ -241,25 +254,11 @@ async function init(router) {
       // clear error in the UI, not a green checkmark followed by silent
       // query failures later.
       const pool = db.getPool(settings);
-      const { rows: [verify] } = await pool.query(
-        `SELECT current_user AS u, current_database() AS d`,
+      const verify = await fetchAndVerifyConfiguredDbIdentity(
+        pool,
+        settings,
+        INIT_DB_IDENTITY_MESSAGES,
       );
-      const expectedUser = (settings.pgUser || "").trim();
-      const expectedDb = (settings.pgDatabase || "").trim();
-      if (expectedUser && verify.u !== expectedUser) {
-        throw new Error(
-          `Connected as "${verify.u}" but you configured user "${expectedUser}". ` +
-          `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
-          `password auth, or change the user field to "${verify.u}" to match what ` +
-          `Postgres logged you in as.`,
-        );
-      }
-      if (expectedDb && verify.d !== expectedDb) {
-        throw new Error(
-          `Connected to database "${verify.d}" but you configured "${expectedDb}". ` +
-          `Check the database name field.`,
-        );
-      }
       connectionState = {
         connected: true,
         error: null,

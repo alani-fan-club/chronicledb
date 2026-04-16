@@ -4,6 +4,12 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+-- Migrations: drop vestigial objects from earlier schema versions that
+-- have zero readers/writers in the current codebase.
+DROP TABLE IF EXISTS chronicle_sessions;
+DROP INDEX IF EXISTS idx_events_major;
+DROP INDEX IF EXISTS idx_dialogue_quotes_chat_speaker;
+
 -- ── Node tables ────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS characters (
@@ -200,6 +206,10 @@ CREATE TABLE IF NOT EXISTS plot_threads (
     thread_type     TEXT NOT NULL DEFAULT 'pending',
     title           TEXT NOT NULL,
     description     TEXT DEFAULT '',
+    -- involved_chars duplicates the plot_thread_characters join. It is
+    -- the primary read path (retrieval-core.getPlotThreads, graph-domain
+    -- both project this column directly), so the join is the secondary
+    -- queryable form. Keep both writes in upsertPlotThread in sync.
     involved_chars  TEXT[] DEFAULT '{}',
     planted_at      INT,
     resolved_at     INT,
@@ -487,3 +497,9 @@ CREATE TABLE IF NOT EXISTS location_adjacency (
 );
 CREATE INDEX IF NOT EXISTS idx_loc_adj_chat_a ON location_adjacency (chat_id, location_a_id);
 CREATE INDEX IF NOT EXISTS idx_loc_adj_chat_b ON location_adjacency (chat_id, location_b_id);
+
+-- C6 access-pattern indexes.
+CREATE INDEX IF NOT EXISTS idx_feels_about_from_char ON feels_about(from_char);
+CREATE INDEX IF NOT EXISTS idx_feels_about_to_char ON feels_about(to_char);
+CREATE INDEX IF NOT EXISTS idx_traits_char_chat ON traits(character_id, source_chat);
+CREATE INDEX IF NOT EXISTS idx_ingestion_status_char_status ON ingestion_status(character_name, status);

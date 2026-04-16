@@ -895,7 +895,7 @@ async function getPlotThreads(pool, chatIds) {
     `SELECT title, description, thread_type, importance, involved_chars FROM plot_threads
      WHERE chat_id = ANY($1::text[]) AND resolved_at IS NULL
      ORDER BY importance DESC
-     LIMIT 10`,
+     LIMIT 20`,
     [ids],
   );
   return rows;

@@ -48,9 +48,9 @@ function getPool(settings) {
       password: settings.pgPassword || "",
       // traverseFromCharacter fans out ~15 concurrent queries via Promise.all,
       // and extractor.js runs parallel upsertTrait per character on top of it.
-      // max:10 was leaving the excess queries queued on the pool; 20 gives
-      // headroom so the common fan-out patterns run unthrottled.
-      max: 20,
+      // 20 gives headroom for the common fan-out; configurable for hosted
+      // Postgres deployments with stricter connection caps.
+      max: parseInt(settings.dbPoolMax, 10) || 20,
     });
     pool.on("error", (err) => {
       try { poolErrorHandler(err); } catch (_) { /* swallowing ensures listener never throws */ }
@@ -62,29 +62,15 @@ function getPool(settings) {
 async function initSchema(settings) {
   const p = getPool(settings);
   const raw = readFileSync(resolve(__dirname, "schema.sql"), "utf-8");
-  // Strip `--` line comments BEFORE splitting on `;`. Comments can
-  // legally contain `;` and backticks, and the previous naive splitter
-  // would mid-cut a comment block and send the dangling second half
-  // ("...`merged_count` is a cheap popularity signal. ALTER TABLE...")
-  // straight to Postgres as a syntax error, silently dropping the ALTER.
-  // schema.sql has no `--` inside SQL string literals, so a whole-line
-  // strip is safe here.
-  const sql = raw
-    .split("\n")
-    .map((line) => {
-      const idx = line.indexOf("--");
-      return idx === -1 ? line : line.slice(0, idx);
-    })
-    .join("\n");
-  const stmts = sql.split(";").map((s) => s.trim()).filter((s) => s.length > 0);
-
-  for (const stmt of stmts) {
-    try {
-      await p.query(stmt);
-    } catch (err) {
-      if (!err.message.includes("already exists")) {
-        console.warn(`[ChronicleDB] Schema warning: ${err.message}`);
-      }
+  // Execute as a single multi-statement query via the simple query
+  // protocol. Every statement is idempotent (CREATE TABLE IF NOT EXISTS,
+  // CREATE INDEX IF NOT EXISTS, ALTER TABLE ... ADD COLUMN IF NOT EXISTS,
+  // DROP ... IF EXISTS), so no transaction wrapping is required.
+  try {
+    await p.query(raw);
+  } catch (err) {
+    if (!err.message.includes("already exists")) {
+      console.warn(`[ChronicleDB] Schema warning: ${err.message}`);
     }
   }
   console.log("[ChronicleDB] Schema initialized.");
@@ -100,15 +86,7 @@ const {
   storeEmbedding,
   upsertMemoryEmbedding,
   upsertDialogueQuote,
-  vectorSearch,
-  vectorSearchScoped,
-  lexicalSearch,
-  hybridSearch,
-  getRelationships,
-  getKnowledgeBoundaries,
-  getRecentEvents,
-  getWorldState,
-} = createRetrievalDomain({ getPool, slugify });
+} = createRetrievalDomain({ getPool });
 
 const {
   traverseFromCharacter,
@@ -508,6 +486,34 @@ function setTraitVerifyCache(key, val) {
   });
 }
 
+// C11: per-(character, category) cache of existing canonical traits, used to
+// short-circuit the fuzzy pre-check SQL on the substring-match case. The
+// extractor batches dozens of upsertTrait calls per character; without this
+// cache each one issues its own SELECT against traits. TTL is short (5s)
+// because writes within the same batch invalidate the snapshot.
+const TRAIT_LIST_CACHE_TTL_MS = 5000;
+const traitListCache = new Map(); // key: `${characterId}::${category}` -> { rows, expires }
+
+function getCachedTraitList(key) {
+  const entry = traitListCache.get(key);
+  if (!entry) return null;
+  if (entry.expires < Date.now()) {
+    traitListCache.delete(key);
+    return null;
+  }
+  return entry.rows;
+}
+
+function setCachedTraitList(key, rows) {
+  traitListCache.set(key, { rows, expires: Date.now() + TRAIT_LIST_CACHE_TTL_MS });
+}
+
+function invalidateTraitListCache(characterId) {
+  for (const k of traitListCache.keys()) {
+    if (k.startsWith(`${characterId}::`)) traitListCache.delete(k);
+  }
+}
+
 async function upsertTrait(
   settings,
   { characterId, characterName, category, content, evidenceSentence, sourceChat, sourceMessageIndex },
@@ -552,21 +558,52 @@ async function upsertTrait(
   // The fuzzy pre-check only considers canonical rows (canonical_id IS
   // NULL) — merged variants would otherwise re-match their own alias
   // content and block the Path 1 embedding pipeline from being reached.
-  const { rows: similar } = await p.query(
-    `SELECT id, content, length(content) AS len,
-            similarity(lower(content), lower($3)) AS sim
-     FROM traits
-     WHERE character_id = $1 AND category = $2 AND canonical_id IS NULL
-       AND (
-         stemmed_content = strip(to_tsvector('english', $3))::text
-         OR lower(content) LIKE '%' || lower($3) || '%'
-         OR lower($3) LIKE '%' || lower(content) || '%'
-         OR similarity(lower(content), lower($3)) > $4
-       )
-     ORDER BY len DESC, sim DESC
-     LIMIT 1`,
-    [characterId, cat, cleaned, TRAIT_SIMILARITY_THRESHOLD],
-  );
+  //
+  // C11 fast path: try the cheap substring-match in JS against a cached
+  // snapshot of the character's canonical traits before issuing SQL. The
+  // SQL stays the source of truth — we still run it on cache miss or when
+  // the JS check returns no substring hit, because stemmer / pg_trgm
+  // matches can't be replicated outside Postgres.
+  const traitListKey = `${characterId}::${cat}`;
+  let cachedList = getCachedTraitList(traitListKey);
+  if (!cachedList) {
+    const { rows: all } = await p.query(
+      `SELECT id, content, length(content) AS len
+         FROM traits
+        WHERE character_id = $1 AND category = $2 AND canonical_id IS NULL`,
+      [characterId, cat],
+    );
+    cachedList = all;
+    setCachedTraitList(traitListKey, all);
+  }
+  const cleanedLower = cleaned.toLowerCase();
+  let jsSubstringHit = null;
+  for (const row of cachedList) {
+    const rowLower = String(row.content || "").toLowerCase();
+    if (!rowLower) continue;
+    if (rowLower.includes(cleanedLower) || cleanedLower.includes(rowLower)) {
+      if (!jsSubstringHit || row.len > jsSubstringHit.len) jsSubstringHit = row;
+    }
+  }
+  let similar;
+  if (jsSubstringHit) {
+    similar = [jsSubstringHit];
+  } else {
+    const res = await p.query(
+      `SELECT id, content, length(content) AS len,
+              similarity(lower(content), lower($3)) AS sim
+       FROM traits
+       WHERE character_id = $1 AND category = $2 AND canonical_id IS NULL
+         AND (
+           stemmed_content = strip(to_tsvector('english', $3))::text
+           OR similarity(lower(content), lower($3)) > $4
+         )
+       ORDER BY len DESC, sim DESC
+       LIMIT 1`,
+      [characterId, cat, cleaned, TRAIT_SIMILARITY_THRESHOLD],
+    );
+    similar = res.rows;
+  }
   if (similar.length > 0) {
     const match = similar[0];
     if (match.len >= cleaned.length) return match.id;
@@ -578,6 +615,7 @@ async function upsertTrait(
         `UPDATE traits SET content = $1 WHERE id = $2`,
         [cleaned, match.id],
       );
+      invalidateTraitListCache(characterId);
     } catch (err) {
       // Rewrite could violate the unique normalized index if two distinct
       // groups collapse into one. Ignore and keep the existing row; the
@@ -653,8 +691,14 @@ async function upsertTrait(
     } catch (err) {
       console.warn(`[ChronicleDB] trait merge UPDATE failed (${err.message})`);
     }
-    const mergedId = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    // Merge candidate ID is content-addressed by (character, raw content,
+    // source_chat, source_message_index) so re-running the same extraction
+    // batch is idempotent — the same candidate evidence won't spawn a new row.
     const msgIdxParam = Number.isFinite(sourceMessageIndex) ? sourceMessageIndex : null;
+    const mergedId = contentId(
+      "trait",
+      `cand:${characterId}:${cleaned}:${sourceChat || ""}:${msgIdxParam ?? ""}`,
+    );
     try {
       await p.query(
         `INSERT INTO traits (id, character_id, category, content, source_chat, source_message_index, embedding, evidence_sentence, canonical_id)
@@ -676,6 +720,7 @@ async function upsertTrait(
       // A normalized-index conflict means an identical row already
       // exists — nothing to do.
     }
+    invalidateTraitListCache(characterId);
     try {
       await recomputeCharacterSummary(settings, characterId);
     } catch (err) {
@@ -718,8 +763,14 @@ async function upsertTrait(
         });
         setTraitVerifyCache(cacheKey, decision);
       } catch (err) {
-        console.warn(`[ChronicleDB] trait verifier failed (${err.message}); falling through to NEW_CANONICAL`);
-        decision = "KEEP_DISTINCT";
+        // Defensive: on verifier error, treat the candidate as a duplicate
+        // of the top kNN hit rather than minting a new canonical row. The
+        // candidate sits in the 0.80-0.88 ambiguous band — we already
+        // believe it's probably the same trait, and a phantom canonical
+        // would fragment the dedup pipeline. False-merge is recoverable
+        // (split via admin tool); a phantom canonical pollutes kNN forever.
+        console.warn(`[ChronicleDB] trait verifier failed (${err.message}); defaulting to MERGE onto top kNN hit`);
+        decision = "MERGE";
       }
     }
 
@@ -747,9 +798,12 @@ async function upsertTrait(
   }
 
   // NEW_CANONICAL: insert as a fresh canonical row, embedding populated
-  // if we have one, canonical_id = NULL. The existing exact-normalized
-  // ON CONFLICT remains as a safety net against races/case variants.
-  const id = `trait-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  // if we have one, canonical_id = NULL. ID is content-addressed by
+  // (character, normalized content) so re-ingesting the same trait always
+  // collides with the existing row's id and the ON CONFLICT clause becomes
+  // a true upsert, not a new row.
+  const normalizedKey = cleaned.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const id = contentId("trait", `${characterId}:${normalizedKey}`);
   const newCanonMsgIdx = Number.isFinite(sourceMessageIndex) ? sourceMessageIndex : null;
   const { rows: inserted } = await p.query(
     `INSERT INTO traits (id, character_id, category, content, source_chat, source_message_index, embedding, evidence_sentence)
@@ -770,6 +824,7 @@ async function upsertTrait(
   let finalId;
   if (inserted.length > 0) {
     finalId = inserted[0].id;
+    invalidateTraitListCache(characterId);
   } else {
     const { rows: existing } = await p.query(
       `SELECT id FROM traits
@@ -934,6 +989,9 @@ async function linkEventToArc(settings, { arcId, eventId, position, isAnchor }) 
   ).catch(err => console.warn(`[ChronicleDB] linkEventToArc failed:`, err.message));
 }
 
+// event_chains is visualization-only: writes happen here but no
+// retrieval/graph code reads it. Kept so the mindmap can grow into using
+// the causal edges already being captured.
 async function createEventChain(settings, { fromEventId, toEventId, chainType, description }) {
   const p = getPool(settings);
   await p.query(
@@ -1449,6 +1507,7 @@ async function clearCharacterMemories(settings, characterName) {
   } finally {
     client.release();
   }
+  invalidateTraitListCache(charId);
   return cleared;
 }
 

@@ -226,9 +226,9 @@ function nodeColor(type, significance, isPC) {
 }
 
 function nodePointSize(type, degree, significance, isPC) {
-  if (type === 'character' && isPC) return Math.min(28, 18 + Math.log(degree + 1) * 2.5);
-  if (type === 'character') return Math.min(20, 12 + Math.log(degree + 1) * 2);
-  if (type === 'story_arc') return 10;
+  if (type === 'character' && isPC) return Math.min(80, 40 + Math.log(degree + 1) * 8);
+  if (type === 'character') return Math.min(55, 20 + Math.log(degree + 1) * 6);
+  if (type === 'story_arc') return Math.min(18, 10 + Math.log(degree + 1) * 2);
   if (type === 'event') return significance >= 4 ? 8 : 4;
   return 3;
 }
@@ -338,11 +338,31 @@ function initGraph() {
     .cooldownTicks(0);
 
   // Tune forces after graph is created
-  graph.d3Force('charge').strength(node => node.type === 'character' ? -250 : -60);
+  graph.d3Force('charge').strength(node => {
+    if (node.type === 'character') return -250;
+    if (node.type === 'story_arc') return -80; // moderate — don't push arcs to the fringe
+    return -60;
+  });
   graph.d3Force('charge').distanceMax(500);
-  graph.d3Force('link').distance(100).strength(link => {
-    // Structural edges have zero spring force — render but don't pull nodes together
-    if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return 0;
+
+  // Pull arcs toward center so they stay near the action.
+  // Access d3-force via the existing center force's constructor
+  const centerForce = graph.d3Force('center');
+  if (centerForce) {
+    // Increase overall center gravity slightly and give arcs extra pull
+    // by making the link force stronger for CONTAINS_EVENT
+    graph.d3Force('link').distance(link => {
+      if (link.type === 'CONTAINS_EVENT') return 40; // short leash — arcs stay near events
+      return 100;
+    });
+  }
+
+  graph.d3Force('link').distance(link => {
+    if (link.type === 'CONTAINS_EVENT') return 40; // short — keeps arcs near their events
+    return 100;
+  }).strength(link => {
+    if (link.type === 'CONTAINS_EVENT') return 0.05; // gentle pull, not blob-causing
+    if (link.type === 'CAUSED') return 0;
     return 0.2;
   });
 

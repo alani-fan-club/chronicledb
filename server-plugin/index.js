@@ -369,6 +369,12 @@ async function init(router) {
   const ARC_REBUILD_CACHE_MAX = 200;
   const arcRebuildLastCount = new Map(); // chatId -> int
   const arcRebuildInFlight = new Set();  // chatId
+  // When a rebuild is in flight and a new /extract trigger arrives for the
+  // same chat, coalesce the (possibly many) follow-up triggers into a single
+  // pending rebuild that fires once the in-flight one completes. Bounds the
+  // rebuild fan-out to 2 (current + one follow-up) regardless of how many
+  // /extract calls land mid-rebuild.
+  const arcRebuildPending = new Set(); // chatId
 
   // Bounded eviction. Both maps accumulate one entry per chat_id forever,
   // so a long-running ST process with many chats grows unboundedly. Cap at
@@ -379,8 +385,53 @@ async function init(router) {
     setWithBoundedEviction(arcRebuildLastCount, chatId, n, ARC_REBUILD_CACHE_MAX, {
       // Set.delete(value) is a no-op if the value isn't present, so this is
       // safe even when the evicted chat has no in-flight rebuild.
-      onEvict: (evictedChatId) => arcRebuildInFlight.delete(evictedChatId),
+      onEvict: (evictedChatId) => {
+        arcRebuildInFlight.delete(evictedChatId);
+        arcRebuildPending.delete(evictedChatId);
+      },
     });
+  }
+
+  // Fire-and-forget arc rebuild with coalesced follow-up. If another
+  // /extract sets arcRebuildPending[chatId] while this is running, we
+  // re-fire once on completion (capturing all events that arrived during
+  // the in-flight rebuild). Errors are logged only — never thrown to a
+  // caller because the HTTP response was already sent.
+  function startArcRebuild(chatId) {
+    arcRebuildInFlight.add(chatId);
+    (async () => {
+      try {
+        const { rebuildArcsForChat } = require("./arc-builder");
+        const r = await rebuildArcsForChat(settings, chatId, {
+          nameArcs: true, nameHierarchy: true,
+        });
+        console.log(
+          `[ChronicleDB] Incremental arc rebuild for ${chatId}: ` +
+          `${r.builtArcs} arcs (${r.namedArcs ?? 0} new LLM-named, ${r.recycledArcs ?? 0} recycled), ` +
+          `${r.superArcs} super (${r.namedSuperArcs ?? 0} new, ${r.recycledSuperArcs ?? 0} recycled), ` +
+          `${r.episodes} episodes (${r.namedEpisodes ?? 0} new, ${r.recycledEpisodes ?? 0} recycled), ` +
+          `Q=${(r.modularityQ ?? 0).toFixed(3)}, N=${r.totalEvents}`,
+        );
+      } catch (err) {
+        console.warn(`[ChronicleDB] Incremental arc rebuild failed for ${chatId}: ${err.message}`);
+      } finally {
+        arcRebuildInFlight.delete(chatId);
+        if (arcRebuildPending.delete(chatId)) {
+          // Refresh the last-count baseline so the next coalesced rebuild
+          // reflects events that landed during the prior run.
+          try {
+            const { rows: [{ n }] } = await db.getPool(settings).query(
+              `SELECT COUNT(*)::int AS n FROM events WHERE chat_id = $1`,
+              [chatId],
+            );
+            setArcRebuildCount(chatId, n);
+          } catch (err) {
+            console.warn(`[ChronicleDB] Arc-rebuild follow-up counter check failed: ${err.message}`);
+          }
+          startArcRebuild(chatId);
+        }
+      }
+    })();
   }
 
   // Per-(chatId, messageIndex) extract mutex. When two /extract calls
@@ -421,22 +472,30 @@ async function init(router) {
       //    /ingest-chat keeps its own drop-and-rebuild semantics so
       //    bulk ingests are unaffected.
       if (mutexKey) {
+        // Wrap the pre-clean in a transaction so a partial failure can't
+        // leave orphaned rows (e.g. participated_in deleted but events kept,
+        // or vice versa). On error, rollback and let withInternalError
+        // surface a 500 — proceeding past a failed pre-clean would write
+        // duplicates on top of stale rows.
+        const client = await db.getPool(settings).connect();
         try {
-          const pool = db.getPool(settings);
-          await pool.query(
+          await client.query("BEGIN");
+          await client.query(
             `DELETE FROM participated_in
              WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
             [chatId, messageIndex],
           );
-          await Promise.all([
-            pool.query(`DELETE FROM events           WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
-            pool.query(`DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
-            pool.query(`DELETE FROM dialogue_quotes  WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
-            pool.query(`DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]),
-            pool.query(`DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2`, [chatId, messageIndex]),
-          ]);
+          await client.query(`DELETE FROM events           WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM dialogue_quotes  WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2`, [chatId, messageIndex]);
+          await client.query("COMMIT");
         } catch (err) {
-          console.warn(`[ChronicleDB] /extract idempotent pre-clean failed (${err.message}); proceeding anyway`);
+          await client.query("ROLLBACK").catch(() => {});
+          throw err;
+        } finally {
+          client.release();
         }
       }
 
@@ -487,41 +546,29 @@ async function init(router) {
       //    typical incremental rebuild only LLM-names new clusters
       //    (usually 0-3) instead of all 35, so cost stays bounded.
       const rebuildEveryN = Number(settings.arcRebuildEveryN ?? 30);
-      if (rebuildEveryN > 0 && chatId && !arcRebuildInFlight.has(chatId)) {
-        try {
-          const pool = db.getPool(settings);
-          const { rows: [{ n }] } = await pool.query(
-            `SELECT COUNT(*)::int AS n FROM events WHERE chat_id = $1`,
-            [chatId],
-          );
-          const lastN = arcRebuildLastCount.get(chatId) || 0;
-          if (n - lastN >= rebuildEveryN) {
-            arcRebuildInFlight.add(chatId);
-            setArcRebuildCount(chatId, n);
-            // Fire and forget — no await. Errors go to the log only.
-            (async () => {
-              try {
-                const { rebuildArcsForChat } = require("./arc-builder");
-                const r = await rebuildArcsForChat(settings, chatId, {
-                  nameArcs: true, nameHierarchy: true,
-                });
-                console.log(
-                  `[ChronicleDB] Incremental arc rebuild for ${chatId}: ` +
-                  `${r.builtArcs} arcs (${r.namedArcs ?? 0} new LLM-named, ${r.recycledArcs ?? 0} recycled), ` +
-                  `${r.superArcs} super (${r.namedSuperArcs ?? 0} new, ${r.recycledSuperArcs ?? 0} recycled), ` +
-                  `${r.episodes} episodes (${r.namedEpisodes ?? 0} new, ${r.recycledEpisodes ?? 0} recycled), ` +
-                  `Q=${(r.modularityQ ?? 0).toFixed(3)}, N=${r.totalEvents}`,
-                );
-              } catch (err) {
-                console.warn(`[ChronicleDB] Incremental arc rebuild failed for ${chatId}: ${err.message}`);
-              } finally {
-                arcRebuildInFlight.delete(chatId);
-              }
-            })();
+      if (rebuildEveryN > 0 && chatId) {
+        if (arcRebuildInFlight.has(chatId)) {
+          // Coalesce: a rebuild is already running for this chat. Mark a
+          // pending follow-up so the in-flight rebuild's finally re-fires
+          // once. Multiple /extract calls landing here all collapse into
+          // the same single follow-up.
+          arcRebuildPending.add(chatId);
+        } else {
+          try {
+            const pool = db.getPool(settings);
+            const { rows: [{ n }] } = await pool.query(
+              `SELECT COUNT(*)::int AS n FROM events WHERE chat_id = $1`,
+              [chatId],
+            );
+            const lastN = arcRebuildLastCount.get(chatId) || 0;
+            if (n - lastN >= rebuildEveryN) {
+              setArcRebuildCount(chatId, n);
+              startArcRebuild(chatId);
+            }
+          } catch (err) {
+            // Counting query failed — log and continue, don't break ingest
+            console.warn(`[ChronicleDB] Arc-rebuild counter check failed: ${err.message}`);
           }
-        } catch (err) {
-          // Counting query failed — log and continue, don't break ingest
-          console.warn(`[ChronicleDB] Arc-rebuild counter check failed: ${err.message}`);
         }
       }
     } finally {

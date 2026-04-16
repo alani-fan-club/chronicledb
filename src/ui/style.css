@@ -537,7 +537,7 @@ html, body {
 }
 
 /* =================================================================
-   HOVER LABEL (Three.js tooltip)
+   HOVER LABEL (3d-force-graph tooltip)
    ================================================================= */
 
 .hover-label {
@@ -553,6 +553,26 @@ html, body {
   white-space: nowrap;
   z-index: 20;
   display: none;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* 3d-force-graph native tooltip */
+.graph-tooltip {
+  font-family: var(--font-mono) !important;
+  font-size: 10px !important;
+  font-weight: 500 !important;
+  color: var(--text-primary) !important;
+  background: rgba(32, 32, 32, 0.92) !important;
+  padding: 4px 10px !important;
+  border: 1px solid var(--border-strong) !important;
+  border-radius: 0 !important;
+  white-space: nowrap !important;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.hover-label-content {
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }

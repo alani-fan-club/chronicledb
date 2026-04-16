@@ -1,12 +1,10 @@
-// ChronicleDB Mind Map — Three.js WebGL particle nebula with bloom
-// Dark charcoal background, coral-red highlights, 3D force-directed layout
+// ChronicleDB Mind Map — 3d-force-graph with bloom post-processing
+// Dark charcoal background, coral-red highlights, particle nebula feel
 
+import ForceGraph3D from '3d-force-graph';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
 
 // ── API base ────────────────────────────────────────────────────
 const IS_ST_PLUGIN = window.location.pathname.includes("/api/plugins/chronicle-db");
@@ -55,22 +53,18 @@ let activeEdgeTypes = new Set([
 let avatarFileByName = new Map();
 
 // Graph data structures
-let graphNodes = [];     // [{id, label, fullLabel, type, size, color, x, y, z, pointSize, ...metadata}]
+let graphNodes = [];     // [{id, label, fullLabel, type, degree, significance, isPC, ...metadata}]
 let graphEdges = [];     // [{id, source, target, type, label, sentiment, intensity}]
 let nodeById = new Map(); // id -> graphNodes index
 let adjacency = new Map(); // nodeId -> [{edge, neighborId, neighborData}]
 
-// Three.js state
-let scene, camera, renderer, composer, controls, labelRenderer;
-let nodePointsMesh = null;
-let edgeLinesMesh = null;
-let raycaster, mouse;
-let hoverIndex = -1;
+// 3d-force-graph instance
+let graph = null;
+let labelRenderer = null;
 let charLabelObjects = []; // CSS2DObject references for cleanup
+let glowTexture = null;
 
-const DEFAULT_CAMERA_Z = 800;
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-let time = 0;
 
 // ── Utilities ───────────────────────────────────────────────────
 
@@ -100,89 +94,6 @@ function sentimentClass(s) {
   return "sentiment-neutral";
 }
 
-// ── Three.js initialization ─────────────────────────────────────
-
-function initThreeJS() {
-  const container = document.getElementById('cy');
-
-  // Scene
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x181818);
-  scene.fog = new THREE.FogExp2(0x181818, 0.0012);
-
-  // Camera
-  camera = new THREE.PerspectiveCamera(
-    60,
-    container.clientWidth / container.clientHeight,
-    1,
-    5000
-  );
-  camera.position.set(0, 0, DEFAULT_CAMERA_Z);
-
-  // Renderer
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setSize(container.clientWidth, container.clientHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.toneMapping = THREE.ReinhardToneMapping;
-  renderer.toneMappingExposure = 1.5;
-  container.appendChild(renderer.domElement);
-
-  // CSS2D label renderer
-  labelRenderer = new CSS2DRenderer();
-  labelRenderer.setSize(container.clientWidth, container.clientHeight);
-  labelRenderer.domElement.style.position = 'absolute';
-  labelRenderer.domElement.style.top = '0';
-  labelRenderer.domElement.style.left = '0';
-  labelRenderer.domElement.style.pointerEvents = 'none';
-  container.appendChild(labelRenderer.domElement);
-
-  // Post-processing
-  composer = new EffectComposer(renderer);
-  const renderPass = new RenderPass(scene, camera);
-  composer.addPass(renderPass);
-
-  const bloomPass = new UnrealBloomPass(
-    new THREE.Vector2(container.clientWidth, container.clientHeight),
-    1.5,   // strength
-    0.5,   // radius
-    0.15   // threshold
-  );
-  composer.addPass(bloomPass);
-
-  // Controls — constrained to near-2D to prevent disorientation.
-  // Camera can tilt slightly but won't flip upside down or go behind.
-  controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.08;
-  controls.rotateSpeed = 0.5;
-  controls.zoomSpeed = 1.2;
-  controls.minDistance = 50;
-  controls.maxDistance = 3000;
-  controls.minPolarAngle = Math.PI * 0.25; // limit vertical tilt
-  controls.maxPolarAngle = Math.PI * 0.75;
-
-  // Raycaster — generous threshold so nodes are easy to click
-  raycaster = new THREE.Raycaster();
-  raycaster.params.Points.threshold = 15;
-  mouse = new THREE.Vector2();
-
-  // Events
-  container.addEventListener('mousemove', onMouseMove, false);
-  container.addEventListener('click', onClick, false);
-
-  window.addEventListener('resize', () => {
-    const w = container.clientWidth;
-    const h = container.clientHeight;
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
-    renderer.setSize(w, h);
-    labelRenderer.setSize(w, h);
-    composer.setSize(w, h);
-  });
-
-  animate();
-}
-
 // ── Glow texture ────────────────────────────────────────────────
 
 function createGlowTexture() {
@@ -198,22 +109,23 @@ function createGlowTexture() {
   gradient.addColorStop(1, 'rgba(255,255,255,0)');
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, size, size);
-  return new THREE.CanvasTexture(canvas);
+  glowTexture = new THREE.CanvasTexture(canvas);
+  return glowTexture;
 }
 
 // ── Node color and sizing ───────────────────────────────────────
 
 function nodeColor(type, significance, isPC) {
-  if (type === 'character' && isPC) return 0xFF8870; // coral-tinted for PCs
+  if (type === 'character' && isPC) return '#FF8870'; // coral-tinted for PCs
   switch (type) {
-    case 'character': return 0xe8e8e8;
-    case 'event': return significance >= 4 ? 0xFF5841 : 0xd4a574;
-    case 'story_arc': return 0xFF5841;
-    case 'location': return 0x7d9a82;
-    case 'item': return 0xa88b6a;
-    case 'plot_thread': return 0xc77d5c;
-    case 'fact': return 0x444444;
-    default: return 0x555555;
+    case 'character': return '#e8e8e8';
+    case 'event': return significance >= 4 ? '#FF5841' : '#d4a574';
+    case 'story_arc': return '#FF5841';
+    case 'location': return '#7d9a82';
+    case 'item': return '#a88b6a';
+    case 'plot_thread': return '#c77d5c';
+    case 'fact': return '#444444';
+    default: return '#555555';
   }
 }
 
@@ -225,369 +137,123 @@ function nodePointSize(type, degree, significance, isPC) {
   return 3;
 }
 
-// ── Force layout ────────────────────────────────────────────────
+// ── Graph initialization ────────────────────────────────────────
 
-async function runForceLayout(nodes, edges) {
-  if (nodes.length === 0) return;
+function initGraph() {
+  const container = document.getElementById('cy');
 
-  // Delete any existing x/y/z so d3-force-3d initializes positions
-  // properly (phyllotaxis spiral). If they're 0, d3 thinks they're
-  // "set" and skips init — 975 nodes all at origin = symmetric forces
-  // that cancel out, producing a collapsed blob.
-  for (const n of nodes) {
-    delete n.x; delete n.y; delete n.z;
-    delete n.vx; delete n.vy; delete n.vz;
-  }
+  createGlowTexture();
 
-  // Use d3-force-3d for proper Barnes-Hut O(N log N) layout.
-  const d3 = await import('https://cdn.jsdelivr.net/npm/d3-force-3d@3/+esm');
+  // CSS2D label renderer for persistent character name labels
+  labelRenderer = new CSS2DRenderer();
+  labelRenderer.setSize(container.clientWidth, container.clientHeight);
+  labelRenderer.domElement.style.position = 'absolute';
+  labelRenderer.domElement.style.top = '0';
+  labelRenderer.domElement.style.left = '0';
+  labelRenderer.domElement.style.pointerEvents = 'none';
+  container.appendChild(labelRenderer.domElement);
 
-  // Filter out structural edges for layout
-  const layoutLinks = edges
-    .filter(e => e.type !== 'CONTAINS_EVENT' && e.type !== 'CAUSED')
-    .map(e => ({ source: e.source, target: e.target }));
+  graph = ForceGraph3D({
+    controlType: 'orbit',
+    extraRenderers: [labelRenderer],
+  })(container)
+    .backgroundColor('#0a0a0a')
+    .showNavInfo(false)
+    // Node config
+    .nodeThreeObject(node => {
+      const group = new THREE.Group();
 
-  const simulation = d3.forceSimulation(nodes, 3)
-    .force("charge", d3.forceManyBody()
-      .strength(n => n.type === 'character' ? -300 : -80)
-      .distanceMax(600))
-    .force("link", d3.forceLink(layoutLinks)
-      .id(d => d.id)
-      .distance(100)
-      .strength(0.3))
-    .force("center", d3.forceCenter())
-    .force("collide", d3.forceCollide()
-      .radius(d => d.pointSize * 0.8)
-      .strength(0.7))
-    .stop();
+      // Glow sprite for particle nebula feel
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: glowTexture,
+          color: new THREE.Color(nodeColor(node.type, node.significance, node.isPC)),
+          transparent: true,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        })
+      );
+      const s = nodePointSize(node.type, node.degree, node.significance, node.isPC);
+      sprite.scale.set(s, s, 1);
+      group.add(sprite);
 
-  // Run synchronously — Barnes-Hut is fast enough for 975 nodes
-  const ticks = 300;
-  for (let i = 0; i < ticks; i++) {
-    simulation.tick();
-    // Yield every 50 ticks to keep browser responsive
-    if (i % 50 === 0) await new Promise(r => setTimeout(r, 0));
-  }
-}
-
-// ── Build Three.js geometry ─────────────────────────────────────
-
-function buildNodeGeometry() {
-  if (graphNodes.length === 0) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
-    geo.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
-    geo.setAttribute('size', new THREE.Float32BufferAttribute([], 1));
-    const material = new THREE.PointsMaterial({ size: 1 });
-    return new THREE.Points(geo, material);
-  }
-
-  const positions = new Float32Array(graphNodes.length * 3);
-  const colors = new Float32Array(graphNodes.length * 3);
-  const sizes = new Float32Array(graphNodes.length);
-  const baseColors = new Float32Array(graphNodes.length * 3);
-
-  for (let i = 0; i < graphNodes.length; i++) {
-    const n = graphNodes[i];
-    positions[i * 3] = n.x;
-    positions[i * 3 + 1] = n.y;
-    positions[i * 3 + 2] = n.z;
-
-    const color = new THREE.Color(n.color);
-    colors[i * 3] = color.r;
-    colors[i * 3 + 1] = color.g;
-    colors[i * 3 + 2] = color.b;
-    baseColors[i * 3] = color.r;
-    baseColors[i * 3 + 1] = color.g;
-    baseColors[i * 3 + 2] = color.b;
-
-    sizes[i] = n.pointSize;
-  }
-
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-  geo.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
-  geo.userData = { baseColors };
-
-  const material = new THREE.ShaderMaterial({
-    uniforms: {
-      glowTexture: { value: createGlowTexture() },
-    },
-    vertexShader: `
-      attribute float size;
-      varying vec3 vColor;
-      void main() {
-        vColor = color;
-        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-        gl_PointSize = size * (400.0 / -mvPosition.z);
-        gl_Position = projectionMatrix * mvPosition;
+      // Persistent character name label via CSS2DObject
+      if (node.type === 'character' && node.label) {
+        const div = document.createElement('div');
+        div.className = 'node-label-3d';
+        div.textContent = node.label;
+        const labelObj = new CSS2DObject(div);
+        labelObj.position.set(0, -s * 0.4, 0);
+        group.add(labelObj);
+        charLabelObjects.push(labelObj);
       }
-    `,
-    fragmentShader: `
-      uniform sampler2D glowTexture;
-      varying vec3 vColor;
-      void main() {
-        vec4 texColor = texture2D(glowTexture, gl_PointCoord);
-        gl_FragColor = vec4(vColor, 1.0) * texColor;
-        if (gl_FragColor.a < 0.01) discard;
+
+      return group;
+    })
+    .nodeThreeObjectExtend(false)
+    .nodeLabel(node => `<div class="hover-label-content">${escapeHtml(node.fullLabel || node.label || node.id)}</div>`)
+    .onNodeClick(node => {
+      showDetailPanel(node);
+      // Fly camera to node
+      const dist = 150;
+      graph.cameraPosition(
+        { x: node.x, y: node.y, z: node.z + dist },
+        node,
+        1500
+      );
+    })
+    .onBackgroundClick(() => hideDetailPanel())
+    // Link config
+    .linkColor(link => {
+      if (link.type === 'FEELS_ABOUT') {
+        return link.sentiment > 0.3 ? '#6ac47a' : link.sentiment < -0.3 ? '#e05555' : '#7a8594';
       }
-    `,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-    vertexColors: true,
+      if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return '#FF5841';
+      return '#333333';
+    })
+    .linkOpacity(0.07)
+    .linkVisibility(link => activeEdgeTypes.has(link.type))
+    .linkWidth(0.3)
+    // Force config
+    .d3AlphaDecay(0.02)
+    .d3VelocityDecay(0.3)
+    .warmupTicks(200)
+    .cooldownTicks(0); // render after warmup
+
+  // Tune forces after graph is created
+  graph.d3Force('charge').strength(node => node.type === 'character' ? -250 : -60);
+  graph.d3Force('charge').distanceMax(500);
+  graph.d3Force('link').distance(100).strength(link => {
+    // Structural edges have zero spring force — render but don't pull nodes together
+    if (link.type === 'CONTAINS_EVENT' || link.type === 'CAUSED') return 0;
+    return 0.2;
   });
 
-  return new THREE.Points(geo, material);
-}
+  // Constrain orbit controls — prevent disorientation
+  const controls = graph.controls();
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.rotateSpeed = 0.5;
+  controls.zoomSpeed = 1.2;
+  controls.minDistance = 50;
+  controls.maxDistance = 3000;
+  controls.minPolarAngle = Math.PI * 0.25;
+  controls.maxPolarAngle = Math.PI * 0.75;
 
-function buildEdgeGeometry() {
-  const visibleEdges = graphEdges.filter(e => activeEdgeTypes.has(e.type));
-  if (visibleEdges.length === 0) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute([], 3));
-    geo.setAttribute('color', new THREE.Float32BufferAttribute([], 3));
-    return new THREE.LineSegments(geo, new THREE.LineBasicMaterial());
-  }
-
-  const positions = new Float32Array(visibleEdges.length * 6);
-  const colors = new Float32Array(visibleEdges.length * 6);
-
-  for (let i = 0; i < visibleEdges.length; i++) {
-    const e = visibleEdges[i];
-    const si = nodeById.get(e.source);
-    const ti = nodeById.get(e.target);
-    if (si === undefined || ti === undefined) continue;
-    const s = graphNodes[si], t = graphNodes[ti];
-
-    positions[i * 6] = s.x; positions[i * 6 + 1] = s.y; positions[i * 6 + 2] = s.z;
-    positions[i * 6 + 3] = t.x; positions[i * 6 + 4] = t.y; positions[i * 6 + 5] = t.z;
-
-    let edgeColor;
-    if (e.type === 'FEELS_ABOUT') {
-      edgeColor = e.sentiment > 0.3 ? 0x6ac47a : e.sentiment < -0.3 ? 0xe05555 : 0x7a8594;
-    } else if (e.type === 'CAUSED') {
-      edgeColor = 0xFF5841;
-    } else if (e.type === 'CONTAINS_EVENT') {
-      edgeColor = 0xFF5841;
-    } else {
-      edgeColor = 0x333333;
-    }
-    const c = new THREE.Color(edgeColor);
-    colors[i * 6] = c.r; colors[i * 6 + 1] = c.g; colors[i * 6 + 2] = c.b;
-    colors[i * 6 + 3] = c.r; colors[i * 6 + 4] = c.g; colors[i * 6 + 5] = c.b;
-  }
-
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-
-  const material = new THREE.LineBasicMaterial({
-    vertexColors: true,
-    transparent: true,
-    opacity: 0.07,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-  });
-
-  return new THREE.LineSegments(geo, material);
-}
-
-// ── Character labels (CSS2D) ────────────────────────────────────
-
-function buildCharacterLabels() {
-  // Remove old labels
-  for (const obj of charLabelObjects) {
-    if (obj.parent) obj.parent.remove(obj);
-    if (obj.element && obj.element.parentNode) {
-      obj.element.parentNode.removeChild(obj.element);
-    }
-  }
-  charLabelObjects = [];
-
-  // Sort characters by degree (most connected first) for label priority
-  const chars = graphNodes
-    .filter(n => n.type === 'character')
-    .sort((a, b) => b.degree - a.degree);
-
-  for (const n of chars) {
-    const div = document.createElement('div');
-    div.className = 'node-label-3d';
-    div.textContent = n.label || n.fullLabel || '';
-    const labelObj = new CSS2DObject(div);
-    labelObj.position.set(n.x, n.y - n.pointSize * 0.3, n.z);
-    labelObj.userData = { degree: n.degree, nodeId: n.id };
-    scene.add(labelObj);
-    charLabelObjects.push(labelObj);
-  }
-}
-
-// Label collision avoidance — hide labels that overlap higher-priority ones.
-// Runs every ~200ms in the animation loop (not every frame — DOM is slow).
-let lastLabelCull = 0;
-function cullOverlappingLabels() {
-  const now = performance.now();
-  if (now - lastLabelCull < 200) return;
-  lastLabelCull = now;
-
-  // Already sorted by priority (degree) from buildCharacterLabels
-  const occupied = [];
-  for (const labelObj of charLabelObjects) {
-    const el = labelObj.element;
-    if (!el || !el.parentNode) continue;
-
-    // Temporarily show to measure
-    el.style.visibility = 'visible';
-    const rect = el.getBoundingClientRect();
-
-    // Check distance from camera — hide labels that are too far
-    const dist = camera.position.distanceTo(labelObj.position);
-    if (dist > 1200) {
-      el.style.visibility = 'hidden';
-      continue;
-    }
-
-    // Check overlap with already-placed labels
-    const overlaps = occupied.some(r =>
-      rect.left < r.right + 4 && rect.right > r.left - 4 &&
-      rect.top < r.bottom + 2 && rect.bottom > r.top - 2
-    );
-
-    if (overlaps) {
-      el.style.visibility = 'hidden';
-    } else {
-      occupied.push(rect);
-    }
-  }
-}
-
-// ── Highlight / reset ───────────────────────────────────────────
-
-function highlightNode(idx) {
-  if (!nodePointsMesh) return;
-  const colors = nodePointsMesh.geometry.attributes.color;
-  // Brighten to white
-  colors.array[idx * 3] = 1.0;
-  colors.array[idx * 3 + 1] = 1.0;
-  colors.array[idx * 3 + 2] = 1.0;
-  colors.needsUpdate = true;
-}
-
-function resetHighlights() {
-  if (!nodePointsMesh) return;
-  const colors = nodePointsMesh.geometry.attributes.color;
-  const base = nodePointsMesh.geometry.userData.baseColors;
-  if (!base) return;
-  for (let i = 0; i < base.length; i++) {
-    colors.array[i] = base[i];
-  }
-  colors.needsUpdate = true;
-}
-
-// ── Mouse interaction ───────────────────────────────────────────
-
-function onMouseMove(event) {
-  const container = document.getElementById('cy');
-  const rect = container.getBoundingClientRect();
-  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-  raycaster.setFromCamera(mouse, camera);
-
-  const label = document.getElementById('hover-label');
-
-  if (!nodePointsMesh || graphNodes.length === 0) {
-    label.style.display = 'none';
-    return;
-  }
-
-  const intersects = raycaster.intersectObject(nodePointsMesh);
-
-  if (intersects.length > 0) {
-    // Pick the largest/most important node among hits — characters
-    // have huge glow radius so small nodes inside their halo get
-    // picked first by distance. Sort by pointSize descending instead.
-    intersects.sort((a, b) => {
-      const na = graphNodes[a.index], nb = graphNodes[b.index];
-      return (nb.pointSize || 0) - (na.pointSize || 0);
-    });
-    const idx = intersects[0].index;
-    const node = graphNodes[idx];
-    label.textContent = node.fullLabel || node.label || node.id;
-    label.style.display = 'block';
-    label.style.left = (event.clientX - rect.left + 12) + 'px';
-    label.style.top = (event.clientY - rect.top - 8) + 'px';
-    container.style.cursor = 'pointer';
-
-    if (hoverIndex !== idx) {
-      resetHighlights();
-      hoverIndex = idx;
-      highlightNode(idx);
-    }
-  } else {
-    label.style.display = 'none';
-    container.style.cursor = 'grab';
-    if (hoverIndex >= 0) {
-      resetHighlights();
-      hoverIndex = -1;
-    }
-  }
-}
-
-function onClick(event) {
-  const container = document.getElementById('cy');
-  const rect = container.getBoundingClientRect();
-  const clickMouse = new THREE.Vector2(
-    ((event.clientX - rect.left) / rect.width) * 2 - 1,
-    -((event.clientY - rect.top) / rect.height) * 2 + 1
+  // Add bloom post-processing
+  const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(container.clientWidth, container.clientHeight),
+    1.5,   // strength
+    0.5,   // radius
+    0.1    // threshold
   );
+  graph.postProcessingComposer().addPass(bloomPass);
 
-  raycaster.setFromCamera(clickMouse, camera);
-
-  if (!nodePointsMesh || graphNodes.length === 0) {
-    hideDetailPanel();
-    return;
-  }
-
-  const intersects = raycaster.intersectObject(nodePointsMesh);
-  if (intersects.length > 0) {
-    intersects.sort((a, b) => {
-      const na = graphNodes[a.index], nb = graphNodes[b.index];
-      return (nb.pointSize || 0) - (na.pointSize || 0);
-    });
-    const idx = intersects[0].index;
-    const node = graphNodes[idx];
-    showDetailPanel(node);
-    flyToNode(node);
-  } else {
-    hideDetailPanel();
-  }
-}
-
-// ── Animation loop ──────────────────────────────────────────────
-
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-
-  // Gentle ambient drift (skip if reduced motion)
-  if (!reducedMotion && nodePointsMesh && graphNodes.length > 0) {
-    time += 0.001;
-    const pos = nodePointsMesh.geometry.attributes.position;
-    for (let i = 0; i < graphNodes.length; i++) {
-      const n = graphNodes[i];
-      const drift = 0.15;
-      pos.array[i * 3] = n.x + Math.sin(time + n.x * 0.01) * drift;
-      pos.array[i * 3 + 1] = n.y + Math.cos(time + n.y * 0.01) * drift;
-      pos.array[i * 3 + 2] = n.z + Math.sin(time * 0.7 + n.z * 0.01) * drift;
-    }
-    pos.needsUpdate = true;
-  }
-
-  cullOverlappingLabels();
-  composer.render();
-  labelRenderer.render(scene, camera);
+  // Handle resize for bloom pass and label renderer
+  window.addEventListener('resize', () => {
+    bloomPass.resolution.set(container.clientWidth, container.clientHeight);
+    labelRenderer.setSize(container.clientWidth, container.clientHeight);
+  });
 }
 
 // ── Data loading ────────────────────────────────────────────────
@@ -654,19 +320,18 @@ async function loadChatFilterOptions() {
 // ── Graph rendering ─────────────────────────────────────────────
 
 async function renderGraph(data) {
-  // Clear previous geometry
-  if (nodePointsMesh) { scene.remove(nodePointsMesh); nodePointsMesh = null; }
-  if (edgeLinesMesh) { scene.remove(edgeLinesMesh); edgeLinesMesh = null; }
+  // Clear old character label objects
   for (const obj of charLabelObjects) {
     if (obj.parent) obj.parent.remove(obj);
+    if (obj.element && obj.element.parentNode) {
+      obj.element.parentNode.removeChild(obj.element);
+    }
   }
   charLabelObjects = [];
 
   // Build valid node set
-  const nodeIds = new Set(data.nodes.map((n) => n.id));
-  const validEdges = data.edges.filter(
-    (e) => nodeIds.has(e.source) && nodeIds.has(e.target),
-  );
+  const nodeIds = new Set(data.nodes.map(n => n.id));
+  const validEdges = data.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
 
   // Connection counts
   const connectionCount = new Map();
@@ -675,92 +340,61 @@ async function renderGraph(data) {
     connectionCount.set(e.target, (connectionCount.get(e.target) || 0) + 1);
   }
 
-  // Build graphNodes
-  graphNodes = [];
-  nodeById = new Map();
+  // Build nodes for 3d-force-graph
+  const nodes = data.nodes
+    .filter(n => n.type !== 'rp_group')
+    .map(n => {
+      const degree = connectionCount.get(n.id) || 0;
+      const significance = n.metadata?.significance || n.metadata?.importance || 3;
+      const isPC = n.metadata?.is_player_character ?? false;
+      return {
+        ...n.metadata,
+        id: n.id,
+        label: n.type === 'character' ? (n.label || '') : '',
+        fullLabel: n.label || '',
+        type: n.type,
+        degree,
+        significance,
+        isPC,
+        avatarUrl: n.type === 'character' ? avatarUrlFor(n.label || '') : undefined,
+      };
+    });
 
-  for (let i = 0; i < data.nodes.length; i++) {
-    const node = data.nodes[i];
-    if (node.type === 'rp_group') continue; // Skip compound parent nodes
-
-    const degree = connectionCount.get(node.id) || 0;
-    const significance = node.metadata?.significance || node.metadata?.importance || 3;
-    const fullLabel = node.label || "";
-    const label = node.type === 'character' ? fullLabel : "";
-    const isPC = node.metadata?.is_player_character ?? false;
-    const color = nodeColor(node.type, significance, isPC);
-    const pointSize = nodePointSize(node.type, degree, significance, isPC);
-
-    const gn = {
-      ...node.metadata,
-      id: node.id,
-      label,
-      fullLabel,
-      type: node.type,
-      color,
-      pointSize,
-      degree,
-      significance,
-      isPC: node.metadata?.is_player_character ?? false,
-      avatarUrl: node.type === 'character' ? avatarUrlFor(fullLabel) : undefined,
-    };
-
-    nodeById.set(node.id, graphNodes.length);
-    graphNodes.push(gn);
-  }
-
-  // Build graphEdges
-  graphEdges = validEdges.map(edge => ({
-    id: edge.id,
-    source: edge.source,
-    target: edge.target,
-    type: edge.type,
-    label: edge.label || "",
-    sentiment: edge.sentiment ?? 0,
-    intensity: edge.intensity ?? 0.5,
+  // Build links for 3d-force-graph
+  const links = validEdges.map(e => ({
+    id: e.id,
+    source: e.source,
+    target: e.target,
+    type: e.type,
+    label: e.label || '',
+    sentiment: e.sentiment ?? 0,
+    intensity: e.intensity ?? 0.5,
   }));
 
-  // Build adjacency map
+  // Store references for detail panel and search
+  graphNodes = nodes;
+  graphEdges = links;
+  nodeById = new Map(nodes.map((n, i) => [n.id, i]));
   adjacency = new Map();
-  for (const e of graphEdges) {
+  for (const e of links) {
     const si = nodeById.get(e.source);
     const ti = nodeById.get(e.target);
     if (si === undefined || ti === undefined) continue;
-
     if (!adjacency.has(e.source)) adjacency.set(e.source, []);
-    adjacency.get(e.source).push({ edge: e, neighborId: e.target, neighborData: graphNodes[ti] });
-
+    adjacency.get(e.source).push({ edge: e, neighborId: e.target, neighborData: nodes[ti] });
     if (!adjacency.has(e.target)) adjacency.set(e.target, []);
-    adjacency.get(e.target).push({ edge: e, neighborId: e.source, neighborData: graphNodes[si] });
+    adjacency.get(e.target).push({ edge: e, neighborId: e.source, neighborData: nodes[si] });
   }
 
-  // Run force layout
-  console.log(`[ChronicleDB] Running force layout on ${graphNodes.length} nodes, ${graphEdges.length} edges...`);
-  const layoutStart = performance.now();
-  await runForceLayout(graphNodes, graphEdges);
-  console.log(`[ChronicleDB] Layout complete in ${((performance.now() - layoutStart) / 1000).toFixed(1)}s`);
+  console.log(`[ChronicleDB] Feeding ${nodes.length} nodes, ${links.length} links to 3d-force-graph`);
 
-  // Build Three.js objects
-  nodePointsMesh = buildNodeGeometry();
-  scene.add(nodePointsMesh);
-
-  edgeLinesMesh = buildEdgeGeometry();
-  scene.add(edgeLinesMesh);
-
-  buildCharacterLabels();
-
-  // Center camera on graph
-  if (graphNodes.length > 0) {
-    let cx = 0, cy = 0, cz = 0;
-    for (const n of graphNodes) { cx += n.x; cy += n.y; cz += n.z; }
-    cx /= graphNodes.length; cy /= graphNodes.length; cz /= graphNodes.length;
-    controls.target.set(cx, cy, cz);
-    camera.position.set(cx, cy, cz + DEFAULT_CAMERA_Z);
-    controls.update();
-  }
+  // Feed to 3d-force-graph — it handles layout automatically via d3-force-3d
+  graph
+    .graphData({ nodes, links })
+    .linkVisibility(link => activeEdgeTypes.has(link.type));
 
   // Yield a frame so the loading spinner can dismiss
-  await new Promise((r) => requestAnimationFrame(r));
+  await new Promise(r => requestAnimationFrame(r));
 }
 
 function showLoading(visible) {
@@ -804,7 +438,6 @@ async function showDetailPanel(data) {
   // Connected nodes via adjacency map
   const neighbors = adjacency.get(data.id) || [];
   if (neighbors.length > 0) {
-    // Group by edge type, dedupe by (type, neighbor_id)
     const groups = new Map();
     const seenByType = new Map();
 
@@ -827,7 +460,6 @@ async function showDetailPanel(data) {
       });
     }
 
-    // Sort PARTICIPATED_IN events by significance (descending)
     if (groups.has("PARTICIPATED_IN")) {
       groups.get("PARTICIPATED_IN").sort((a, b) => (b.significance || 0) - (a.significance || 0));
     }
@@ -868,7 +500,6 @@ async function showDetailPanel(data) {
 
   // ── Story Arcs section (character nodes) ─────────────────────
   if (data.type === "character") {
-    // Find events this character participated in
     const charEventIds = new Set();
     const myNeighbors = adjacency.get(data.id) || [];
     for (const { edge, neighborId, neighborData } of myNeighbors) {
@@ -877,7 +508,6 @@ async function showDetailPanel(data) {
       }
     }
 
-    // Find arcs that contain any of those events
     const arcs = [];
     const seenArcs = new Set();
     for (let i = 0; i < graphNodes.length; i++) {
@@ -1039,15 +669,19 @@ async function selectCharacter(name) {
   });
   document.getElementById("btn-show-all").classList.remove("active");
   await loadGraphData("character", { character: name, depth: 3 });
-  // Fly camera to the selected character — try name match, fall back to
-  // highest-degree character node (the selected character is typically
-  // the most-connected node in their scoped subgraph)
-  flyToNode(name);
-  if (!graphNodes.find(n => (n.fullLabel || '').toLowerCase().includes(name.toLowerCase()))) {
-    const bestChar = graphNodes
-      .filter(n => n.type === 'character')
-      .sort((a, b) => b.degree - a.degree)[0];
-    if (bestChar) flyToNode(bestChar);
+
+  // Find the character node and fly to it
+  const nameLower = name.toLowerCase();
+  const charNode = graphNodes.find(n =>
+    (n.fullLabel || '').toLowerCase().includes(nameLower)
+  ) || graphNodes.filter(n => n.type === 'character').sort((a, b) => b.degree - a.degree)[0];
+
+  if (charNode) {
+    graph.cameraPosition(
+      { x: charNode.x, y: charNode.y, z: charNode.z + 200 },
+      charNode,
+      1500
+    );
   }
 }
 
@@ -1079,42 +713,7 @@ function initEdgeChips() {
 }
 
 function applyEdgeFilter() {
-  if (edgeLinesMesh) scene.remove(edgeLinesMesh);
-  edgeLinesMesh = buildEdgeGeometry();
-  scene.add(edgeLinesMesh);
-}
-
-// ── Camera fly-to ──────────────────────────────────────────────
-
-function flyToNode(nodeOrName) {
-  let target;
-  if (typeof nodeOrName === 'string') {
-    const nameLower = nodeOrName.toLowerCase();
-    // Try exact match first, then includes, then character type match
-    target = graphNodes.find(n =>
-      (n.fullLabel || n.label || '').toLowerCase() === nameLower
-    ) || graphNodes.find(n =>
-      (n.fullLabel || n.label || '').toLowerCase().includes(nameLower)
-    ) || graphNodes.find(n =>
-      n.type === 'character' && nameLower.includes((n.fullLabel || n.label || '').toLowerCase())
-    );
-  } else {
-    target = nodeOrName;
-  }
-  if (!target) {
-    console.warn('[ChronicleDB] flyToNode: no match for', nodeOrName);
-    return;
-  }
-  const targetPos = new THREE.Vector3(target.x, target.y, target.z);
-  const camDist = 250;
-  const camTarget = targetPos.clone().add(new THREE.Vector3(0, 0, camDist));
-  const animate = () => {
-    const d = controls.target.distanceTo(targetPos);
-    controls.target.lerp(targetPos, 0.1);
-    camera.position.lerp(camTarget, 0.1);
-    if (d > 2) requestAnimationFrame(animate);
-  };
-  animate();
+  graph.linkVisibility(link => activeEdgeTypes.has(link.type));
 }
 
 // ── Search ──────────────────────────────────────────────────────
@@ -1124,7 +723,12 @@ function searchAndFocus(query) {
     (n.fullLabel || n.label || '').toLowerCase().includes(query)
   );
   if (matches.length > 0) {
-    flyToNode(matches[0]);
+    const node = matches[0];
+    graph.cameraPosition(
+      { x: node.x, y: node.y, z: node.z + 200 },
+      node,
+      1500
+    );
   }
   return matches.length;
 }
@@ -1134,46 +738,23 @@ function searchAndFocus(query) {
 function initToolbar() {
   document.getElementById("btn-show-all").addEventListener("click", clearCharacterSelection);
 
-  // Fit: reset camera to default
+  // Fit: reset camera to default — zoom to fit all nodes
   document.getElementById("btn-fit").addEventListener("click", () => {
-    const animateFit = () => {
-      const target = new THREE.Vector3(0, 0, 0);
-      const camPos = new THREE.Vector3(0, 0, DEFAULT_CAMERA_Z);
-      const d1 = controls.target.distanceTo(target);
-      const d2 = camera.position.distanceTo(camPos);
-      controls.target.lerp(target, 0.12);
-      camera.position.lerp(camPos, 0.12);
-      if (d1 > 1 || d2 > 1) requestAnimationFrame(animateFit);
-    };
-    animateFit();
+    graph.zoomToFit(600, 40);
   });
 
-  // Re-layout
-  document.getElementById("btn-layout").addEventListener("click", async () => {
+  // Re-layout: reheat the simulation
+  document.getElementById("btn-layout").addEventListener("click", () => {
     if (graphNodes.length === 0) return;
-    showLoading(true);
-    // Yield a frame so the spinner renders
-    await new Promise(r => requestAnimationFrame(r));
-
-    await runForceLayout(graphNodes, graphEdges);
-
-    // Rebuild geometry
-    if (nodePointsMesh) scene.remove(nodePointsMesh);
-    nodePointsMesh = buildNodeGeometry();
-    scene.add(nodePointsMesh);
-
-    if (edgeLinesMesh) scene.remove(edgeLinesMesh);
-    edgeLinesMesh = buildEdgeGeometry();
-    scene.add(edgeLinesMesh);
-
-    buildCharacterLabels();
-    showLoading(false);
+    // Clear fixed positions so force sim can re-arrange
+    graphNodes.forEach(n => { n.fx = undefined; n.fy = undefined; n.fz = undefined; });
+    graph.d3ReheatSimulation();
   });
 
   // Export PNG
   document.getElementById("btn-export").addEventListener("click", () => {
-    // Render one clean frame
-    composer.render();
+    const renderer = graph.renderer();
+    graph.postProcessingComposer().render();
     const dataUrl = renderer.domElement.toDataURL('image/png');
     const link = document.createElement("a");
     link.download = "chronicledb-graph.png";
@@ -1191,9 +772,6 @@ function initToolbar() {
     searchDebounce = setTimeout(() => {
       searchDebounce = null;
       const query = e.target.value.toLowerCase().trim();
-
-      // Reset highlights
-      resetHighlights();
 
       if (!query) {
         if (searchCount) searchCount.textContent = "";
@@ -1232,7 +810,7 @@ function initToolbar() {
 // ── Init ────────────────────────────────────────────────────────
 
 (async function bootstrap() {
-  initThreeJS();
+  initGraph();
   initEdgeChips();
   initToolbar();
   await Promise.all([loadCharacterSidebar(), loadChatFilterOptions()]);

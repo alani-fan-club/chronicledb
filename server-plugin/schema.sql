@@ -129,12 +129,10 @@ CREATE INDEX IF NOT EXISTS idx_knows_chat ON knows (chat_id);
 -- at `knows_character_id_fact_id_key`; the new one is explicitly named
 -- knows_char_fact_chat_uniq so upsertFact's ON CONFLICT can target it.
 --
--- We do NOT wrap this in a DO $$ ... END $$; block because the naive
--- schema loader in db.js::initSchema strips `--` comments then splits
--- the file on `;`, which would shatter a DO block mid-statement. The
--- loader's per-statement try/catch swallows "already exists" errors,
--- so ADD CONSTRAINT is idempotent across reboots once the new one is
--- on the table. DROP CONSTRAINT IF EXISTS is idempotent on its own.
+-- ADD CONSTRAINT has no IF NOT EXISTS form, so we wrap it in a DO block
+-- that checks pg_constraint first. Required because db.js::initSchema
+-- now runs the schema as one multi-statement query — a non-idempotent
+-- failure here would abort every statement that follows.
 --
 -- Why this matters: with the old (character_id, fact_id) key, a fact
 -- learned by the same character in two different chats could only
@@ -142,8 +140,16 @@ CREATE INDEX IF NOT EXISTS idx_knows_chat ON knows (chat_id);
 -- which made the C2 fix in getKnowledgeBoundaries silently drop
 -- multi-chat facts from the second chat's view.
 ALTER TABLE knows DROP CONSTRAINT IF EXISTS knows_character_id_fact_id_key;
-ALTER TABLE knows ADD CONSTRAINT knows_char_fact_chat_uniq
-    UNIQUE (character_id, fact_id, chat_id);
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'knows_char_fact_chat_uniq'
+      AND conrelid = 'knows'::regclass
+  ) THEN
+    ALTER TABLE knows ADD CONSTRAINT knows_char_fact_chat_uniq
+      UNIQUE (character_id, fact_id, chat_id);
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS participated_in (
     id           SERIAL PRIMARY KEY,

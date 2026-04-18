@@ -95,12 +95,25 @@ const EXTRACTION_PROMPT = `You are a narrative analyst for a roleplay memory sys
 
 Each message has a speaker and content. Some are from the user (player), others from AI characters or narrators.
 
+OVERALL CAPS — be aggressive about NOT emitting. The user has explicitly
+asked for slim, summary-level extraction; this memory store gets polluted
+fast and has to be cleaned by hand if you over-extract. Per BATCH
+(typically 5 messages), aim for AT MOST:
+  - ≤ 5 events total (only significance ≥ 3; mundane beats are noise)
+  - ≤ 2 plot_threads total (only genuinely NEW unresolved tensions)
+  - ≤ 3 NEW persistent_traits per character (only previously-unseen
+    dispositions; do NOT re-emit traits the character already had)
+  - ≤ 5 relationships total (only when sentiment/intensity meaningfully
+    changes or a brand-new pair interacts for the first time)
+When in doubt, EMIT NOTHING for that field. Empty arrays are correct
+answers most of the time.
+
 Extract:
-1. **Characters** — Extract EVERY named character that appears, no matter how minor.
-   This includes: protagonists, antagonists, walk-ons, servers, drivers, guards,
-   passersby, characters mentioned in dialogue, characters in flashbacks. If a
-   name appears, the character gets a node. Do NOT filter by importance — the
-   graph filters at query time, not extraction time.
+1. **Characters** — Extract characters who SPEAK or TAKE ACTION in this batch,
+   plus characters who are the explicit subject of dialogue. SKIP one-line
+   walk-ons (random servers, drivers, passersby) unless they're plot-relevant.
+   Reuse names from the "Known entities" list verbatim — don't introduce
+   spelling/casing variants of characters that already exist.
 
    For each character, also extract:
    - **aliases**: alternate forms of the name. E.g., a character named "Alex
@@ -157,9 +170,14 @@ Extract:
      * Each entry is **one fact** — don't emit "brave, loyal, and
        protective" as a single row; that's three separate entries.
      * **Bias STRONGLY toward not emitting.** If you're unsure whether
-       something is a trait or a mood, it's a mood — put it in
-       scene_state or drop it. Emit 3-5 very confident persistent
-       traits per character per batch rather than 15 maybe-traits.
+       something is a trait or a mood, drop it. Emit AT MOST 3 NEW traits
+       per character per batch — and only if the character does not
+       already have that trait or a near-synonym in the "Known entities"
+       list. Re-emitting an existing trait is wasted output.
+     * If the character already has 5+ traits known to the system, only
+       emit a NEW trait when the current passage reveals a major,
+       genuinely surprising disposition (e.g. revealing they're a former
+       assassin). Otherwise emit zero traits for that character.
      * **Every trait MUST come with an evidence_sentence**: one
        sentence drawn verbatim from the passage (lightly cleaned is OK:
        strip dialogue tags, redundant framing, and he-said/she-said
@@ -223,30 +241,37 @@ Extract:
    A passage mentions "the bartender set down a drink" — extract the bartender
    as a character even if she has one line. Extract "the doorman" even if he
    is only named in passing.
-2. **Relationships** — how characters feel about each other (sentiment -1.0 to 1.0, intensity 0-1, evidence)
-3. **Events** — things that happened, with significance. For each event, also
-   capture **source_quote**: the most distinctive 1-2 sentences from the
-   passage, copied VERBATIM. Include dialogue if any. This is the actual line
-   that justifies the event existing — preserve it exactly so we can quote it
-   back later. If no specific quote captures it (pure narration), include the
-   single most narratively load-bearing sentence verbatim.
+2. **Relationships** — Cap: ≤ 5 per BATCH. Only emit when a pair INTERACTS
+   in this batch AND the sentiment/intensity meaningfully changes from
+   what's already known, OR they meet for the first time. Don't re-emit
+   the same neutral relationship every batch.
+3. **Events** — Cap: ≤ 5 events per BATCH (5 messages), and ONLY events at
+   significance ≥ 3. Skip flavor beats and small gestures entirely; do not
+   emit them as significance-1 or 2 — leave the array short. Prefer ONE
+   summary event per scene to many granular ones.
+   For each event, capture **source_quote**: the most distinctive 1-2
+   sentences from the passage, copied VERBATIM. Include dialogue if any.
    Also capture **world_time** per event: optional, any in-world time marker
    for this moment, natural language like "the next morning" or "three hours
    later" or null if none. Null is the expected default — only populate when
    the prose itself names a time shift or time-of-day.
-   CRITICAL: major events (4-5) are the load-bearing plot beats — only mark something major if it would appear in a summary of the whole chapter:
-   - 5 = defining moment (major plot beat, character revelation, death, transformation, confession, betrayal)
-   - 4 = important development (confrontation, decision, significant reveal, first meeting, turning point)
-   - 3 = meaningful action (argument, bonding moment, notable action with consequences)
-   - 2 = minor beat (small gesture, casual dialogue with some weight)
-   - 1 = flavor detail (background action, mundane interaction, transitional scene)
-   Be strict about 4-5. In a typical batch you'll have 1-3 major events at most, many minor ones.
+   Significance scale (only emit ≥3):
+   - 5 = defining moment (major plot beat, revelation, death, betrayal)
+   - 4 = important development (confrontation, decision, first meeting, turning point)
+   - 3 = meaningful action with downstream consequences
+   In a typical batch expect 0-3 events. Five is a hard ceiling reached only
+   in dense plot-heavy batches.
 4. **Event chains** — when one event directly causes, triggers, or leads to another. Think causally: "X caused Y", "Because of A, B happened". Only chain events that have a clear causal link.
 5. **Location transitions** — movement between two named locations mentioned in this batch, as a character going from A to B. Empty if none. Do not invent locations that aren't explicitly in the prose.
 6. **World state** — environmental/setting changes (key-value)
 7. **Knowledge updates** — what each character learned AND what they explicitly do not know
 8. **Context snapshot** — a summary of the current scene state: who is present, where, emotional tone, what's happening
-9. **Plot threads** — foreshadowing, pending events, unresolved tensions, promises, threats. Mark if a prior thread got resolved.
+9. **Plot threads** — Cap: ≤ 2 per BATCH, only NEW unresolved tensions. Do
+   NOT re-emit a thread that's already in the system (the existing list
+   you don't see is large; assume any obvious tension is already tracked).
+   If you're about to write a thread that's a slight rewording of a
+   tension involving the same characters and same setting, skip. Mark
+   prior threads as resolved when they actually resolve.
 
 RULES:
 - Only attribute knowledge to characters who were PRESENT and could perceive it
@@ -1138,13 +1163,13 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
     }
 
     const description = persistentTraits.map((t) => (t && t.content) || "").filter(Boolean).join("; ");
-    await db.upsertCharacter(settings, {
+    const charId = await db.upsertCharacter(settings, {
       name: char.name,
       aliases: char.aliases || [],
       description,
       firstSeen: safeChat,
+      chatId: safeChat,
     });
-    const charId = db.slugify(char.name);
     if (char.role || char.status || char.significance) {
       const p = db.getPool(settings);
       await p.query(
@@ -1393,18 +1418,25 @@ async function applyExtractionToGraph(settings, { extraction, chatId, charName, 
     if (snap.location && snap.present_characters?.length > 0) {
       const locationId = await db.upsertLocation(settings, snap.location, "");
       const p = db.getPool(settings);
-      const charIds = snap.present_characters.map((n) => db.slugify(n));
+      // Resolve every present-character to its (possibly chat-scoped) id
+      // first, then use the resolved set to clear+insert presence. Cannot
+      // pre-compute via slugify any more — chat-scoped rows have a hashed
+      // prefix that slugify alone doesn't produce.
+      const resolvedCharIds = [];
+      for (const presentName of snap.present_characters) {
+        resolvedCharIds.push(
+          await db.upsertCharacter(settings, { name: presentName, chatId: safeChat }),
+        );
+      }
       // Only clear presence within THIS chat so a character present in
       // chat A doesn't get kicked out of their location in chat B when
       // chat A's extraction fires.
       await p.query(
         `UPDATE present_at SET is_current = FALSE
          WHERE character_id = ANY($1::text[]) AND chat_id = $2`,
-        [charIds, safeChat],
+        [resolvedCharIds, safeChat],
       ).catch(() => {});
-      for (const presentName of snap.present_characters) {
-        const pCharId = db.slugify(presentName);
-        await db.upsertCharacter(settings, { name: presentName });
+      for (const pCharId of resolvedCharIds) {
         await p.query(
           `INSERT INTO present_at (character_id, location_id, is_current, chat_id) VALUES ($1, $2, TRUE, $3)`,
           [pCharId, locationId, safeChat],

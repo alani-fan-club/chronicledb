@@ -10,6 +10,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.4.4",
     "cytoscape": "^3.30.4",
     "express": "^4.21.1",
     "openai": "^4.77.0",

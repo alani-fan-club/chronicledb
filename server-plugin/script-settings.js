@@ -1,6 +1,6 @@
 const { existsSync, readFileSync } = require("fs");
 const { resolve, join } = require("path");
-const { Pool } = require("pg");
+const { buildClient } = require("./db/client");
 const dotenv = require("dotenv");
 
 const DEFAULT_CONFIG_PATH = resolve(__dirname, "..", "chronicledb.config.json");
@@ -85,13 +85,10 @@ function loadScriptSettings(options) {
 }
 
 function createPoolFromSettings(settings) {
-  return new Pool({
-    host: settings.pgHost,
-    port: settings.pgPort,
-    database: settings.pgDatabase,
-    user: settings.pgUser || resolveDefaultPgUser(),
-    password: settings.pgPassword || "",
-  });
+  // Returns a backend-agnostic client adapter (PGlite or pg.Pool)
+  // matching the .query / .connect / .end surface. Kept named
+  // createPoolFromSettings for back-compat with CLI/test callers.
+  return buildClient(settings);
 }
 
 module.exports = {

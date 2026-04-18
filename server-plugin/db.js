@@ -1,9 +1,9 @@
-const { Pool } = require("pg");
 const { readFileSync } = require("fs");
 const { resolve } = require("path");
 const { createHash } = require("crypto");
 const { GOLDBERG_100, NRC_EMOTION, NRC_VAD } = require("../shared/trait-lexicons");
 const { setWithBoundedEviction } = require("./bounded-map");
+const { buildClient, isEmbeddedBackend, describeBackend } = require("./db/client");
 const { createRetrievalDomain } = require("./db/retrieval-domain");
 const { createGraphDomain } = require("./db/graph-domain");
 const { createCharacterPanelDomain } = require("./db/character-panel-domain");
@@ -36,22 +36,17 @@ function contentId(prefix, key) {
 }
 
 function getPool(settings) {
-  const configHash = `${settings.pgHost}:${settings.pgPort}:${settings.pgDatabase}:${settings.pgUser}`;
+  // configHash captures every input that would force a new client:
+  // the backend choice (embedded vs external), the embedded data dir,
+  // and the external connection coordinates. Changing any of these
+  // through the settings UI tears the old client down and rebuilds.
+  const configHash = isEmbeddedBackend(settings)
+    ? `embedded:${settings.embeddedDataDir || ""}`
+    : `external:${settings.pgHost}:${settings.pgPort}:${settings.pgDatabase}:${settings.pgUser}`;
   if (!pool || configHash !== poolConfigHash) {
     if (pool) pool.end().catch(() => {});
     poolConfigHash = configHash;
-    pool = new Pool({
-      host: settings.pgHost || "localhost",
-      port: settings.pgPort || 5432,
-      database: settings.pgDatabase || "chronicledb",
-      user: settings.pgUser || process.env.USER,
-      password: settings.pgPassword || "",
-      // traverseFromCharacter fans out ~15 concurrent queries via Promise.all,
-      // and extractor.js runs parallel upsertTrait per character on top of it.
-      // 20 gives headroom for the common fan-out; configurable for hosted
-      // Postgres deployments with stricter connection caps.
-      max: parseInt(settings.dbPoolMax, 10) || 20,
-    });
+    pool = buildClient(settings);
     pool.on("error", (err) => {
       try { poolErrorHandler(err); } catch (_) { /* swallowing ensures listener never throws */ }
     });
@@ -62,18 +57,20 @@ function getPool(settings) {
 async function initSchema(settings) {
   const p = getPool(settings);
   const raw = readFileSync(resolve(__dirname, "schema.sql"), "utf-8");
-  // Execute as a single multi-statement query via the simple query
-  // protocol. Every statement is idempotent (CREATE TABLE IF NOT EXISTS,
-  // CREATE INDEX IF NOT EXISTS, ALTER TABLE ... ADD COLUMN IF NOT EXISTS,
-  // DROP ... IF EXISTS), so no transaction wrapping is required.
+  // Execute as a single multi-statement batch. Every statement is
+  // idempotent (CREATE TABLE IF NOT EXISTS, CREATE INDEX IF NOT EXISTS,
+  // ALTER TABLE ... ADD COLUMN IF NOT EXISTS, DROP ... IF EXISTS, plus
+  // the DO block gating the H3 constraint), so no transaction wrapping.
+  // `.exec()` routes through the simple-query protocol on both backends
+  // so multi-statement SQL is handled correctly.
   try {
-    await p.query(raw);
+    await p.exec(raw);
   } catch (err) {
     if (!err.message.includes("already exists")) {
       console.warn(`[ChronicleDB] Schema warning: ${err.message}`);
     }
   }
-  console.log("[ChronicleDB] Schema initialized.");
+  console.log(`[ChronicleDB] Schema initialized — ${describeBackend(settings)}`);
 }
 
 // ── Node upserts ───────────────────────────────────────────────

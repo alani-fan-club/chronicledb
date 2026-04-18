@@ -14,7 +14,8 @@ DROP INDEX IF EXISTS idx_dialogue_quotes_chat_speaker;
 
 CREATE TABLE IF NOT EXISTS characters (
     id                TEXT PRIMARY KEY,
-    name              TEXT NOT NULL UNIQUE,
+    name              TEXT NOT NULL,
+    chat_id           TEXT,
     aliases           TEXT[] DEFAULT '{}',
     description       TEXT DEFAULT '',
     faction           TEXT,
@@ -26,6 +27,25 @@ CREATE TABLE IF NOT EXISTS characters (
     updated_at        TIMESTAMPTZ DEFAULT NOW(),
     summary_embedding vector(768)
 );
+
+-- Per-chat character scoping: drop the old global UNIQUE(name) and replace
+-- with UNIQUE(chat_id, name) NULLS NOT DISTINCT. NULL chat_id rows act as
+-- the legacy "global" characters; new extractions in a chat get a chat-
+-- scoped row keyed by the same (chat_id, name). NULLS NOT DISTINCT means
+-- only one global row per name (matching the prior semantics).
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS chat_id TEXT;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint
+             WHERE conname = 'characters_name_key' AND conrelid = 'characters'::regclass) THEN
+    ALTER TABLE characters DROP CONSTRAINT characters_name_key;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                 WHERE conname = 'characters_chat_name_uniq' AND conrelid = 'characters'::regclass) THEN
+    ALTER TABLE characters ADD CONSTRAINT characters_chat_name_uniq
+      UNIQUE NULLS NOT DISTINCT (chat_id, name);
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_characters_chat ON characters(chat_id);
 
 -- Per-character rollup embedding: mean-pool of dispositional trait embeddings
 -- for that character. Recomputed by recomputeCharacterSummary on trait

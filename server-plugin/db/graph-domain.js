@@ -1,11 +1,11 @@
-function createGraphDomain({ getPool, slugify }) {
+function createGraphDomain({ getPool, slugify, chatScopedId }) {
   /**
    * N-hop recursive traversal from a starting character.
    * Finds all connected entities within `depth` hops through any edge type.
    */
   async function traverseFromCharacter(settings, characterName, depth = 3, overrideChatIds) {
     const p = getPool(settings);
-    const startId = slugify(characterName);
+    const globalStartId = slugify(characterName);
 
     // If the caller provided an explicit chat scope (e.g. the mindmap is
     // filtering to the current chat), use it directly. Otherwise fall back to
@@ -15,28 +15,59 @@ function createGraphDomain({ getPool, slugify }) {
     if (Array.isArray(overrideChatIds) && overrideChatIds.length > 0) {
       chatIds = overrideChatIds;
     } else {
+      // Discover every chat this character has events in. Joins through
+      // participated_in via either the canonical name or any alias, which
+      // works for both global character rows (chr-{slug}) and the new
+      // per-chat variants (chr-{chatHash}-{slug}). Whitespace is
+      // collapsed on both sides so a card filename with double-spacing
+      // still matches a single-spaced canonical name in the DB.
       const { rows: chats } = await p.query(
-        `SELECT chat_file FROM ingestion_status WHERE character_name = $1 AND status = 'done'`,
+        `WITH n(target) AS (
+           SELECT lower(regexp_replace(trim($1), '\\s+', ' ', 'g'))
+         )
+         SELECT DISTINCT e.chat_id
+         FROM events e
+         JOIN participated_in pi ON pi.event_id = e.id
+         JOIN characters c ON c.id = pi.character_id
+         CROSS JOIN n
+         WHERE lower(regexp_replace(trim(c.name), '\\s+', ' ', 'g')) = n.target
+            OR EXISTS (
+              SELECT 1 FROM unnest(c.aliases) a
+              WHERE lower(regexp_replace(trim(a), '\\s+', ' ', 'g')) = n.target
+            )`,
         [characterName],
       );
-      chatIds = chats.map((c) => c.chat_file.replace(".jsonl", ""));
-
-      // Fallback: find session_ids that start with the character name
-      // (ST chat files are named "Character Name - date.jsonl")
-      if (chatIds.length === 0) {
-        const { rows: sessions } = await p.query(
-          `SELECT DISTINCT session_id FROM feels_about WHERE session_id LIKE $1
-           UNION
-           SELECT DISTINCT chat_id FROM events WHERE chat_id LIKE $1`,
-          [`${characterName}%`],
-        );
-        chatIds = sessions.map((s) => s.session_id).filter(Boolean);
-      }
+      chatIds = chats.map((c) => c.chat_id).filter(Boolean);
     }
 
     if (chatIds.length === 0) {
       return { nodes: [], edges: [] };
     }
+
+    // Resolve the requested character name to every actual character_id
+    // row that matches by canonical name or alias (whitespace-tolerant).
+    // Pure slugify(name) isn't enough: a name-variant merge can collapse
+    // chr-foo-bar into chr-foo, leaving the raw slugify pointing at a
+    // node that no longer exists and returning an empty walk. The
+    // chat-scoped variants are added in case any per-chat rows exist for
+    // the requested character. Duplicates are deduped.
+    const { rows: idRows } = await p.query(
+      `WITH n(target) AS (
+         SELECT lower(regexp_replace(trim($1), '\\s+', ' ', 'g'))
+       )
+       SELECT DISTINCT id FROM characters c CROSS JOIN n
+       WHERE lower(regexp_replace(trim(c.name), '\\s+', ' ', 'g')) = n.target
+          OR EXISTS (
+            SELECT 1 FROM unnest(c.aliases) a
+            WHERE lower(regexp_replace(trim(a), '\\s+', ' ', 'g')) = n.target
+          )`,
+      [characterName],
+    );
+    const startIds = Array.from(new Set([
+      globalStartId, // keep as ultimate fallback if no rows match
+      ...idRows.map((r) => r.id),
+      ...chatIds.map((cid) => chatScopedId(characterName, cid)),
+    ]));
 
     // Recursive CTE: walk through edges scoped to this character's chats
     const { rows } = await p.query(`
@@ -95,7 +126,7 @@ function createGraphDomain({ getPool, slugify }) {
         WHERE e1.chat_id = ANY($3)
       ),
       graph_walk AS (
-        SELECT $1::text as node_id, 'character'::text as node_type, 0 as hop
+        SELECT unnest($1::text[]) as node_id, 'character'::text as node_type, 0 as hop
         UNION
         SELECT ae.dst, ae.dst_type, gw.hop + 1
         FROM graph_walk gw
@@ -106,7 +137,7 @@ function createGraphDomain({ getPool, slugify }) {
       FROM graph_walk
       GROUP BY node_id, node_type
       ORDER BY hop, node_type
-    `, [startId, depth, chatIds]);
+    `, [startIds, depth, chatIds]);
 
     // Hydrate the node IDs into full objects
     const nodes = [];

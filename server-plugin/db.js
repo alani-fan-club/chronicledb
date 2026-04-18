@@ -82,6 +82,17 @@ function slugify(name) {
   return "chr-" + name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
+function chatScopedId(name, chatId) {
+  // Per-chat character IDs prevent cross-chat alias pollution. Existing
+  // global rows (chat_id IS NULL) keep their classic chr-{slug} ids; new
+  // characters extracted in a chat get a chat-hash prefix so two chats
+  // featuring the same name produce distinct rows.
+  const baseSlug = slugify(name);
+  if (!chatId) return baseSlug;
+  const hash = createHash("sha1").update(String(chatId)).digest("hex").slice(0, 6);
+  return `chr-${hash}-${baseSlug.slice(4)}`;
+}
+
 const {
   storeEmbedding,
   upsertMemoryEmbedding,
@@ -91,39 +102,62 @@ const {
 const {
   traverseFromCharacter,
   getGraphData,
-} = createGraphDomain({ getPool, slugify });
+} = createGraphDomain({ getPool, slugify, chatScopedId });
 
 const {
   getCharacterPanelStats,
   getCharacterRecentEvents,
   getCharacterOutboundRelationships,
-} = createCharacterPanelDomain({ getPool, slugify });
+} = createCharacterPanelDomain({ getPool, slugify, chatScopedId });
 
-async function upsertCharacter(settings, { name, aliases, description, firstSeen }) {
+async function upsertCharacter(settings, { name, aliases, description, firstSeen, chatId }) {
   const p = getPool(settings);
-  const id = slugify(name);
+  // If chatId is provided AND a global row already exists for this name,
+  // prefer the global row (legacy chats keep accumulating into it). New
+  // names in any chat go to chat-scoped rows. Brand-new chats with no
+  // pre-existing global character match start cleanly per-chat.
+  let id;
+  let effectiveChatId = chatId || null;
+  if (chatId) {
+    const { rows: existingGlobal } = await p.query(
+      `SELECT id FROM characters WHERE chat_id IS NULL AND name = $1 LIMIT 1`,
+      [name],
+    );
+    if (existingGlobal.length > 0) {
+      id = existingGlobal[0].id;
+      effectiveChatId = null;
+    } else {
+      id = chatScopedId(name, chatId);
+    }
+  } else {
+    id = slugify(name);
+  }
   await p.query(
-    `INSERT INTO characters (id, name, aliases, description, first_seen)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (id) DO UPDATE SET
+    `INSERT INTO characters (id, name, chat_id, aliases, description, first_seen)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT ON CONSTRAINT characters_chat_name_uniq DO UPDATE SET
        aliases = (
          SELECT array_agg(DISTINCT a)
          FROM unnest(characters.aliases || EXCLUDED.aliases) a
        ),
        description = COALESCE(NULLIF(EXCLUDED.description, ''), characters.description),
        updated_at = NOW()`,
-    [id, name, aliases || [], description || "", firstSeen || ""],
+    [id, name, effectiveChatId, aliases || [], description || "", firstSeen || ""],
   );
   return id;
 }
 
-async function findCharacterByNameOrAlias(settings, name) {
+async function findCharacterByNameOrAlias(settings, name, chatId) {
   const p = getPool(settings);
+  // Prefer the chat-scoped row; fall back to global. ORDER BY puts the
+  // chat-scoped match first when both exist.
   const { rows } = await p.query(
     `SELECT id, name, aliases FROM characters
-     WHERE name = $1 OR $1 = ANY(aliases) OR id = $2
+     WHERE (chat_id = $2 OR chat_id IS NULL)
+       AND (name = $1 OR $1 = ANY(aliases) OR id = $3 OR id = $4)
+     ORDER BY (chat_id = $2) DESC NULLS LAST
      LIMIT 1`,
-    [name, slugify(name)],
+    [name, chatId || null, slugify(name), chatScopedId(name, chatId)],
   );
   return rows[0] || null;
 }
@@ -175,11 +209,10 @@ async function upsertLocationAdjacency(settings, { chatId, fromName, toName, eve
 
 async function upsertRelationship(settings, { from, to, sentiment, intensity, description, sessionId }) {
   const p = getPool(settings);
-  const fromId = slugify(from);
-  const toId = slugify(to);
-  // Ensure both characters exist
-  await upsertCharacter(settings, { name: from });
-  await upsertCharacter(settings, { name: to });
+  // Resolve via upsertCharacter so the per-chat-scoped ID is honored when
+  // sessionId is the chat scope.
+  const fromId = await upsertCharacter(settings, { name: from, chatId: sessionId });
+  const toId = await upsertCharacter(settings, { name: to, chatId: sessionId });
   // Upsert keys on (from_char, to_char, session_id) so per-chat sentiment is preserved
   await p.query(
     `INSERT INTO feels_about (from_char, to_char, sentiment, intensity, description, session_id)
@@ -218,7 +251,7 @@ async function upsertEvent(settings, { summary, sourceText, participants, locati
   );
 
   for (const name of (participants || [])) {
-    const charId = await upsertCharacter(settings, { name });
+    const charId = await upsertCharacter(settings, { name, chatId: sessionId });
     await p.query(
       `INSERT INTO participated_in (character_id, event_id, role)
        VALUES ($1, $2, 'participant')
@@ -246,8 +279,7 @@ async function upsertFact(settings, { content, domain, confidence, characterScop
   );
 
   for (const charName of (characterScope || [])) {
-    const charId = slugify(charName);
-    await upsertCharacter(settings, { name: charName });
+    const charId = await upsertCharacter(settings, { name: charName, chatId });
     // H3: chat_id is now part of the uniqueness key via
     // knows_char_fact_chat_uniq, so identity is per-chat and we can
     // simply DO NOTHING on conflict. The old (character_id, fact_id)
@@ -466,8 +498,8 @@ function classifyDisposition(candidate, category) {
 // VERIFY_THRESHOLD–MERGE_THRESHOLD is the band where Path 3's LLM
 // verifier would be invoked once it exists; below VERIFY_THRESHOLD is a
 // new canonical row.
-const TRAIT_MERGE_COSINE = 0.88;
-const TRAIT_VERIFY_COSINE = 0.80;
+const TRAIT_MERGE_COSINE = 0.82;
+const TRAIT_VERIFY_COSINE = 0.72;
 
 // Process-local cache for Path 3 verifier decisions. Key is
 // `${canonical_id}::${normalized_candidate}`. Cleared on restart.
@@ -1051,8 +1083,7 @@ async function upsertPlotThread(settings, { chatId, title, description, threadTy
   // Link to characters (ensure they exist first)
   for (const charName of (involvedChars || [])) {
     if (!charName) continue;
-    const charId = slugify(charName);
-    await upsertCharacter(settings, { name: charName });
+    const charId = await upsertCharacter(settings, { name: charName, chatId });
     await p.query(
       `INSERT INTO plot_thread_characters (plot_id, character_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
       [plotId, charId],
@@ -1345,7 +1376,7 @@ async function getCharacterKnownUniverse(settings, { characterName, chatId, upTo
   };
   if (!characterName || !chatId) return empty;
 
-  const character = await findCharacterByNameOrAlias(settings, characterName);
+  const character = await findCharacterByNameOrAlias(settings, characterName, chatId);
   if (!character) return empty;
   const charId = character.id;
 

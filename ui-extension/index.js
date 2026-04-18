@@ -451,11 +451,15 @@ function bindSettings(settings) {
     saveAndSync(settings);
   });
 
-  // Embedding dimension (numeric, generic name)
-  $("#chronicle_embeddingDimension").val(settings.embeddingDimension || 768).on("input", function () {
-    settings.embeddingDimension = parseInt($(this).val()) || 768;
+  // Embedding dimension is locked at 768 to match the schema's
+  // vector(768) columns. The input is disabled in the HTML; we still
+  // force the cached setting back to 768 in case an older settings
+  // export carried a different value through.
+  if (settings.embeddingDimension !== 768) {
+    settings.embeddingDimension = 768;
     saveAndSyncDebounced(settings);
-  });
+  }
+  $("#chronicle_embeddingDimension").val(768);
 
   // Auto-ingest toggle — gates the GENERATION_ENDED extract hook
   $("#chronicle_autoIngest").prop("checked", settings.autoIngest).on("change", function () {

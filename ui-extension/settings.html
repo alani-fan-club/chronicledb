@@ -113,7 +113,8 @@
         </div>
         <div class="chronicle-setting">
           <label for="chronicle_embeddingDimension">Dimension:</label>
-          <input type="number" id="chronicle_embeddingDimension" class="text_pole" placeholder="768" min="128" max="3072" value="768">
+          <input type="number" id="chronicle_embeddingDimension" class="text_pole" value="768" readonly disabled>
+          <p class="chronicle-hint">Fixed at 768 — the schema's <code>vector(768)</code> columns are baked into the indexes. Pick an embedding model that natively outputs 768, or one that accepts a <code>dimensions</code> parameter (OpenAI 3-small / 3-large, Vertex 004 / 005, Voyage) and the plugin will truncate. Setting any other value here would only desync embed-time from store-time and break inserts.</p>
         </div>
       </div>
       <div class="chronicle-setting-row">

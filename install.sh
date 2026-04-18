@@ -7,16 +7,43 @@
 # Or after cloning the repo manually:
 #   bash install.sh
 #
+# Flags:
+#   --skip-postgres    Don't install / check / create a local Postgres.
+#                      Use this when you're pointing ChronicleDB at a cloud
+#                      DB (Neon, Supabase, etc.); you'll paste the creds in
+#                      the ST settings panel after the script completes.
+#   -h, --help         Print usage.
+#
 # Idempotent — safe to re-run. Detects existing clones, existing symlinks,
 # existing databases, and skips work that's already done.
 #
 # Environment overrides (rarely needed):
-#   ST_DIR     — path to your SillyTavern install (auto-detected from common
-#                paths if not set)
-#   REPO_DIR   — where to clone ChronicleDB (default: ~/.chronicledb)
-#   DB_NAME    — Postgres database name (default: chronicledb)
+#   ST_DIR             path to your SillyTavern install (auto-detected
+#                      from common paths if not set)
+#   REPO_DIR           where to clone ChronicleDB (default: ~/.chronicledb)
+#   DB_NAME            Postgres database name (default: chronicledb)
+#   SKIP_POSTGRES=1    same as --skip-postgres
 
 set -euo pipefail
+
+# ── Argument parsing ────────────────────────────────────────────────
+SKIP_POSTGRES="${SKIP_POSTGRES:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-postgres|--cloud)
+      SKIP_POSTGRES=1
+      shift
+      ;;
+    -h|--help)
+      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      printf 'Unknown argument: %s\nSee --help.\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # ── Output helpers ──────────────────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -100,6 +127,12 @@ fi
 ok "Node $(node --version)"
 
 # ── 4. Check PostgreSQL — offer to install if missing ──────────────
+# Skipped under --skip-postgres: user is pointing at a cloud DB and we
+# don't need a local Postgres binary, service, or role for the script
+# to finish wiring the plugin into SillyTavern.
+if [[ -n "$SKIP_POSTGRES" ]]; then
+  log "Skipping local PostgreSQL setup (--skip-postgres)"
+else
 if ! command -v psql >/dev/null 2>&1; then
   warn "PostgreSQL is not installed."
   case "$PLATFORM" in
@@ -111,7 +144,7 @@ if ! command -v psql >/dev/null 2>&1; then
           # Make sure brew's pg is on PATH for the rest of the script
           export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
         else
-          fail "Cannot continue without PostgreSQL. Install it manually and re-run."
+          fail "Cannot continue without PostgreSQL. Install it manually and re-run, or pass --skip-postgres if you're using a cloud DB."
         fi
       else
         fail "Homebrew not found. Install Homebrew first (https://brew.sh), then re-run this script. Or install PostgreSQL manually from https://www.postgresql.org/download/macosx/"
@@ -129,7 +162,7 @@ if ! command -v psql >/dev/null 2>&1; then
             sudo -u postgres createuser --superuser "$USER"
           fi
         else
-          fail "Cannot continue without PostgreSQL. Install it manually and re-run."
+          fail "Cannot continue without PostgreSQL. Install it manually and re-run, or pass --skip-postgres if you're using a cloud DB."
         fi
       else
         fail "apt-get not found. This installer's auto-install only knows Debian/Ubuntu. Install PostgreSQL 14+ manually for your distro and re-run."
@@ -166,8 +199,15 @@ if ! psql -tAc "SELECT 1" >/dev/null 2>&1; then
   fi
 fi
 ok "PostgreSQL $PG_VERSION (running, current user can connect)"
+fi
 
 # ── 5. Check pgvector extension — offer to install if missing ──────
+# Cloud DB users skip this entirely — they install pgvector on their
+# cloud instance via its own UI (Neon auto-enables it, Supabase has a
+# toggle under Database > Extensions).
+if [[ -n "$SKIP_POSTGRES" ]]; then
+  log "Skipping pgvector check (--skip-postgres)"
+else
 TMP_DB="chronicledb_pgvector_check_$$"
 if createdb "$TMP_DB" 2>/dev/null && \
    psql -d "$TMP_DB" -tAc "CREATE EXTENSION IF NOT EXISTS vector; DROP EXTENSION vector;" >/dev/null 2>&1; then
@@ -203,6 +243,7 @@ if [[ "$PGVECTOR_OK" -eq 0 ]]; then
   dropdb "$TMP_DB" 2>/dev/null || true
 fi
 ok "pgvector is available"
+fi
 
 # ── 6. Clone or update the repo ─────────────────────────────────────
 REPO_DIR="${REPO_DIR:-$HOME/.chronicledb}"
@@ -281,7 +322,16 @@ else
 fi
 
 # ── 11. Create database and enable extensions ───────────────────────
+# Under --skip-postgres the cloud DB already exists and the user is
+# responsible for enabling extensions there. ChronicleDB's own initSchema
+# runs CREATE EXTENSION IF NOT EXISTS on boot, so the only real
+# requirement is that the cloud role has CREATE EXTENSION privilege
+# (Neon and Supabase both grant it by default on the app user).
 DB_NAME="${DB_NAME:-chronicledb}"
+if [[ -n "$SKIP_POSTGRES" ]]; then
+  log "Skipping database creation (--skip-postgres). Paste your cloud DB"
+  log "  connection info into the ST settings panel after restart."
+else
 if psql -lqt | cut -d '|' -f 1 | grep -qw "$DB_NAME"; then
   ok "Database '$DB_NAME' already exists"
 else
@@ -292,8 +342,19 @@ fi
 log "Enabling extensions in $DB_NAME ..."
 psql -d "$DB_NAME" -tAc "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pg_trgm;" >/dev/null
 ok "Extensions enabled (vector, pg_trgm)"
+fi
 
 # ── 12. Final report ────────────────────────────────────────────────
+if [[ -n "$SKIP_POSTGRES" ]]; then
+  DB_LINE="Database:      (cloud — paste creds in the ST settings panel)"
+  RERUN_LINE="  bash $REPO_DIR/install.sh --skip-postgres"
+  UNINSTALL_DB_LINE="  # (cloud DB: drop it from your provider dashboard)"
+else
+  DB_LINE="Database:      $DB_NAME (host: localhost, user: $(whoami))"
+  RERUN_LINE="  bash $REPO_DIR/install.sh"
+  UNINSTALL_DB_LINE="  dropdb $DB_NAME"
+fi
+
 cat <<EOF
 
 ${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}
@@ -311,15 +372,15 @@ ${BOLD}Where things landed:${RESET}
                  → $PLUGIN_TARGET
   UI extension:  $UI_LINK
                  → $UI_TARGET
-  Database:      $DB_NAME (host: localhost, user: $(whoami))
+  $DB_LINE
 
 ${BOLD}Re-run later (idempotent — fixes any drift):${RESET}
-  bash $REPO_DIR/install.sh
+$RERUN_LINE
 
 ${BOLD}Uninstall:${RESET}
   rm $PLUGIN_LINK
   rm $UI_LINK
-  dropdb $DB_NAME
+$UNINSTALL_DB_LINE
   rm -rf $REPO_DIR
 ${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}
 EOF

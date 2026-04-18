@@ -723,13 +723,15 @@ async function upsertTrait(
     } catch (err) {
       console.warn(`[ChronicleDB] trait merge UPDATE failed (${err.message})`);
     }
-    // Merge candidate ID is content-addressed by (character, raw content,
-    // source_chat, source_message_index) so re-running the same extraction
-    // batch is idempotent — the same candidate evidence won't spawn a new row.
+    // Merge candidate ID is content-addressed by (character, category, raw
+    // content, source_chat, source_message_index) so re-running the same
+    // extraction batch is idempotent. Category MUST be in the key for the
+    // same reason as the canonical id — otherwise the same content under
+    // two categories collides on the primary key.
     const msgIdxParam = Number.isFinite(sourceMessageIndex) ? sourceMessageIndex : null;
     const mergedId = contentId(
       "trait",
-      `cand:${characterId}:${cleaned}:${sourceChat || ""}:${msgIdxParam ?? ""}`,
+      `cand:${characterId}:${cat}:${cleaned}:${sourceChat || ""}:${msgIdxParam ?? ""}`,
     );
     try {
       await p.query(
@@ -831,11 +833,16 @@ async function upsertTrait(
 
   // NEW_CANONICAL: insert as a fresh canonical row, embedding populated
   // if we have one, canonical_id = NULL. ID is content-addressed by
-  // (character, normalized content) so re-ingesting the same trait always
-  // collides with the existing row's id and the ON CONFLICT clause becomes
-  // a true upsert, not a new row.
+  // (character, category, normalized content) so re-ingesting the same
+  // trait always collides with the existing row's id and the ON CONFLICT
+  // clause becomes a true upsert. Category MUST be in the key — the same
+  // normalized content can legitimately appear in two categories
+  // ("brave" as personality AND as skill) and they'd otherwise hash to
+  // the same id, causing a primary-key violation that ON CONFLICT
+  // (char, cat, norm) doesn't catch (different category, no conflict on
+  // the named target).
   const normalizedKey = cleaned.toLowerCase().replace(/[^a-z0-9]/g, "");
-  const id = contentId("trait", `${characterId}:${normalizedKey}`);
+  const id = contentId("trait", `${characterId}:${cat}:${normalizedKey}`);
   const newCanonMsgIdx = Number.isFinite(sourceMessageIndex) ? sourceMessageIndex : null;
   const { rows: inserted } = await p.query(
     `INSERT INTO traits (id, character_id, category, content, source_chat, source_message_index, embedding, evidence_sentence)

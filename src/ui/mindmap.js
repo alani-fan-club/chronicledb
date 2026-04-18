@@ -871,10 +871,29 @@ function initToolbar() {
 
 // ── Init ────────────────────────────────────────────────────────
 
+async function pickRecentChatCharacter() {
+  try {
+    const res = await fetch(`${API_BASE}/chats`, fetchOpts);
+    if (!res.ok) return null;
+    const chats = await res.json();
+    return chats[0]?.character || null;
+  } catch (err) {
+    console.warn("[ChronicleDB] /chats lookup failed:", err);
+    return null;
+  }
+}
+
 (async function bootstrap() {
   initGraph();
   initEdgeChips();
   initToolbar();
   await loadCharacterSidebar();
-  await loadGraphData("global");
+  // Auto-load the most-recent active chat's primary character so the
+  // mindmap opens onto something meaningful instead of a blank canvas.
+  const recent = await pickRecentChatCharacter();
+  if (recent) {
+    await selectCharacter(recent);
+  } else {
+    await loadGraphData("global");
+  }
 })();

@@ -457,20 +457,42 @@ JSON:`;
   );
 }
 
+// Best-effort sanitizer for LLM JSON quirks: strip trailing commas
+// before `}` or `]` (the most common Gemini-side flaw), and strip
+// JS-style line comments that occasionally leak in. Returns the input
+// unchanged if no fixes apply.
+function sanitizeLooseJson(s) {
+  return s
+    .replace(/,(\s*[}\]])/g, "$1")  // trailing commas
+    .replace(/^\uFEFF/, "")          // BOM
+    .replace(/\/\/[^\n]*\n/g, "\n"); // line comments
+}
+
+function tryParse(s) {
+  try { return JSON.parse(s); } catch (_) { /* fall through */ }
+  try { return JSON.parse(sanitizeLooseJson(s)); } catch (_) { /* fall through */ }
+  return undefined;
+}
+
 function parseResponse(raw) {
-  // Try raw JSON
   const trimmed = raw.trim();
+  // Try raw JSON
   if (trimmed.startsWith("{")) {
-    return JSON.parse(trimmed);
+    const parsed = tryParse(trimmed);
+    if (parsed) return parsed;
   }
   // Try markdown fenced
   const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-  if (fenceMatch) return JSON.parse(fenceMatch[1].trim());
+  if (fenceMatch) {
+    const parsed = tryParse(fenceMatch[1].trim());
+    if (parsed) return parsed;
+  }
   // Find first { to last }
   const first = trimmed.indexOf("{");
   const last = trimmed.lastIndexOf("}");
   if (first !== -1 && last > first) {
-    return JSON.parse(trimmed.slice(first, last + 1));
+    const parsed = tryParse(trimmed.slice(first, last + 1));
+    if (parsed) return parsed;
   }
   throw new Error("Could not parse extraction response");
 }

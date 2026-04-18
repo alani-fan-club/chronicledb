@@ -1025,16 +1025,34 @@ async function init(router) {
   // ── All-chats list for the mind map filter dropdown ─────────
 
   router.get("/chats", withInternalError(async (req, res) => {
+    // Union batch-ingested chats (ingestion_status) with live chats
+    // (derived from events). ingestion_status is empty for live chats —
+    // without the events fallback the sidebar's recency lookup misses
+    // the chat the user is actively in. Character name is taken from
+    // ingestion_status when known and falls back to parsing the
+    // chat_id ("Character Name - YYYY-...").
     const rows = await queryRows(
-      `SELECT DISTINCT chat_file AS chat_id, character_name, ingested_at
-       FROM ingestion_status
-       WHERE status = 'done'
-       ORDER BY ingested_at DESC NULLS LAST, chat_file`,
+      `WITH combined AS (
+         SELECT regexp_replace(chat_file, '\.jsonl$', '') AS chat_id, character_name, ingested_at AS recent
+           FROM ingestion_status WHERE status = 'done'
+         UNION ALL
+         SELECT chat_id,
+                split_part(chat_id, ' - ', 1) AS character_name,
+                MAX(timestamp) AS recent
+           FROM events WHERE chat_id IS NOT NULL AND chat_id <> ''
+           GROUP BY chat_id
+       )
+       SELECT chat_id,
+              MAX(character_name) AS character_name,
+              MAX(recent) AS recent
+       FROM combined
+       GROUP BY chat_id
+       ORDER BY recent DESC NULLS LAST, chat_id`,
     );
     res.json(rows.map((r) => ({
-      chatId: stripJsonlSuffix(r.chat_id || ""),
+      chatId: r.chat_id,
       character: r.character_name,
-      label: `${r.character_name} — ${stripJsonlSuffix(r.chat_id || "")}`,
+      label: `${r.character_name || "?"} — ${r.chat_id}`,
     })));
   }));
 

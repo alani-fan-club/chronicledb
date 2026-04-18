@@ -164,8 +164,29 @@ if ! command -v psql >/dev/null 2>&1; then
         else
           fail "Cannot continue without PostgreSQL. Install it manually and re-run, or pass --skip-postgres if you're using a cloud DB."
         fi
+      elif command -v dnf >/dev/null 2>&1; then
+        # Fedora / Nobara / RHEL / Rocky / Alma. Fedora 40+ has
+        # postgresql-pgvector in the main repos; older releases or RHEL
+        # derivatives may need PGDG's yum repo enabled first.
+        if prompt_yes "Install PostgreSQL + pgvector via dnf now? (will sudo)"; then
+          run_install "sudo dnf install -y postgresql-server postgresql-contrib postgresql-pgvector"
+          # Unlike apt, dnf's postgresql-server does NOT initialize the
+          # data directory on its own. Only run initdb if PG_VERSION
+          # isn't already there so re-runs don't clobber existing data.
+          if [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
+            log "Initializing Postgres data directory ..."
+            run_install "sudo postgresql-setup --initdb"
+          fi
+          run_install "sudo systemctl enable --now postgresql"
+          if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER'" 2>/dev/null | grep -q 1; then
+            log "Creating Postgres role for current user '$USER'..."
+            sudo -u postgres createuser --superuser "$USER"
+          fi
+        else
+          fail "Cannot continue without PostgreSQL. Install it manually and re-run, or pass --skip-postgres if you're using a cloud DB."
+        fi
       else
-        fail "apt-get not found. This installer's auto-install only knows Debian/Ubuntu. Install PostgreSQL 14+ manually for your distro and re-run."
+        fail "No supported Linux package manager found (looked for apt-get, dnf). For Arch / openSUSE / other distros, install PostgreSQL 14+ and pgvector manually, then re-run — or pass --skip-postgres if you're pointing at a cloud DB."
       fi
       ;;
   esac
@@ -185,6 +206,12 @@ if ! psql -tAc "SELECT 1" >/dev/null 2>&1; then
       ;;
     linux)
       if prompt_yes "Try starting it via 'sudo systemctl start postgresql' now?"; then
+        # Fedora-style installs may have an empty data dir if postgres-
+        # setup --initdb was never run.
+        if command -v postgresql-setup >/dev/null 2>&1 && [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
+          log "Initializing Postgres data directory ..."
+          run_install "sudo postgresql-setup --initdb"
+        fi
         run_install "sudo systemctl start postgresql"
         sleep 2
         if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='$USER'" 2>/dev/null | grep -q 1; then
@@ -229,8 +256,10 @@ if [[ "$PGVECTOR_OK" -eq 0 ]]; then
     linux)
       if command -v apt-get >/dev/null 2>&1 && prompt_yes "Install pgvector via 'sudo apt-get install postgresql-${PG_VERSION}-pgvector' now?"; then
         run_install "sudo apt-get install -y postgresql-${PG_VERSION}-pgvector"
+      elif command -v dnf >/dev/null 2>&1 && prompt_yes "Install pgvector via 'sudo dnf install postgresql-pgvector' now?"; then
+        run_install "sudo dnf install -y postgresql-pgvector"
       else
-        fail "Install pgvector manually and re-run:  sudo apt-get install postgresql-${PG_VERSION}-pgvector"
+        fail "Install pgvector manually for your distro and re-run (apt: postgresql-${PG_VERSION}-pgvector ; dnf: postgresql-pgvector)."
       fi
       ;;
   esac

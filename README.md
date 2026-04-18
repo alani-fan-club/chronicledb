@@ -1,6 +1,6 @@
 # ChronicleDB
 
-A persistent graph-plus-vector memory store for SillyTavern roleplays. Runs as a SillyTavern server plugin backed by PostgreSQL and pgvector. Ingests chat files, pulls structured entities and events out of each batch via a cheap extraction LLM, stores them in a hybrid relational-graph plus vector schema, and returns a memory block on every turn so the main chat model sees the relevant past without stuffing the whole chat into its context window.
+A persistent graph-plus-vector memory store for SillyTavern roleplays. Runs as a SillyTavern server plugin backed by an embedded Postgres (PGlite, pure-JS, with pgvector + pg_trgm built in) — no system Postgres install required, no distro-specific dance, no `pg_hba.conf` gymnastics. Power users with their own Postgres or a cloud DB (Neon, Supabase) can opt in via the settings panel; the plugin talks to either backend through the same client adapter. Ingests chat files, pulls structured entities and events out of each batch via a cheap extraction LLM, stores them in a hybrid relational-graph plus vector schema, and returns a memory block on every turn so the main chat model sees the relevant past without stuffing the whole chat into its context window.
 
 ## What it does
 

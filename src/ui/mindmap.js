@@ -372,15 +372,21 @@ function initGraph() {
 
 // ── Data loading ────────────────────────────────────────────────
 
-let activeChatFilter = "";
-
 async function loadGraphData(scope = "global", params = {}) {
   showLoading(true);
   try {
+    // scope=global without a chat scope is an unbounded query the backend
+    // hard-rejects. Render an empty graph + console hint so the user
+    // sees a sensible state instead of a 400.
+    if (scope === "global") {
+      console.info("[ChronicleDB] Click a character on the left to load their graph.");
+      allData = { nodes: [], edges: [] };
+      await renderGraph(allData);
+      return;
+    }
     const url = new URL(`${API_BASE}/graph`, window.location.origin);
     url.searchParams.set("scope", scope);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-    if (activeChatFilter) url.searchParams.set("chat_id", activeChatFilter);
 
     const res = await fetch(url, fetchOpts);
     if (!res.ok) throw new Error(`API error: ${res.status}`);
@@ -392,43 +398,6 @@ async function loadGraphData(scope = "global", params = {}) {
   } finally {
     showLoading(false);
   }
-}
-
-async function loadChatFilterOptions() {
-  const select = document.getElementById("chat-filter");
-  if (!select) return;
-  let chats = [];
-  try {
-    const res = await fetch(`${API_BASE}/chats`, fetchOpts);
-    if (res.ok) chats = await res.json();
-  } catch (err) {
-    console.warn("[ChronicleDB] Failed to load chat filter options:", err);
-  }
-  for (const chat of chats) {
-    const opt = document.createElement("option");
-    opt.value = chat.chatId || chat.id || chat.filename || "";
-    opt.textContent = chat.label || chat.chatId || chat.filename || "(unnamed)";
-    select.appendChild(opt);
-  }
-
-  const remembered = localStorage.getItem("chronicledb_chat_filter");
-  const validValues = new Set(Array.from(select.options).map((o) => o.value));
-  if (remembered !== null && validValues.has(remembered)) {
-    select.value = remembered;
-  } else if (chats.length > 0) {
-    select.value = chats[0].chatId || chats[0].id || chats[0].filename || "";
-  }
-  activeChatFilter = select.value;
-
-  select.addEventListener("change", async () => {
-    activeChatFilter = select.value;
-    localStorage.setItem("chronicledb_chat_filter", activeChatFilter);
-    if (activeCharacter) {
-      await loadGraphData("character", { character: activeCharacter, depth: 3 });
-    } else {
-      await loadGraphData("global");
-    }
-  });
 }
 
 // ── Graph rendering ─────────────────────────────────────────────
@@ -760,19 +729,12 @@ async function selectCharacter(name) {
   document.getElementById("btn-show-all").classList.remove("active");
   await loadGraphData("character", { character: name, depth: 3 });
 
-  // Find the character node and fly to it
-  const nameLower = name.toLowerCase();
-  const charNode = graphNodes.find(n =>
-    (n.fullLabel || '').toLowerCase().includes(nameLower)
-  ) || graphNodes.filter(n => n.type === 'character').sort((a, b) => b.degree - a.degree)[0];
-
-  if (charNode) {
-    graph.cameraPosition(
-      { x: charNode.x, y: charNode.y, z: charNode.z + 200 },
-      charNode,
-      1500
-    );
-  }
+  // d3-force-3d hasn't simulated yet — node positions are NaN/undefined,
+  // so flying to a specific node lands the camera nowhere. Wait a beat
+  // for the simulation to spread nodes out, then zoomToFit.
+  setTimeout(() => {
+    if (graph) graph.zoomToFit(800, 60);
+  }, 1200);
 }
 
 function clearCharacterSelection() {
@@ -913,6 +875,6 @@ function initToolbar() {
   initGraph();
   initEdgeChips();
   initToolbar();
-  await Promise.all([loadCharacterSidebar(), loadChatFilterOptions()]);
+  await loadCharacterSidebar();
   await loadGraphData("global");
 })();

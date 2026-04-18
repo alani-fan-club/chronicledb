@@ -12,6 +12,11 @@
 #                      Use this when you're pointing ChronicleDB at a cloud
 #                      DB (Neon, Supabase, etc.); you'll paste the creds in
 #                      the ST settings panel after the script completes.
+#   --skip-clone       Don't try to git-clone or git-fetch the repo. Use
+#                      this when you've already got the tree (tarball,
+#                      release download, manual checkout); the script
+#                      expects REPO_DIR to point at it and just does the
+#                      npm install + symlinks + DB bootstrap.
 #   -h, --help         Print usage.
 #
 # Idempotent — safe to re-run. Detects existing clones, existing symlinks,
@@ -23,19 +28,25 @@
 #   REPO_DIR           where to clone ChronicleDB (default: ~/.chronicledb)
 #   DB_NAME            Postgres database name (default: chronicledb)
 #   SKIP_POSTGRES=1    same as --skip-postgres
+#   SKIP_CLONE=1       same as --skip-clone
 
 set -euo pipefail
 
 # ── Argument parsing ────────────────────────────────────────────────
 SKIP_POSTGRES="${SKIP_POSTGRES:-}"
+SKIP_CLONE="${SKIP_CLONE:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-postgres|--cloud)
       SKIP_POSTGRES=1
       shift
       ;;
+    --skip-clone)
+      SKIP_CLONE=1
+      shift
+      ;;
     -h|--help)
-      sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -79,6 +90,55 @@ run_install() {
   local cmd="$1"
   log "Running: $cmd"
   eval "$cmd"
+}
+
+# True when a Postgres *server* (not just the psql client) is installed.
+# On Debian-land the client and server travel together; on Fedora/RHEL
+# they're split packages. Checking for the systemd unit file catches the
+# Fedora gotcha where `command -v psql` succeeds without a real server.
+pg_server_installed() {
+  if [[ "${PLATFORM:-}" == "macos" ]]; then
+    command -v psql >/dev/null 2>&1
+  else
+    command -v psql >/dev/null 2>&1 \
+      && systemctl list-unit-files 2>/dev/null | grep -q '^postgresql\.service'
+  fi
+}
+
+# Create a Postgres database matching the OS username, so that `psql`
+# with no -d flag (which defaults to dbname=$USER) resolves to something.
+# Debian's postgresql-common postinst does this automatically; Fedora's
+# postgresql-server does not.
+ensure_user_db() {
+  if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='$USER'" 2>/dev/null | grep -q 1; then
+    log "Creating Postgres database '$USER' for OS-user shortcuts ..."
+    sudo -u postgres createdb "$USER" 2>/dev/null || true
+  fi
+}
+
+# Fedora's default pg_hba.conf uses 'ident' auth on TCP loopback, which
+# requires an ident daemon nobody's run since ~2003. Node apps
+# (node-postgres, ChronicleDB) connect via TCP by default, so they hit
+# this and fail with "Ident authentication failed". Offer to rewrite to
+# 'trust' (fine for single-user dev machines, explicitly NOT fine on
+# shared hosts or anything exposing Postgres beyond loopback).
+ensure_loopback_trust() {
+  local PG_HBA
+  PG_HBA=$(sudo -u postgres psql -tAc "SHOW hba_file" 2>/dev/null | tr -d '[:space:]')
+  [[ -z "$PG_HBA" || ! -f "$PG_HBA" ]] && return 0
+  if ! sudo grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32[[:space:]]+ident' "$PG_HBA"; then
+    return 0
+  fi
+  warn "pg_hba.conf uses 'ident' auth on TCP loopback — Node apps can't satisfy ident without an ident daemon running."
+  if prompt_yes "Rewrite 127.0.0.1 + ::1 loopback lines to 'trust' so ChronicleDB can connect? (safe on a single-user dev laptop; NOT safe on shared hosts)"; then
+    sudo cp "$PG_HBA" "${PG_HBA}.chronicledb-backup"
+    sudo sed -i -E 's|^(host[[:space:]]+all[[:space:]]+all[[:space:]]+127\.0\.0\.1/32[[:space:]]+)ident[[:space:]]*$|\1trust|' "$PG_HBA"
+    sudo sed -i -E 's|^(host[[:space:]]+all[[:space:]]+all[[:space:]]+::1/128[[:space:]]+)ident[[:space:]]*$|\1trust|' "$PG_HBA"
+    run_install "sudo systemctl reload postgresql"
+    ok "pg_hba.conf patched; backup at ${PG_HBA}.chronicledb-backup"
+  else
+    warn "Leaving pg_hba.conf alone. If ChronicleDB fails with 'Ident authentication failed', edit $PG_HBA: change 'ident' to 'trust' on the 127.0.0.1/32 and ::1/128 lines, then: sudo systemctl reload postgresql"
+  fi
 }
 
 # ── 1. Detect platform ──────────────────────────────────────────────
@@ -133,8 +193,12 @@ ok "Node $(node --version)"
 if [[ -n "$SKIP_POSTGRES" ]]; then
   log "Skipping local PostgreSQL setup (--skip-postgres)"
 else
-if ! command -v psql >/dev/null 2>&1; then
-  warn "PostgreSQL is not installed."
+if ! pg_server_installed; then
+  if command -v psql >/dev/null 2>&1; then
+    warn "psql client found, but no postgresql-server. On Fedora/RHEL these are separate packages."
+  else
+    warn "PostgreSQL is not installed."
+  fi
   case "$PLATFORM" in
     macos)
       if command -v brew >/dev/null 2>&1; then
@@ -161,6 +225,8 @@ if ! command -v psql >/dev/null 2>&1; then
             log "Creating Postgres role for current user '$USER'..."
             sudo -u postgres createuser --superuser "$USER"
           fi
+          ensure_user_db
+          ensure_loopback_trust
         else
           fail "Cannot continue without PostgreSQL. Install it manually and re-run, or pass --skip-postgres if you're using a cloud DB."
         fi
@@ -182,6 +248,8 @@ if ! command -v psql >/dev/null 2>&1; then
             log "Creating Postgres role for current user '$USER'..."
             sudo -u postgres createuser --superuser "$USER"
           fi
+          ensure_user_db
+          ensure_loopback_trust
         else
           fail "Cannot continue without PostgreSQL. Install it manually and re-run, or pass --skip-postgres if you're using a cloud DB."
         fi
@@ -218,6 +286,8 @@ if ! psql -tAc "SELECT 1" >/dev/null 2>&1; then
           log "Creating Postgres role for current user '$USER'..."
           sudo -u postgres createuser --superuser "$USER"
         fi
+        ensure_user_db
+        ensure_loopback_trust
       fi
       ;;
   esac
@@ -277,7 +347,21 @@ fi
 # ── 6. Clone or update the repo ─────────────────────────────────────
 REPO_DIR="${REPO_DIR:-$HOME/.chronicledb}"
 REPO_URL="https://github.com/alani-fan-club/chronicledb.git"
-if [[ -d "$REPO_DIR/.git" ]]; then
+if [[ -n "$SKIP_CLONE" ]]; then
+  # User brought their own tree (tarball, release download, manual clone
+  # with auth we don't have). Trust them, but verify REPO_DIR actually
+  # looks like the repo so the later steps don't blow up with misleading
+  # errors pointing at missing server-plugin/ or ui-extension/.
+  if [[ ! -d "$REPO_DIR" ]]; then
+    fail "--skip-clone was set but $REPO_DIR doesn't exist. Either drop the tree there first or set REPO_DIR=<path> to point at it."
+  fi
+  for required in server-plugin ui-extension package.json; do
+    if [[ ! -e "$REPO_DIR/$required" ]]; then
+      fail "$REPO_DIR/$required is missing — --skip-clone expects a full ChronicleDB tree. Re-extract your tarball or point REPO_DIR at the right location."
+    fi
+  done
+  log "Skipping clone/fetch (--skip-clone). Using existing tree at $REPO_DIR."
+elif [[ -d "$REPO_DIR/.git" ]]; then
   log "Updating existing clone at $REPO_DIR ..."
   git -C "$REPO_DIR" fetch --quiet origin master
   git -C "$REPO_DIR" reset --hard --quiet origin/master
@@ -288,7 +372,19 @@ else
   ok "Cloned to $(git -C "$REPO_DIR" rev-parse --short HEAD)"
 fi
 
-# ── 7. npm install in server-plugin ─────────────────────────────────
+# ── 7. npm install (top-level, then server-plugin) ──────────────────
+# The top-level package.json declares express, openai, zod, etc. that
+# the server-plugin require()s. Because the plugin is consumed by ST
+# via a symlink, Node realpath's through and walks up from the real
+# location — landing in $REPO_DIR/node_modules/. Without this step, ST
+# fails to load the plugin with "Cannot find module 'express'".
+log "Installing top-level dependencies (express, openai, zod...) ..."
+(
+  cd "$REPO_DIR"
+  npm install --silent --no-audit --no-fund --no-progress
+)
+ok "Top-level dependencies installed"
+
 log "Installing server plugin dependencies (graphology, pg, pgvector...) ..."
 (
   cd "$REPO_DIR/server-plugin"

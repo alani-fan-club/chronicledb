@@ -891,9 +891,36 @@ async function upsertTrait(
   return finalId;
 }
 
-async function getTraitsForCharacters(settings, characterNames) {
+async function getTraitsForCharacters(settings, characterNames, chatIds) {
   if (!Array.isArray(characterNames) || characterNames.length === 0) return [];
   const p = getPool(settings);
+  // Chat isolation: traits are stamped with source_chat but the character
+  // row is shared across chats (legacy global rows plus alias pollution
+  // where one character's aliases absorb another's name). Without a
+  // source_chat filter, traits extracted in chat B surface in chat A's
+  // memory block. `chatIds` is the retriever's already-resolved scope —
+  // it honors sessionMode (isolated/persistent) and per-character
+  // selectedChats overrides, so cross-chat opt-ins keep working without
+  // a separate mode branch here. NULL source_chat rows stay visible so
+  // legacy pre-migration traits don't silently disappear.
+  //
+  // Callers that omit chatIds (eval harness, debug tools) get the old
+  // unscoped behavior for backward compat.
+  const scoped = Array.isArray(chatIds) && chatIds.length > 0;
+  // Canonical-aware scope check: a canonical row surfaces in a given
+  // chat if EITHER the canonical itself was extracted there OR any
+  // merged alias variant pointing at it was extracted there. Without
+  // the alias half, re-extractions in chat B that dedupe onto a chat-A
+  // canonical (the common case once trait dedup kicks in) would silently
+  // drop out of chat B's memory block.
+  const chatFilter = scoped
+    ? ` AND EXISTS (
+         SELECT 1 FROM traits v
+         WHERE (v.id = t.id OR v.canonical_id = t.id)
+           AND (v.source_chat = ANY($2::text[]) OR v.source_chat IS NULL)
+       )`
+    : "";
+  const params = scoped ? [characterNames, chatIds] : [characterNames];
   const { rows } = await p.query(
     `SELECT c.name AS character_name, t.category, t.content
      FROM traits t
@@ -901,9 +928,9 @@ async function getTraitsForCharacters(settings, characterNames) {
      WHERE (c.name = ANY($1) OR EXISTS (
        SELECT 1 FROM unnest(c.aliases) AS a(alias) WHERE a.alias = ANY($1)
      ))
-     AND t.canonical_id IS NULL
+     AND t.canonical_id IS NULL${chatFilter}
      ORDER BY c.name, t.category, t.content`,
-    [characterNames],
+    params,
   );
   return rows;
 }

@@ -319,7 +319,7 @@ async function retrieve(
     core.getPlotThreads(pool, chatIds),
     core.getRecentSnapshots(pool, chatIds, recentSnapshotsLimit),
     core.getLocations(pool, chatIds, activeCharacters || []),
-    db.getTraitsForCharacters(settings, activeCharacters || []).catch((err) => {
+    db.getTraitsForCharacters(settings, activeCharacters || [], chatIds).catch((err) => {
       console.warn("[ChronicleDB] getTraitsForCharacters failed:", err.message);
       return [];
     }),

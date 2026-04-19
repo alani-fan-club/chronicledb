@@ -336,11 +336,31 @@ Return ONLY valid JSON:
   "contradictions": ["Any detail that contradicts previously established facts, if noticed"]
 }`;
 
+// Per-message hard cap on what gets shown to the extraction LLM.
+// Originally 2000 — silently lopped the back half off most narrative
+// RP messages, dropping events / traits / world-state changes that
+// happened past the cutoff. 12000 (~3k tokens) covers virtually every
+// real message and still bounds pathological 50k-char paste-bombs at
+// 5 msgs/batch × 12k = 60k chars (~15k tokens), well under any modern
+// extraction LLM's context window.
+const EXTRACT_MSG_CHAR_CAP = 12000;
+
 async function extract(settings, { characterName, userName, messages, chatId }) {
+  let truncatedCount = 0;
   const msgBlock = messages
     .filter((m) => !m.is_system)
-    .map((m) => `[${m.is_user ? "USER" : "CHARACTER"}] ${m.name}: ${m.mes.slice(0, 2000)}`)
+    .map((m) => {
+      const body = typeof m.mes === "string" ? m.mes : "";
+      const capped = body.length > EXTRACT_MSG_CHAR_CAP ? body.slice(0, EXTRACT_MSG_CHAR_CAP) : body;
+      if (capped.length < body.length) truncatedCount += 1;
+      return `[${m.is_user ? "USER" : "CHARACTER"}] ${m.name}: ${capped}`;
+    })
     .join("\n\n---\n\n");
+  if (truncatedCount > 0) {
+    console.warn(
+      `[ChronicleDB] extraction: ${truncatedCount} of ${messages.length} message(s) exceeded ${EXTRACT_MSG_CHAR_CAP} chars and were truncated for the extractor prompt. Embeddings still index the full text via chunkText.`,
+    );
+  }
 
   // Cross-batch entity context: prepend a bullet list of characters,
   // locations, and items already known in THIS chat so the per-batch

@@ -440,12 +440,27 @@ JSON:`;
     // Gemini API tolerates contents without it, so adding it unconditionally
     // is safe and keeps the two arms identical.
     const auth = googleAuth(apiType, apiKey);
+    let lastFinishReason = null;
     content = await withExponentialBackoff(async () => {
       const res = await fetch(`${apiUrl}/models/${model}:generateContent${auth.query}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...auth.headers },
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: prompt }] }],
+          // Disable Gemini's default safety filters. The extraction prompt
+          // summarizes user RP chats — mature themes are routine, and the
+          // default MEDIUM_AND_ABOVE thresholds block them silently
+          // (empty `candidate.content`, finishReason="SAFETY"), which
+          // showed up to users as "LLM returned empty response" with no
+          // hint at the cause. We're not generating content for an end
+          // user here — just JSON describing what already happened in the
+          // chat — so BLOCK_NONE is the right call.
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT",        threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH",       threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+          ],
           generationConfig: {
             temperature: 0.1,
             // Gemini's documented upper bound is 65536 EXCLUSIVE — so the
@@ -463,11 +478,18 @@ JSON:`;
       if (!res.ok) throw new Error(`${apiType} extraction error: ${res.status} ${await res.text()}`);
       const data = await res.json();
       const candidate = data.candidates?.[0];
-      if (candidate?.finishReason && candidate.finishReason !== "STOP") {
-        console.warn(`[ChronicleDB] Finish reason: ${candidate.finishReason}`);
+      lastFinishReason = candidate?.finishReason || null;
+      if (lastFinishReason && lastFinishReason !== "STOP") {
+        console.warn(`[ChronicleDB] Finish reason: ${lastFinishReason}`);
       }
       return candidate?.content?.parts?.[0]?.text;
     });
+    if (!content && lastFinishReason && lastFinishReason !== "STOP") {
+      // Surface the real cause to the LLM call monitor instead of the
+      // generic "empty response" — SAFETY, MAX_TOKENS, RECITATION, etc.
+      // each suggest a different fix.
+      throw new Error(`Gemini returned empty response (finishReason=${lastFinishReason})`);
+    }
   }
 
   if (!content) throw new Error("LLM returned empty response");

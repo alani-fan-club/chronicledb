@@ -109,26 +109,68 @@ const {
 
 async function upsertCharacter(settings, { name, aliases, description, firstSeen, chatId }) {
   const p = getPool(settings);
-  // If chatId is provided AND a global row already exists for this name,
-  // prefer the global row (legacy chats keep accumulating into it). New
-  // names in any chat go to chat-scoped rows. Brand-new chats with no
-  // pre-existing global character match start cleanly per-chat.
-  let id;
-  let effectiveChatId = chatId || null;
-  if (chatId) {
-    const { rows: existingGlobal } = await p.query(
-      `SELECT id FROM characters WHERE chat_id IS NULL AND name = $1 LIMIT 1`,
-      [name],
+
+  // Build the bag of surface forms this call asserts belong to one
+  // character: the primary name plus any aliases the extractor handed
+  // us. Anything in this set is what we'll match existing rows against
+  // and what we'll union into the resolved row's aliases column.
+  const incomingForms = Array.from(new Set(
+    [name, ...(aliases || [])]
+      .filter((a) => typeof a === "string" && a.trim().length > 0)
+      .map((a) => a.trim()),
+  ));
+  const normalizedForms = incomingForms.map((n) => n.toLowerCase());
+
+  // Look for an existing row in this chat (or a global row) whose own
+  // name OR alias list contains any of the incoming forms (case- and
+  // whitespace-insensitive). This is the dedup that the old name-only
+  // check missed: when one turn extracts "James Roe" and the next emits
+  // "Captain Roe" (with "James Roe" listed as an alias), they now
+  // collapse onto the same row instead of forking. Same-chat rows beat
+  // globals; ties broken by larger alias set then longer name so we
+  // pick up a richly-described canonical row over a thin stub.
+  const { rows: existing } = await p.query(
+    `SELECT id, chat_id
+       FROM characters
+      WHERE (chat_id = $1 OR chat_id IS NULL)
+        AND (
+          lower(trim(name)) = ANY($2::text[])
+          OR EXISTS (
+            SELECT 1
+              FROM unnest(COALESCE(aliases, '{}'::text[])) a
+             WHERE lower(trim(a)) = ANY($2::text[])
+          )
+        )
+      ORDER BY (chat_id = $1) DESC NULLS LAST,
+               cardinality(COALESCE(aliases, '{}'::text[])) DESC,
+               length(name) DESC
+      LIMIT 1`,
+    [chatId || null, normalizedForms],
+  );
+
+  if (existing.length > 0) {
+    const row = existing[0];
+    // Found a canonical row. Keep its name (don't try to overwrite),
+    // just merge the new surface forms into aliases so future lookups
+    // for any of them hit this row. Description backfills only when
+    // empty so a later thin extraction doesn't blank a rich one.
+    await p.query(
+      `UPDATE characters
+          SET aliases = (
+                SELECT COALESCE(array_agg(DISTINCT a), '{}'::text[])
+                  FROM unnest(COALESCE(aliases, '{}'::text[]) || $2::text[]) a
+                 WHERE a IS NOT NULL AND length(trim(a)) > 0
+              ),
+              description = COALESCE(NULLIF($3, ''), description),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [row.id, incomingForms, description || ""],
     );
-    if (existingGlobal.length > 0) {
-      id = existingGlobal[0].id;
-      effectiveChatId = null;
-    } else {
-      id = chatScopedId(name, chatId);
-    }
-  } else {
-    id = slugify(name);
+    return row.id;
   }
+
+  // No existing row matches any incoming surface form — create fresh.
+  const id = chatId ? chatScopedId(name, chatId) : slugify(name);
   await p.query(
     `INSERT INTO characters (id, name, chat_id, aliases, description, first_seen)
      VALUES ($1, $2, $3, $4, $5, $6)
@@ -139,7 +181,7 @@ async function upsertCharacter(settings, { name, aliases, description, firstSeen
        ),
        description = COALESCE(NULLIF(EXCLUDED.description, ''), characters.description),
        updated_at = NOW()`,
-    [id, name, effectiveChatId, aliases || [], description || "", firstSeen || ""],
+    [id, name, chatId || null, incomingForms, description || "", firstSeen || ""],
   );
   return id;
 }

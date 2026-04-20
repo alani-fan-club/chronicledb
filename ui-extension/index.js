@@ -88,8 +88,16 @@ let settingsSyncErrorNotified = false;
 (async function init() {
   // Merge defaults under existing settings so existing users keep their values
   // but new keys get sane defaults. Never overwrite user-set fields.
+  //
+  // dbBackend deliberately lives OUTSIDE DEFAULT_SETTINGS: a missing
+  // dbBackend on an existing user means they were on the legacy
+  // pgHost-driven external Postgres path (db/client.js rule 3), and
+  // injecting "embedded" via the merge loop would silently reroute
+  // them off their real database and onto a fresh PGlite store —
+  // i.e. apparent data loss. So we only stamp dbBackend="embedded"
+  // when the settings object is being created from scratch.
   if (!extension_settings[EXT_NAME]) {
-    extension_settings[EXT_NAME] = { ...DEFAULT_SETTINGS };
+    extension_settings[EXT_NAME] = { ...DEFAULT_SETTINGS, dbBackend: "embedded" };
   } else {
     for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
       if (!(k in extension_settings[EXT_NAME])) extension_settings[EXT_NAME][k] = v;
@@ -405,6 +413,33 @@ function bindSettings(settings) {
     settings.enabled = $(this).prop("checked");
     saveAndSync(settings);
   });
+
+  // Storage backend select. Embedded = PGlite (no Postgres fields needed),
+  // External = user-supplied pg connection. Resolution at the server uses
+  // dbBackend explicitly when present (db/client.js rule 1), so flipping
+  // here switches stores cleanly. Existing users with no dbBackend in
+  // their cached settings (legacy upgraders) fall through to the
+  // pgHost-based rule and stay on external — see init() comment for
+  // why we don't set dbBackend in DEFAULT_SETTINGS.
+  //
+  // The whole control sits inside an <details id="chronicle_advancedStorage">
+  // disclosure that's collapsed by default. We auto-expand it here when
+  // the resolved backend is external so legacy upgraders see their
+  // existing creds without having to hunt for them.
+  const applyBackendVisibility = (backend) => {
+    const showExternal = backend === "external";
+    $("#chronicle_externalDbFields").toggle(showExternal);
+  };
+  const initialBackend = settings.dbBackend || (settings.pgHost ? "external" : "embedded");
+  if (initialBackend === "external") {
+    $("#chronicle_advancedStorage").attr("open", "open");
+  }
+  $("#chronicle_dbBackend").val(initialBackend).on("change", function () {
+    settings.dbBackend = $(this).val();
+    applyBackendVisibility(settings.dbBackend);
+    saveAndSync(settings);
+  });
+  applyBackendVisibility(initialBackend);
 
   // DB settings
   for (const field of ["pgHost", "pgPort", "pgDatabase", "pgUser", "pgPassword"]) {

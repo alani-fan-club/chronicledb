@@ -37,31 +37,55 @@
 
       <!-- Database settings -->
       <h4>Database</h4>
-      <p class="chronicle-hint">PostgreSQL connection for the memory store. Connects automatically on startup after the first initialization.</p>
-      <div class="chronicle-setting-row">
-        <div class="chronicle-setting">
-          <label for="chronicle_pgHost">Host:</label>
-          <input type="text" id="chronicle_pgHost" class="text_pole" placeholder="localhost">
+      <p class="chronicle-hint">Memory is stored in an embedded PGlite database under <code>~/.chronicledb/pgdata</code>. No setup, no Postgres install — click <strong>Connect &amp; initialize</strong> below to provision it on first run.</p>
+
+      <!-- Advanced storage. Collapsed for the 99% of users who are happy
+           with embedded PGlite. Auto-expanded by bindSettings when the
+           resolved backend is "external" (legacy upgraders with pgHost
+           set, or anyone who's already flipped the toggle) so their
+           current config is visible without a click. -->
+      <details id="chronicle_advancedStorage" class="chronicle-setting" style="margin-top:.5rem;">
+        <summary style="cursor:pointer;">Advanced storage <span class="chronicle-hint" style="display:inline;margin-left:.5rem;">— bring your own Postgres (Neon, Supabase, local pg)</span></summary>
+
+        <div class="chronicle-setting" style="margin-top:.75rem;">
+          <label for="chronicle_dbBackend">Storage backend:</label>
+          <select id="chronicle_dbBackend" class="text_pole">
+            <option value="embedded">Embedded — PGlite, runs inside the plugin (default)</option>
+            <option value="external">External Postgres — connect to your own</option>
+          </select>
+          <p class="chronicle-hint">Switching here changes which store the plugin reads and writes — your data does not move between them.</p>
         </div>
-        <div class="chronicle-setting">
-          <label for="chronicle_pgPort">Port:</label>
-          <input type="number" id="chronicle_pgPort" class="text_pole" placeholder="5432">
+
+        <!-- External Postgres connection. Hidden when Embedded is selected. -->
+        <div id="chronicle_externalDbFields">
+          <p class="chronicle-hint">PostgreSQL connection for the memory store. The DB needs the <code>vector</code> and <code>pg_trgm</code> extensions enabled.</p>
+          <div class="chronicle-setting-row">
+            <div class="chronicle-setting">
+              <label for="chronicle_pgHost">Host:</label>
+              <input type="text" id="chronicle_pgHost" class="text_pole" placeholder="localhost">
+            </div>
+            <div class="chronicle-setting">
+              <label for="chronicle_pgPort">Port:</label>
+              <input type="number" id="chronicle_pgPort" class="text_pole" placeholder="5432">
+            </div>
+          </div>
+          <div class="chronicle-setting">
+            <label for="chronicle_pgDatabase">Database:</label>
+            <input type="text" id="chronicle_pgDatabase" class="text_pole" placeholder="chronicledb">
+          </div>
+          <div class="chronicle-setting-row">
+            <div class="chronicle-setting">
+              <label for="chronicle_pgUser">User:</label>
+              <input type="text" id="chronicle_pgUser" class="text_pole" placeholder="chronicledb">
+            </div>
+            <div class="chronicle-setting">
+              <label for="chronicle_pgPassword">Password:</label>
+              <input type="password" id="chronicle_pgPassword" class="text_pole" placeholder="">
+            </div>
+          </div>
         </div>
-      </div>
-      <div class="chronicle-setting">
-        <label for="chronicle_pgDatabase">Database:</label>
-        <input type="text" id="chronicle_pgDatabase" class="text_pole" placeholder="chronicledb">
-      </div>
-      <div class="chronicle-setting-row">
-        <div class="chronicle-setting">
-          <label for="chronicle_pgUser">User:</label>
-          <input type="text" id="chronicle_pgUser" class="text_pole" placeholder="chronicledb">
-        </div>
-        <div class="chronicle-setting">
-          <label for="chronicle_pgPassword">Password:</label>
-          <input type="password" id="chronicle_pgPassword" class="text_pole" placeholder="">
-        </div>
-      </div>
+      </details>
+
       <div class="chronicle-setting">
         <label for="chronicle_stDataRoot">SillyTavern data root (optional):</label>
         <input type="text" id="chronicle_stDataRoot" class="text_pole" placeholder="auto-detected">
@@ -87,7 +111,7 @@
         </div>
         <div class="chronicle-setting">
           <label for="chronicle_extractionModel">Model:</label>
-          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="e.g. gemini-2.5-flash-lite">
+          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="e.g. gemini-3.1-flash-lite-preview">
         </div>
       </div>
       <div class="chronicle-setting">

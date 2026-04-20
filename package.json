@@ -1,6 +1,6 @@
 {
   "name": "chronicledb",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Persistent memory system for SillyTavern roleplays — hybrid graph + vector architecture",
   "type": "module",
   "main": "dist/index.js",

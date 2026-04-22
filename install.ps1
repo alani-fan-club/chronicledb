@@ -1,4 +1,4 @@
-# ChronicleDB one-shot installer for Windows (PowerShell).
+﻿# ChronicleDB one-shot installer for Windows (PowerShell).
 #
 # Mirrors install.sh for users on raw PowerShell (no WSL, no Git Bash).
 # Uses NTFS junctions instead of symbolic links so no admin elevation

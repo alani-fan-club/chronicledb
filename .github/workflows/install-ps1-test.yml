@@ -1,0 +1,183 @@
+# Real-Windows verification for install.ps1.
+#
+# Why this exists: v0.2.1's install.ps1 contained `Remove-Item -Recurse`
+# on a junction, which on PowerShell 5.1 (the default `powershell.exe`
+# on Windows 10/11) follows the junction and deletes the TARGET
+# directory's contents. A user re-ran the installer over a botched
+# earlier install and lost files. The fix in v0.2.2 swaps to
+# `[System.IO.Directory]::Delete($path, $false)` — but that fix shipped
+# without anyone running it on real Windows. This workflow does that.
+#
+# What it tests:
+#   1. Destructive scenario: pre-stage a junction whose target is a
+#      directory we DON'T want erased, drop a sentinel file in that
+#      target, run install.ps1, and assert the sentinel still exists.
+#      A regression of the v0.2.1 bug will delete the sentinel and
+#      this job will fail loudly.
+#   2. Happy-path post-conditions: the junction now points at the
+#      correct (chronicledb ui-extension) target, and config.yaml has
+#      `enableServerPlugins: true`.
+#
+# Crucial detail: the install.ps1 step uses `shell: powershell` (PS 5.1)
+# explicitly, NOT `pwsh` (PS 7+). The whole point is to exercise the
+# version that has the recursive-delete footgun.
+
+name: install.ps1 (Windows)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - install.ps1
+      - .github/workflows/install-ps1-test.yml
+  pull_request:
+    paths:
+      - install.ps1
+      - .github/workflows/install-ps1-test.yml
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out chronicledb
+        uses: actions/checkout@v4
+        with:
+          path: chronicledb
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Stage a fake SillyTavern install
+        shell: pwsh
+        run: |
+          $st = Join-Path $env:RUNNER_TEMP 'fake-st'
+          New-Item -ItemType Directory -Path $st -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $st 'server.js') -Value '// fake ST entry point'
+          Set-Content -LiteralPath (Join-Path $st 'config.yaml') -Value "enableServerPlugins: false`n# placeholder"
+          New-Item -ItemType Directory -Path (Join-Path $st 'plugins') -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $st 'public\scripts\extensions\third-party') -Force | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "ST_DIR=$st"
+
+      - name: Stage the destructive scenario (wrong-target junction with sentinel content)
+        shell: pwsh
+        run: |
+          # The target we DO NOT want install.ps1 to recursively delete through.
+          $wrongTarget = Join-Path $env:RUNNER_TEMP 'precious-target'
+          New-Item -ItemType Directory -Path $wrongTarget -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $wrongTarget 'DO_NOT_DELETE.txt') `
+                      -Value 'this file must survive a re-run of install.ps1'
+          Set-Content -LiteralPath (Join-Path $wrongTarget 'another.txt') `
+                      -Value 'and so must this one'
+
+          # Plant a junction at the UI extension link path pointing at the
+          # wrong target. This simulates a user who manually created a junction
+          # earlier (or had a previous install.ps1 run that pointed elsewhere).
+          $uiLink = Join-Path $env:ST_DIR 'public\scripts\extensions\third-party\chronicle-db'
+          New-Item -ItemType Junction -Path $uiLink -Target $wrongTarget | Out-Null
+
+          Add-Content -Path $env:GITHUB_ENV -Value "WRONG_TARGET=$wrongTarget"
+          Add-Content -Path $env:GITHUB_ENV -Value "UI_LINK=$uiLink"
+
+          Write-Host "Pre-install state:"
+          Write-Host "  junction: $uiLink"
+          Write-Host "  -> target: $((Get-Item -LiteralPath $uiLink -Force).Target)"
+          Get-ChildItem -LiteralPath $wrongTarget | ForEach-Object { Write-Host "  sentinel: $($_.Name)" }
+
+      - name: Run install.ps1 (PowerShell 5.1 — must exercise the footgun-prone version)
+        shell: powershell
+        env:
+          ST_DIR: ${{ env.ST_DIR }}
+          REPO_DIR: ${{ github.workspace }}\chronicledb
+        run: |
+          & "${env:GITHUB_WORKSPACE}\chronicledb\install.ps1" -SkipClone
+
+      - name: ASSERT — wrong-target's contents still exist (the v0.2.1 destructive-bug regression test)
+        shell: pwsh
+        run: |
+          $sentinel1 = Join-Path $env:WRONG_TARGET 'DO_NOT_DELETE.txt'
+          $sentinel2 = Join-Path $env:WRONG_TARGET 'another.txt'
+          $missing = @()
+          if (-not (Test-Path -LiteralPath $sentinel1)) { $missing += $sentinel1 }
+          if (-not (Test-Path -LiteralPath $sentinel2)) { $missing += $sentinel2 }
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::REGRESSION of v0.2.1 destructive bug. install.ps1 traversed the junction and deleted the target's contents."
+            $missing | ForEach-Object { Write-Host "::error::missing: $_" }
+            exit 1
+          }
+          $body1 = Get-Content -LiteralPath $sentinel1 -Raw
+          if ($body1 -notmatch 'this file must survive') {
+            Write-Host "::error::sentinel content was modified: $body1"
+            exit 1
+          }
+          Write-Host "OK — both sentinel files survived install.ps1 on PS 5.1"
+
+      - name: ASSERT — UI junction now points at the correct target
+        shell: pwsh
+        run: |
+          $item = Get-Item -LiteralPath $env:UI_LINK -Force
+          if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Write-Host "::error::UI link at $env:UI_LINK is not a reparse point after install.ps1"
+            exit 1
+          }
+          $expected = Join-Path $env:GITHUB_WORKSPACE 'chronicledb\ui-extension'
+          $actual = @($item.Target) | Select-Object -First 1
+          # Case-insensitive — Windows paths are case-insensitive on the FS,
+          # and PowerShell variants normalize differently across PS 5/7.
+          if ($actual -ine $expected) {
+            Write-Host "::error::UI junction points at '$actual', expected '$expected'"
+            exit 1
+          }
+          Write-Host "OK — UI junction now -> $actual"
+
+      - name: ASSERT — server-plugin junction was created
+        shell: pwsh
+        run: |
+          $pluginLink = Join-Path $env:ST_DIR 'plugins\chronicle-db'
+          if (-not (Test-Path -LiteralPath $pluginLink)) {
+            Write-Host "::error::server-plugin junction was not created at $pluginLink"
+            exit 1
+          }
+          $item = Get-Item -LiteralPath $pluginLink -Force
+          if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Write-Host "::error::$pluginLink exists but is not a junction"
+            exit 1
+          }
+          Write-Host "OK — server-plugin junction at $pluginLink"
+
+      - name: ASSERT — config.yaml was patched
+        shell: pwsh
+        run: |
+          $config = Get-Content -LiteralPath (Join-Path $env:ST_DIR 'config.yaml') -Raw
+          if ($config -notmatch '(?m)^enableServerPlugins:\s*true\s*$') {
+            Write-Host "::error::config.yaml does not contain 'enableServerPlugins: true'. Contents:"
+            Write-Host $config
+            exit 1
+          }
+          Write-Host "OK — config.yaml patched"
+
+      - name: ASSERT — re-running install.ps1 is idempotent (no destructive ops on already-correct state)
+        shell: powershell
+        env:
+          ST_DIR: ${{ env.ST_DIR }}
+          REPO_DIR: ${{ github.workspace }}\chronicledb
+        run: |
+          # Re-run against the now-correct state and verify the sentinel
+          # files in the OLD wrong target STILL survive (they're outside our
+          # tree but the junction no longer points there, so they should
+          # just be untouched).
+          & "${env:GITHUB_WORKSPACE}\chronicledb\install.ps1" -SkipClone
+
+      - name: ASSERT — second run still didn't disturb the precious target
+        shell: pwsh
+        run: |
+          $sentinel = Join-Path $env:WRONG_TARGET 'DO_NOT_DELETE.txt'
+          if (-not (Test-Path -LiteralPath $sentinel)) {
+            Write-Host "::error::Second install.ps1 run deleted the precious target's contents."
+            exit 1
+          }
+          Write-Host "OK — idempotent re-run did not touch precious-target"

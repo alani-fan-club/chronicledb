@@ -140,6 +140,27 @@ Write-Ok 'Plugin dependencies installed'
 # admin or Developer Mode (unlike SymbolicLinks), and SillyTavern's
 # plugin loader follows them transparently. The trade-off is they're
 # local-only — fine here, since both ends sit under the user profile.
+function Remove-JunctionSafely {
+    # CRITICAL: do NOT use `Remove-Item -Recurse` on a junction.
+    #
+    # PowerShell 5.1 — which is what ships with Windows 10/11 as
+    # `powershell.exe`, and is the thing our `irm | iex` one-liner
+    # invokes — follows junctions during recursive delete and wipes
+    # the TARGET directory's contents. This is a well-documented
+    # footgun (see PowerShell/PowerShell#621 and related). PS 7 fixed
+    # it, but we can't assume PS 7.
+    #
+    # A previous revision of this script used `Remove-Item -Force
+    # -Recurse` on junctions and quietly nuked content inside the
+    # chronicledb repo (and adjacent ST extension folders) when a
+    # user re-ran install.ps1 over a pre-existing wrong-target
+    # junction. [System.IO.Directory]::Delete with recursive=$false
+    # only removes the reparse-point entry itself without traversing
+    # into the target, which is what we actually want.
+    param([string]$JunctionPath)
+    [System.IO.Directory]::Delete($JunctionPath, $false)
+}
+
 function Set-Junction {
     param([string]$LinkPath, [string]$TargetPath)
     if (Test-Path $LinkPath) {
@@ -151,7 +172,7 @@ function Set-Junction {
             # to a single value so the equality check works on either.
             $existingTarget = @($item.Target) | Select-Object -First 1
             if ($existingTarget -and ($existingTarget -eq $TargetPath)) { return $true }
-            Remove-Item -LiteralPath $LinkPath -Force -Recurse
+            Remove-JunctionSafely $LinkPath
         } else {
             Fail "$LinkPath exists and is not a junction/symlink. Move it aside or delete it and re-run."
         }

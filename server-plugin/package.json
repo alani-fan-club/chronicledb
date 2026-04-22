@@ -1,6 +1,6 @@
 {
   "name": "chronicle-db",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "ChronicleDB — persistent graph+vector memory for SillyTavern RP",
   "dependencies": {
     "@electric-sql/pglite": "^0.4.4",

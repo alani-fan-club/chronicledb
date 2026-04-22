@@ -208,15 +208,6 @@ jobs:
           path: ${{ env.zip_path }}
           retention-days: 14
 
-      - name: Attach to GitHub Release (tag pushes only)
-        if: github.ref_type == 'tag'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh release upload "${{ github.ref_name }}" "$zip_path" --clobber
-
   # Zip install is now the primary install path the docs promote, so a
   # Windows-native smoke test of that exact flow matters. The build job
   # above runs on ubuntu-latest, which catches build/staging bugs but
@@ -315,3 +306,45 @@ jobs:
             exit 1
           }
           Write-Host "OK — no stale ../shared/ imports"
+
+  # Release attach lives in its own job, gated on BOTH build and the
+  # Windows verify — we don't attach a zip to a published release if
+  # we haven't confirmed it extracts and runs on Windows. Also carries
+  # the `contents: write` permission the default GITHUB_TOKEN needs
+  # to upload release assets; v0.2.4's tag push 403'd here because
+  # the build job didn't have it. Race-tolerant create-if-missing
+  # handles the case where the release doesn't exist yet (we created
+  # v0.2.3 as a draft in parallel with the workflow and the upload
+  # couldn't find it by tag).
+  publish-release:
+    needs: [build, verify-on-windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download zip artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.zip_name }}
+          path: ${{ runner.temp }}/artifact
+
+      - name: Ensure release exists then upload zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(ls "$RUNNER_TEMP/artifact"/*.zip | head -1)"
+          if [[ -z "$ZIP" ]]; then
+            echo "::error::no zip in downloaded artifact at $RUNNER_TEMP/artifact"
+            exit 1
+          fi
+          if ! gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "No published release for ${{ github.ref_name }} — creating a placeholder."
+            gh release create "${{ github.ref_name }}" \
+              --title "${{ github.ref_name }}" \
+              --notes "Auto-created by the release-zip workflow. The zip asset is attached below; replace this body with real release notes."
+          fi
+          gh release upload "${{ github.ref_name }}" "$ZIP" --clobber

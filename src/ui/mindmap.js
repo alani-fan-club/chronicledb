@@ -626,7 +626,6 @@ async function showDetailPanel(data) {
   if (data.type === "character") {
     try {
       const traitUrl = new URL(`${API_BASE}/character/${encodeURIComponent(title)}/traits`, window.location.origin);
-      if (activeChatFilter) traitUrl.searchParams.set("chat_id", activeChatFilter);
       const res = await fetch(traitUrl, fetchOpts);
       if (res.ok) {
         const traits = await res.json();
@@ -726,7 +725,6 @@ async function selectCharacter(name) {
   document.querySelectorAll(".char-card").forEach((c) => {
     c.classList.toggle("active", c.dataset.name === name);
   });
-  document.getElementById("btn-show-all").classList.remove("active");
   await loadGraphData("character", { character: name, depth: 3 });
 
   // d3-force-3d hasn't simulated yet — node positions are NaN/undefined,
@@ -735,13 +733,6 @@ async function selectCharacter(name) {
   setTimeout(() => {
     if (graph) graph.zoomToFit(800, 60);
   }, 1200);
-}
-
-function clearCharacterSelection() {
-  activeCharacter = null;
-  document.querySelectorAll(".char-card").forEach((c) => c.classList.remove("active"));
-  document.getElementById("btn-show-all").classList.add("active");
-  loadGraphData("global");
 }
 
 // ── Edge filter chips ───────────────────────────────────────────
@@ -798,8 +789,6 @@ function searchAndFocus(query) {
 // ── Toolbar wiring ──────────────────────────────────────────────
 
 function initToolbar() {
-  document.getElementById("btn-show-all").addEventListener("click", clearCharacterSelection);
-
   // Fit: reset camera to default — zoom to fit all nodes
   document.getElementById("btn-fit").addEventListener("click", () => {
     graph.zoomToFit(600, 40);

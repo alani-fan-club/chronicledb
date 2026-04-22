@@ -52,6 +52,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      zip_name: ${{ steps.buildstep.outputs.zip_name }}
 
     steps:
       - name: Check out
@@ -182,6 +184,7 @@ jobs:
           "
 
       - name: Build zip
+        id: buildstep
         shell: bash
         run: |
           set -euo pipefail
@@ -193,6 +196,10 @@ jobs:
           ls -lh "$OUT_ZIP"
           echo "zip_path=$OUT_ZIP" >> "$GITHUB_ENV"
           echo "zip_name=$(basename "$OUT_ZIP")" >> "$GITHUB_ENV"
+          # Also expose zip_name as a job output so the Windows verify
+          # job can download the artifact by name without duplicating
+          # the label-building logic.
+          echo "zip_name=$(basename "$OUT_ZIP")" >> "$GITHUB_OUTPUT"
 
       - name: Upload as workflow artifact (always)
         uses: actions/upload-artifact@v4
@@ -209,3 +216,102 @@ jobs:
         run: |
           set -euo pipefail
           gh release upload "${{ github.ref_name }}" "$zip_path" --clobber
+
+  # Zip install is now the primary install path the docs promote, so a
+  # Windows-native smoke test of that exact flow matters. The build job
+  # above runs on ubuntu-latest, which catches build/staging bugs but
+  # doesn't tell us whether the produced zip extracts cleanly and the
+  # plugin's require graph resolves on Windows (different path
+  # separators, different line-ending handling, different Node default
+  # encodings — the same class of things that bit install.ps1 pre-BOM).
+  verify-on-windows:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download zip artifact produced by build job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.zip_name }}
+          path: ${{ runner.temp }}\artifact
+
+      - name: Stage a fake SillyTavern install
+        shell: pwsh
+        run: |
+          $st = Join-Path $env:RUNNER_TEMP 'fake-st'
+          New-Item -ItemType Directory -Path $st -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $st 'server.js') -Value '// fake'
+          Set-Content -LiteralPath (Join-Path $st 'config.yaml') -Value "enableServerPlugins: true`n"
+          Add-Content -Path $env:GITHUB_ENV -Value "ST_DIR=$st"
+
+      - name: Extract zip into fake ST tree
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'artifact') -Filter *.zip | Select-Object -First 1
+          if (-not $zip) {
+            Write-Host "::error::no zip artifact found under $env:RUNNER_TEMP\artifact"
+            exit 1
+          }
+          Write-Host "Extracting $($zip.FullName) into $env:ST_DIR"
+          # Expand-Archive is built-in on PS 5.1+ and handles Windows path
+          # separators / line endings natively — this is the exact tool
+          # the install docs tell users to run (right-click → Extract All
+          # uses Expand-Archive under the hood).
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $env:ST_DIR -Force
+
+      - name: ASSERT — staged tree has expected paths on Windows
+        shell: pwsh
+        run: |
+          $fail = $false
+          $checks = @(
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\index.js'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\package.json'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\schema.sql'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\shared\retrieval-core.js'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\node_modules\@electric-sql\pglite\package.json'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\node_modules\express\package.json'),
+            (Join-Path $env:ST_DIR 'public\scripts\extensions\third-party\chronicle-db\manifest.json'),
+            (Join-Path $env:ST_DIR 'public\scripts\extensions\third-party\chronicle-db\index.js')
+          )
+          foreach ($p in $checks) {
+            if (-not (Test-Path -LiteralPath $p)) {
+              Write-Host "::error::missing after extract on Windows: $p"
+              $fail = $true
+            }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "OK — every expected file is present after Windows extract"
+
+      - name: ASSERT — plugin's require graph resolves under Node on Windows
+        shell: pwsh
+        run: |
+          $pluginDir = Join-Path $env:ST_DIR 'plugins\chronicle-db'
+          Push-Location $pluginDir
+          try {
+            # Exact same smoke test as the Ubuntu build job — if Windows
+            # path resolution or line-ending handling broke any require(),
+            # this throws and the workflow fails.
+            node -e "const m = require('./index.js'); if (typeof m.init !== 'function') { console.error('::error::plugin loaded but init is', typeof m.init); process.exit(1) } console.log('OK — plugin graph loaded on Windows, init:', typeof m.init);"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+
+      - name: ASSERT — no stale ../shared/ imports slipped through
+        shell: pwsh
+        run: |
+          # The build-side rewrite should have converted all
+          # `../shared/` → `./shared/`; if ANY stale reference is
+          # still in the extracted zip it'll ENOENT at runtime on
+          # Windows (same as Linux, but the grep lives here so the
+          # check runs against the actually-downloaded artifact).
+          $hits = Select-String -Path "$env:ST_DIR\plugins\chronicle-db\*.js" -Pattern 'require\("\.\./shared/' -SimpleMatch:$false -ErrorAction SilentlyContinue
+          if ($hits) {
+            Write-Host "::error::stale ../shared/ import found in extracted zip on Windows:"
+            $hits | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host "OK — no stale ../shared/ imports"

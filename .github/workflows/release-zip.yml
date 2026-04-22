@@ -1,0 +1,211 @@
+# Build a drop-in release zip for ChronicleDB.
+#
+# Users unzip this into their SillyTavern folder; the internal layout
+# matches ST's expected directory structure so files land in the right
+# places automatically. No shell scripts, no symlinks, no junctions.
+#
+# Layout produced:
+#   chronicledb-vX.Y.Z.zip
+#   ├── plugins/
+#   │   └── chronicle-db/              (server plugin + bundled node_modules)
+#   │       ├── index.js
+#   │       ├── package.json
+#   │       ├── node_modules/
+#   │       ├── shared/                (copied from repo shared/, imports rewritten)
+#   │       └── ...
+#   └── public/
+#       └── scripts/
+#           └── extensions/
+#               └── third-party/
+#                   └── chronicle-db/  (UI extension — no node_modules needed)
+#                       ├── manifest.json
+#                       ├── index.js
+#                       └── ...
+#
+# The server-plugin repo layout references shared/ at the repo root
+# via `require("../shared/retrieval-core")`. In a zip install the
+# plugin is isolated under <ST>/plugins/chronicle-db/, so we copy
+# shared/ INTO the plugin directory during staging and rewrite the
+# two `../shared/` imports to `./shared/`. The dev repo layout is
+# untouched; only the staged copy is transformed.
+
+name: Release zip
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - .github/workflows/release-zip.yml
+      - server-plugin/**
+      - ui-extension/**
+      - shared/**
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag label for the zip filename (dev/testing only — does not create a release)'
+        required: false
+        default: 'dev'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "label=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "label=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=pr-${{ github.event.pull_request.number || 'dev' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage zip tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/stage"
+          PLUGIN_DIR="$STAGE/plugins/chronicle-db"
+          UI_DIR="$STAGE/public/scripts/extensions/third-party/chronicle-db"
+          mkdir -p "$PLUGIN_DIR" "$UI_DIR"
+
+          # Server plugin contents. -a preserves symlinks/perms but we
+          # also need to NOT copy node_modules from the dev checkout
+          # (there won't be one in CI, but defense in depth).
+          rsync -a --exclude=node_modules --exclude=.settings-cache.json \
+                server-plugin/ "$PLUGIN_DIR/"
+
+          # Inline the shared/ tree inside the plugin dir so require
+          # paths resolve without relying on a repo-root sibling.
+          rsync -a shared/ "$PLUGIN_DIR/shared/"
+
+          # Rewrite the two `../shared/` imports to `./shared/` in the
+          # staged copy. Dev repo is untouched — these sed calls target
+          # the staged files under $STAGE.
+          sed -i -E 's|require\("\.\./shared/|require("./shared/|g' \
+            "$PLUGIN_DIR/retriever.js" \
+            "$PLUGIN_DIR/db.js"
+
+          # UI extension contents. No node_modules; the UI code only
+          # imports from ST's own globals (../../../script.js etc).
+          rsync -a --exclude=node_modules ui-extension/ "$UI_DIR/"
+
+          # Pre-install production deps into the staged plugin dir.
+          # npm ci uses the committed server-plugin/package-lock.json so
+          # every release zip pins identical dep versions (the dev team's
+          # tested set). --omit=dev skips vitest/tsx and friends;
+          # --ignore-scripts blocks any package's postinstall from
+          # touching the runner (PGlite ships prebuilt WASM so it doesn't
+          # need postinstall).
+          cd "$PLUGIN_DIR"
+          npm ci --omit=dev --no-audit --no-fund --ignore-scripts
+
+          # Remove the lockfile from the zip — it's only needed for the
+          # ci install above, not for users running the plugin.
+          rm -f package-lock.json
+
+          echo "stage=$STAGE" >> "$GITHUB_ENV"
+          echo "plugin_dir=$PLUGIN_DIR" >> "$GITHUB_ENV"
+          echo "ui_dir=$UI_DIR" >> "$GITHUB_ENV"
+
+      - name: Assert staged tree has everything the plugin needs at runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          # Files the plugin expects to find by relative path.
+          for f in \
+            index.js package.json schema.sql \
+            shared/retrieval-core.js shared/trait-lexicons.js shared/ts-query.js \
+            node_modules/@electric-sql/pglite/package.json \
+            node_modules/express/package.json \
+            node_modules/pg/package.json \
+            node_modules/graphology/package.json \
+            node_modules/graphology-communities-louvain/package.json \
+            node_modules/dotenv/package.json ; do
+            if [[ ! -e "$plugin_dir/$f" ]]; then
+              echo "::error::missing in staged plugin: $f"
+              fail=1
+            fi
+          done
+          # UI extension files.
+          for f in manifest.json index.js style.css settings.html ; do
+            if [[ ! -e "$ui_dir/$f" ]]; then
+              echo "::error::missing in staged UI: $f"
+              fail=1
+            fi
+          done
+          # The `require("./shared/...")` rewrite must have landed — if
+          # any stale ../shared/ reference remains, Node will ENOENT at
+          # runtime in the zip install.
+          if grep -rnE 'require\("\.\./shared/' "$plugin_dir" ; then
+            echo "::error::stale ../shared/ import found in staged plugin"
+            fail=1
+          fi
+          [[ "$fail" -eq 0 ]] || exit 1
+          echo "staged tree OK"
+
+      - name: Smoke-test require('./index.js') against the staged plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The plugin's index.js exports an initPlugin function that
+          # SillyTavern would normally call. We just want to confirm the
+          # module graph loads without throwing (resolves all deps).
+          cd "$plugin_dir"
+          node -e "
+            try {
+              const mod = require('./index.js');
+              if (typeof mod.init !== 'function') {
+                console.error('::error::plugin module loaded but no init export');
+                process.exit(1);
+              }
+              console.log('OK — plugin graph loaded, init() is', typeof mod.init);
+            } catch (err) {
+              console.error('::error::plugin failed to load:', err && err.stack || err);
+              process.exit(1);
+            }
+          "
+
+      - name: Build zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_ZIP="$RUNNER_TEMP/chronicledb-${{ steps.ver.outputs.label }}.zip"
+          cd "$stage"
+          # -r recurse, -q quiet, -9 max compression (node_modules bulks this
+          # up; a few extra seconds of CPU here saves ~30% download size).
+          zip -r -q -9 "$OUT_ZIP" plugins public
+          ls -lh "$OUT_ZIP"
+          echo "zip_path=$OUT_ZIP" >> "$GITHUB_ENV"
+          echo "zip_name=$(basename "$OUT_ZIP")" >> "$GITHUB_ENV"
+
+      - name: Upload as workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.zip_name }}
+          path: ${{ env.zip_path }}
+          retention-days: 14
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${{ github.ref_name }}" "$zip_path" --clobber

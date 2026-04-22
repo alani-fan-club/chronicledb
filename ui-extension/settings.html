@@ -6,6 +6,45 @@
     </div>
     <div class="inline-drawer-content">
 
+      <!--
+        First-run setup panel. Shown INSTEAD of the normal settings body when
+        the server plugin is unreachable (GET /api/plugins/chronicle-db/status
+        returns 404 or a network error). Lives inside the same drawer and
+        is swapped in/out by index.js via #chronicle_setupPanel /
+        #chronicle_normalPanel visibility.
+      -->
+      <div id="chronicle_setupPanel" class="chronicle-setup-panel" style="display: none;">
+        <h4 class="chronicle-setup-headline">Almost there — one manual step</h4>
+        <p class="chronicle-hint chronicle-setup-blurb">
+          ChronicleDB needs SillyTavern's server plugins enabled. Add this one line to your
+          <code>config.yaml</code>, then restart SillyTavern:
+        </p>
+
+        <div class="chronicle-setup-codeblock">
+          <code id="chronicle_setupConfigLine">enableServerPlugins: true</code>
+          <button type="button" id="chronicle_setupCopyBtn" class="menu_button menu_button_small chronicle-setup-copy" title="Copy to clipboard">Copy line</button>
+        </div>
+
+        <p class="chronicle-hint chronicle-setup-paths-label">Likely locations for <code>config.yaml</code>:</p>
+        <ul class="chronicle-setup-paths">
+          <li><b>Windows:</b> <code>%USERPROFILE%\SillyTavern\config.yaml</code> (or under <code>SillyTavern-Launcher</code>)</li>
+          <li><b>macOS:</b> <code>~/SillyTavern/config.yaml</code></li>
+          <li><b>Linux:</b> <code>~/SillyTavern/config.yaml</code></li>
+        </ul>
+
+        <div class="chronicle-setup-actions">
+          <input type="button" id="chronicle_setupRecheck" class="menu_button" value="I've done it — recheck">
+          <input type="button" id="chronicle_setupDismiss" class="menu_button menu_button_small chronicle-setup-dismiss" value="I know what I'm doing — hide this">
+        </div>
+        <div id="chronicle_setupRecheckHint" class="chronicle-hint chronicle-setup-recheck-hint" style="display: none;"></div>
+      </div>
+
+      <!--
+        Normal settings body. Hidden until the server plugin is confirmed
+        reachable (or the user explicitly dismisses the setup panel).
+      -->
+      <div id="chronicle_normalPanel" style="display: none;">
+
       <!-- Enable toggle -->
       <div class="chronicle-setting">
         <label class="checkbox_label" for="chronicle_enabled">
@@ -265,6 +304,8 @@
       <div class="chronicle-setting">
         <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open mind map">
       </div>
+
+      </div><!-- /#chronicle_normalPanel -->
 
     </div>
   </div>

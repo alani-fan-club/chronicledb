@@ -82,6 +82,11 @@ let isExtracting = false;
 // is reachable again.
 let dbDownNotified = false;
 let settingsSyncErrorNotified = false;
+// Guard so runFullInit() is idempotent — init() calls it on the happy path,
+// but the setup panel's "recheck" / "hide this" buttons may also call it if
+// the user unblocks things mid-session. We must not bind settings twice, hook
+// ST events twice, or spin up a second /status poll interval.
+let fullInitDone = false;
 
 // ── Initialization ─────────────────────────────────────────────
 
@@ -105,26 +110,177 @@ let settingsSyncErrorNotified = false;
   }
   const settings = extension_settings[EXT_NAME];
 
-  // Load settings panel HTML via ST's template loader
+  // Load settings panel HTML via ST's template loader. We always append the
+  // full template — the setup panel and the normal panel both live inside it
+  // and we toggle visibility based on reachability below.
   const settingsHtml = await renderExtensionTemplateAsync(
     `third-party/${EXT_NAME}`,
     'settings',
   );
   $('#extensions_settings2').append(settingsHtml);
 
+  // Probe the server plugin FIRST. v0.2.3 ships via zip-install, which leaves
+  // one manual step: the user must flip `enableServerPlugins: true` in
+  // SillyTavern's config.yaml. If they miss it, the UI extension loads but
+  // every /api/plugins/chronicle-db/* call 404s. Rather than letting every
+  // feature fail one-at-a-time with cryptic toasts, we render a first-run
+  // setup panel up front and hold off on binding settings / hooks / polling
+  // until the plugin is confirmed reachable.
+  const reachable = await probeServerPlugin();
+  if (reachable) {
+    showNormalPanel();
+    runFullInit(settings);
+  } else {
+    showSetupPanel();
+    wireSetupPanel(settings);
+  }
+
+  console.log("[ChronicleDB] UI extension loaded.");
+})();
+
+// ── First-run setup panel ──────────────────────────────────────
+
+// GET /api/plugins/chronicle-db/status. Returns true when the server plugin
+// is loaded (any 2xx/non-404 JSON response from our router), false when the
+// route 404s (server plugins disabled) or the request fails outright. We
+// deliberately DO NOT care about the status payload here — we only care
+// whether the route exists at all; the DB-connected bit is handled by the
+// existing refreshStatus() badge flow.
+async function probeServerPlugin() {
+  try {
+    const res = await fetch(`${PLUGIN_BASE}/status`, { headers: getRequestHeaders() });
+    // 404 is the unambiguous "server plugin not loaded" signal — ST's
+    // catch-all returns 404 for any /api/plugins/<id>/* when <id> isn't
+    // registered. 200 (and anything non-404 our router might return)
+    // means the plugin is mounted and reachable.
+    return res.status !== 404;
+  } catch (err) {
+    // Network error (ST itself is down mid-load, or CSP/CORS blip). Treat as
+    // unreachable — the setup panel's recheck button lets the user retry
+    // once things are back. Logging at info level since this is expected
+    // during the first-run flow.
+    console.info("[ChronicleDB] Server plugin probe failed:", err?.message || err);
+    return false;
+  }
+}
+
+function showSetupPanel() {
+  $("#chronicle_setupPanel").show();
+  $("#chronicle_normalPanel").hide();
+}
+
+function showNormalPanel() {
+  $("#chronicle_setupPanel").hide();
+  $("#chronicle_normalPanel").show();
+}
+
+// Wire the buttons in the setup panel. Called exactly once, regardless of
+// how many times the user recheck/dismisses — re-binding would attach
+// duplicate handlers.
+function wireSetupPanel(settings) {
+  // Copy button — puts `enableServerPlugins: true` on the clipboard. Prefer
+  // the async clipboard API; fall back to the old execCommand path for
+  // non-secure contexts (ST is usually served over http://localhost so this
+  // matters in practice — navigator.clipboard is undefined on insecure origins
+  // in some browsers).
+  $("#chronicle_setupCopyBtn").on("click", async function () {
+    const btn = $(this);
+    const text = "enableServerPlugins: true";
+    let copied = false;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch (_) { /* fall through to legacy path */ }
+    if (!copied) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        copied = document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch (_) { copied = false; }
+    }
+    if (copied) {
+      const original = btn.val() || btn.text();
+      btn.addClass("copied");
+      // menu_button_small renders as either <input> or <button>; support both
+      if (btn.is("input")) btn.val("Copied!"); else btn.text("Copied!");
+      setTimeout(() => {
+        btn.removeClass("copied");
+        if (btn.is("input")) btn.val(original); else btn.text(original);
+      }, 1500);
+    } else if (typeof toastr !== "undefined") {
+      toastr.warning("Couldn't copy automatically — select the line and copy manually.");
+    }
+  });
+
+  // Recheck — re-probe and, if the plugin is now reachable, swap to the
+  // normal panel and run the rest of init. If still unreachable, show a
+  // gentle nudge about restarting ST.
+  $("#chronicle_setupRecheck").on("click", async function () {
+    const btn = $(this);
+    const hint = $("#chronicle_setupRecheckHint");
+    btn.prop("disabled", true);
+    const originalVal = btn.val();
+    btn.val("Checking…");
+    hint.hide().removeClass("chronicle-setup-recheck-error").text("");
+    try {
+      const ok = await probeServerPlugin();
+      if (ok) {
+        showNormalPanel();
+        runFullInit(extension_settings[EXT_NAME]);
+        if (typeof toastr !== "undefined") {
+          toastr.success("ChronicleDB: server plugin reached. Memory is online.");
+        }
+      } else {
+        hint
+          .addClass("chronicle-setup-recheck-error")
+          .text("Still not reachable — make sure you restarted SillyTavern after editing config.yaml.")
+          .show();
+      }
+    } finally {
+      btn.prop("disabled", false);
+      btn.val(originalVal || "I've done it — recheck");
+    }
+  });
+
+  // Session-only dismiss: the user accepts the warning and wants the normal
+  // panel anyway (maybe they're mid-edit on a remote config.yaml and need
+  // the settings form to copy URLs out of). Runs full init so the settings
+  // controls are functional; on next ST reload the setup panel comes back
+  // if still unreachable.
+  $("#chronicle_setupDismiss").on("click", () => {
+    showNormalPanel();
+    runFullInit(settings);
+  });
+}
+
+// ── Post-probe full init ───────────────────────────────────────
+
+// Everything that used to live inline in init() after the template append.
+// Factored out so it can also be called from the setup panel's recheck /
+// dismiss handlers. Guarded by fullInitDone — binding settings inputs or
+// hooking ST events twice would double-fire every callback.
+function runFullInit(settings) {
+  if (fullInitDone) return;
+  fullInitDone = true;
+
   // Bind settings inputs
   bindSettings(settings);
 
   // Mount the per-character memory panel into the ST character card sidebar.
   // Failure here must not break the rest of init, so isolate in try/catch.
-  try {
-    await mountCharacterPanel();
-  } catch (err) {
+  mountCharacterPanel().catch((err) => {
     console.warn("[ChronicleDB] Character panel mount failed:", err);
-  }
+  });
 
   // Push settings to server plugin
-  await syncSettings(settings);
+  syncSettings(settings).catch(() => { /* already logged + toasted in syncSettings */ });
 
   // Auto-reconnect on every boot after the first successful initialization.
   // The server's initSchema is idempotent, so running it unconditionally is
@@ -173,7 +329,7 @@ let settingsSyncErrorNotified = false;
   }
 
   // Load on init too if a chat is already open
-  await loadChatSelector();
+  loadChatSelector().catch(() => {});
   refreshCharacterPanel().catch(() => {});
 
   // ── Event hooks ────────────────────────────────────────────
@@ -240,9 +396,7 @@ let settingsSyncErrorNotified = false;
 
     await injectMemoryContext();
   });
-
-  console.log("[ChronicleDB] UI extension loaded.");
-})();
+}
 
 // ── Extraction ─────────────────────────────────────────────────
 

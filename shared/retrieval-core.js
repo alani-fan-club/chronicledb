@@ -878,9 +878,17 @@ async function getWorldState(pool, chatIds) {
     );
     return rows;
   }
+  // Strict chat scoping — no `OR chat_id IS NULL` fallback. The hatch
+  // was designed for legitimately universal facts but in practice the
+  // extractor wrote chat-specific rows with NULL chat_id via a
+  // pre-per-chat-scoping bug, and those polluted rows leaked into
+  // every unrelated chat's memory injection (Yakuza world state
+  // showing up in an Arkansas-set roleplay, etc.). Each story has
+  // its own universe — cross-chat world facts don't have a well-
+  // defined meaning here.
   const { rows } = await pool.query(
     `SELECT key, value, valid_from as since FROM world_state
-     WHERE valid_until IS NULL AND (chat_id = ANY($1::text[]) OR chat_id IS NULL)
+     WHERE valid_until IS NULL AND chat_id = ANY($1::text[])
      ORDER BY valid_from DESC
      LIMIT 20`,
     [ids],

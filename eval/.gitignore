@@ -1,0 +1,7 @@
+.env
+node_modules/
+results/
+questions.json
+*.log
+*.scored.json
+*.report.md

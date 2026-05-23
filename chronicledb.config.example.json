@@ -1,0 +1,34 @@
+{
+  "sillytavern": {
+    "dataRoot": "/path/to/SillyTavern/data/default-user",
+    "chatsDir": "chats",
+    "charactersDir": "characters"
+  },
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "database": "chronicledb",
+    "user": "chronicledb",
+    "password": ""
+  },
+  "extraction": {
+    "model": "",
+    "batchSize": 5,
+    "debounceMs": 2000
+  },
+  "embedding": {
+    "provider": "gemini",
+    "apiKey": "",
+    "model": "",
+    "dimension": 768,
+    "taskType": "SEMANTIC_SIMILARITY"
+  },
+  "sessions": {
+    "defaultMode": "persistent",
+    "modes": {
+      "persistent": "Memories carry across all chat sessions for this character",
+      "isolated": "Fresh session — no memory from prior chats, no cross-contamination",
+      "readonly": "Can read prior memories but won't write new ones to the shared graph"
+    }
+  }
+}

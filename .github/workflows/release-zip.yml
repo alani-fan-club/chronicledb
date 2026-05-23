@@ -1,0 +1,364 @@
+# Build a drop-in release zip for ChronicleDB.
+#
+# Users unzip this into their SillyTavern folder; the internal layout
+# matches ST's expected directory structure so files land in the right
+# places automatically. No shell scripts, no symlinks, no junctions.
+#
+# Layout produced:
+#   chronicledb-vX.Y.Z.zip
+#   ├── plugins/
+#   │   └── chronicle-db/              (server plugin + bundled node_modules)
+#   │       ├── index.js
+#   │       ├── package.json
+#   │       ├── node_modules/
+#   │       ├── shared/                (copied from repo shared/, imports rewritten)
+#   │       └── ...
+#   └── public/
+#       └── scripts/
+#           └── extensions/
+#               └── third-party/
+#                   └── chronicle-db/  (UI extension — no node_modules needed)
+#                       ├── manifest.json
+#                       ├── index.js
+#                       └── ...
+#
+# The server-plugin repo layout references shared/ at the repo root
+# via `require("../shared/retrieval-core")`. In a zip install the
+# plugin is isolated under <ST>/plugins/chronicle-db/, so we copy
+# shared/ INTO the plugin directory during staging and rewrite the
+# two `../shared/` imports to `./shared/`. The dev repo layout is
+# untouched; only the staged copy is transformed.
+
+name: Release zip
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - .github/workflows/release-zip.yml
+      - server-plugin/**
+      - ui-extension/**
+      - shared/**
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag label for the zip filename (dev/testing only — does not create a release)'
+        required: false
+        default: 'dev'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      zip_name: ${{ steps.buildstep.outputs.zip_name }}
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "label=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "label=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=pr-${{ github.event.pull_request.number || 'dev' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage zip tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/stage"
+          PLUGIN_DIR="$STAGE/plugins/chronicle-db"
+          UI_DIR="$STAGE/public/scripts/extensions/third-party/chronicle-db"
+          mkdir -p "$PLUGIN_DIR" "$UI_DIR"
+
+          # Server plugin contents. -a preserves symlinks/perms but we
+          # also need to NOT copy node_modules from the dev checkout
+          # (there won't be one in CI, but defense in depth).
+          rsync -a --exclude=node_modules --exclude=.settings-cache.json \
+                server-plugin/ "$PLUGIN_DIR/"
+
+          # Inline the shared/ tree inside the plugin dir so require
+          # paths resolve without relying on a repo-root sibling.
+          rsync -a shared/ "$PLUGIN_DIR/shared/"
+
+          # The plugin resolves /map to ../src/ui relative to the plugin
+          # dir, which lands at plugins/src/ui in the extracted zip.
+          mkdir -p "$STAGE/plugins/src/ui"
+          rsync -a src/ui/ "$STAGE/plugins/src/ui/"
+
+          # Rewrite shared/ imports to ./shared/ or ../shared/ in the
+          # staged copy. Dev repo is untouched — these sed calls target
+          # the staged files under $STAGE.
+          # Top-level files: ../shared/ → ./shared/
+          sed -i -E 's|require\("\.\./shared/|require("./shared/|g' \
+            "$PLUGIN_DIR/retriever.js" \
+            "$PLUGIN_DIR/db.js"
+          # Subdirectory files (db/): ../../shared/ → ../shared/
+          sed -i -E 's|require\("../../shared/|require("../shared/|g' \
+            "$PLUGIN_DIR/db/character-panel-domain.js"
+
+          # UI extension contents. No node_modules; the UI code only
+          # imports from ST's own globals (../../../script.js etc).
+          rsync -a --exclude=node_modules ui-extension/ "$UI_DIR/"
+
+          # Pre-install production deps into the staged plugin dir.
+          # npm ci uses the committed server-plugin/package-lock.json so
+          # every release zip pins identical dep versions (the dev team's
+          # tested set). --omit=dev skips vitest/tsx and friends;
+          # --ignore-scripts blocks any package's postinstall from
+          # touching the runner (PGlite ships prebuilt WASM so it doesn't
+          # need postinstall).
+          cd "$PLUGIN_DIR"
+          npm ci --omit=dev --no-audit --no-fund --ignore-scripts
+
+          # Remove the lockfile from the zip — it's only needed for the
+          # ci install above, not for users running the plugin.
+          rm -f package-lock.json
+
+          echo "stage=$STAGE" >> "$GITHUB_ENV"
+          echo "plugin_dir=$PLUGIN_DIR" >> "$GITHUB_ENV"
+          echo "ui_dir=$UI_DIR" >> "$GITHUB_ENV"
+
+      - name: Assert staged tree has everything the plugin needs at runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail=0
+          # Files the plugin expects to find by relative path.
+          for f in \
+            index.js package.json schema.sql \
+            shared/retrieval-core.js shared/trait-lexicons.js shared/ts-query.js shared/character-identity.js \
+            node_modules/@electric-sql/pglite/package.json \
+            node_modules/express/package.json \
+            node_modules/pg/package.json \
+            node_modules/graphology/package.json \
+            node_modules/graphology-communities-louvain/package.json \
+            node_modules/dotenv/package.json ; do
+            if [[ ! -e "$plugin_dir/$f" ]]; then
+              echo "::error::missing in staged plugin: $f"
+              fail=1
+            fi
+          done
+          # UI extension files.
+          for f in manifest.json index.js style.css settings.html ; do
+            if [[ ! -e "$ui_dir/$f" ]]; then
+              echo "::error::missing in staged UI: $f"
+              fail=1
+            fi
+          done
+          # The require path rewrites must have landed. Two patterns are wrong:
+          # - ../shared/ in top-level files (should be ./shared/)
+          # - ../../shared/ anywhere (db/ subdir files should use ../shared/)
+          if grep -E 'require\("\.\./shared/' "$plugin_dir"/*.js 2>/dev/null ; then
+            echo "::error::stale ../shared/ import found in top-level staged plugin files"
+            fail=1
+          fi
+          if grep -rnE 'require\("../../shared/' "$plugin_dir" ; then
+            echo "::error::stale ../../shared/ import found in staged plugin (db/ subdir not rewritten)"
+            fail=1
+          fi
+          [[ "$fail" -eq 0 ]] || exit 1
+          echo "staged tree OK"
+
+      - name: Smoke-test require('./index.js') against the staged plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The plugin's index.js exports an initPlugin function that
+          # SillyTavern would normally call. We just want to confirm the
+          # module graph loads without throwing (resolves all deps).
+          cd "$plugin_dir"
+          node -e "
+            try {
+              const mod = require('./index.js');
+              if (typeof mod.init !== 'function') {
+                console.error('::error::plugin module loaded but no init export');
+                process.exit(1);
+              }
+              console.log('OK — plugin graph loaded, init() is', typeof mod.init);
+            } catch (err) {
+              console.error('::error::plugin failed to load:', err && err.stack || err);
+              process.exit(1);
+            }
+          "
+
+      - name: Build zip
+        id: buildstep
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_ZIP="$RUNNER_TEMP/chronicledb-${{ steps.ver.outputs.label }}.zip"
+          cd "$stage"
+          # -r recurse, -q quiet, -9 max compression (node_modules bulks this
+          # up; a few extra seconds of CPU here saves ~30% download size).
+          zip -r -q -9 "$OUT_ZIP" plugins public
+          ls -lh "$OUT_ZIP"
+          echo "zip_path=$OUT_ZIP" >> "$GITHUB_ENV"
+          echo "zip_name=$(basename "$OUT_ZIP")" >> "$GITHUB_ENV"
+          # Also expose zip_name as a job output so the Windows verify
+          # job can download the artifact by name without duplicating
+          # the label-building logic.
+          echo "zip_name=$(basename "$OUT_ZIP")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload as workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.zip_name }}
+          path: ${{ env.zip_path }}
+          retention-days: 14
+
+  # Zip install is now the primary install path the docs promote, so a
+  # Windows-native smoke test of that exact flow matters. The build job
+  # above runs on ubuntu-latest, which catches build/staging bugs but
+  # doesn't tell us whether the produced zip extracts cleanly and the
+  # plugin's require graph resolves on Windows (different path
+  # separators, different line-ending handling, different Node default
+  # encodings — the same class of things that bit install.ps1 pre-BOM).
+  verify-on-windows:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download zip artifact produced by build job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.zip_name }}
+          path: ${{ runner.temp }}\artifact
+
+      - name: Stage a fake SillyTavern install
+        shell: pwsh
+        run: |
+          $st = Join-Path $env:RUNNER_TEMP 'fake-st'
+          New-Item -ItemType Directory -Path $st -Force | Out-Null
+          Set-Content -LiteralPath (Join-Path $st 'server.js') -Value '// fake'
+          Set-Content -LiteralPath (Join-Path $st 'config.yaml') -Value "enableServerPlugins: true`n"
+          Add-Content -Path $env:GITHUB_ENV -Value "ST_DIR=$st"
+
+      - name: Extract zip into fake ST tree
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'artifact') -Filter *.zip | Select-Object -First 1
+          if (-not $zip) {
+            Write-Host "::error::no zip artifact found under $env:RUNNER_TEMP\artifact"
+            exit 1
+          }
+          Write-Host "Extracting $($zip.FullName) into $env:ST_DIR"
+          # Expand-Archive is built-in on PS 5.1+ and handles Windows path
+          # separators / line endings natively — this is the exact tool
+          # the install docs tell users to run (right-click → Extract All
+          # uses Expand-Archive under the hood).
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $env:ST_DIR -Force
+
+      - name: ASSERT — staged tree has expected paths on Windows
+        shell: pwsh
+        run: |
+          $fail = $false
+          $checks = @(
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\index.js'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\package.json'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\schema.sql'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\shared\retrieval-core.js'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\node_modules\@electric-sql\pglite\package.json'),
+            (Join-Path $env:ST_DIR 'plugins\chronicle-db\node_modules\express\package.json'),
+            (Join-Path $env:ST_DIR 'public\scripts\extensions\third-party\chronicle-db\manifest.json'),
+            (Join-Path $env:ST_DIR 'public\scripts\extensions\third-party\chronicle-db\index.js')
+          )
+          foreach ($p in $checks) {
+            if (-not (Test-Path -LiteralPath $p)) {
+              Write-Host "::error::missing after extract on Windows: $p"
+              $fail = $true
+            }
+          }
+          if ($fail) { exit 1 }
+          Write-Host "OK — every expected file is present after Windows extract"
+
+      - name: ASSERT — plugin's require graph resolves under Node on Windows
+        shell: pwsh
+        run: |
+          $pluginDir = Join-Path $env:ST_DIR 'plugins\chronicle-db'
+          Push-Location $pluginDir
+          try {
+            # Exact same smoke test as the Ubuntu build job — if Windows
+            # path resolution or line-ending handling broke any require(),
+            # this throws and the workflow fails.
+            node -e "const m = require('./index.js'); if (typeof m.init !== 'function') { console.error('::error::plugin loaded but init is', typeof m.init); process.exit(1) } console.log('OK — plugin graph loaded on Windows, init:', typeof m.init);"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally { Pop-Location }
+
+      - name: ASSERT — no stale ../shared/ imports slipped through
+        shell: pwsh
+        run: |
+          # The build-side rewrite should have converted all
+          # `../shared/` → `./shared/`; if ANY stale reference is
+          # still in the extracted zip it'll ENOENT at runtime on
+          # Windows (same as Linux, but the grep lives here so the
+          # check runs against the actually-downloaded artifact).
+          $hits = Select-String -Path "$env:ST_DIR\plugins\chronicle-db\*.js" -Pattern 'require\("\.\./shared/' -SimpleMatch:$false -ErrorAction SilentlyContinue
+          if ($hits) {
+            Write-Host "::error::stale ../shared/ import found in extracted zip on Windows:"
+            $hits | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host "OK — no stale ../shared/ imports"
+
+  # Release attach lives in its own job, gated on BOTH build and the
+  # Windows verify — we don't attach a zip to a published release if
+  # we haven't confirmed it extracts and runs on Windows. Also carries
+  # the `contents: write` permission the default GITHUB_TOKEN needs
+  # to upload release assets; v0.2.4's tag push 403'd here because
+  # the build job didn't have it. Race-tolerant create-if-missing
+  # handles the case where the release doesn't exist yet (we created
+  # v0.2.3 as a draft in parallel with the workflow and the upload
+  # couldn't find it by tag).
+  publish-release:
+    needs: [build, verify-on-windows]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download zip artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.zip_name }}
+          path: ${{ runner.temp }}/artifact
+
+      - name: Ensure release exists then upload zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="$(ls "$RUNNER_TEMP/artifact"/*.zip | head -1)"
+          if [[ -z "$ZIP" ]]; then
+            echo "::error::no zip in downloaded artifact at $RUNNER_TEMP/artifact"
+            exit 1
+          fi
+          if ! gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "No published release for ${{ github.ref_name }} — creating a placeholder."
+            gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --title "${{ github.ref_name }}" \
+              --notes "Auto-created by the release-zip workflow. The zip asset is attached below; replace this body with real release notes."
+          fi
+          gh release upload "${{ github.ref_name }}" "$ZIP" --repo "${{ github.repository }}" --clobber

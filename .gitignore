@@ -1,0 +1,30 @@
+node_modules/
+dist/
+*.env
+.DS_Store
+
+# Secrets / per-deployment config
+chronicledb.config.json
+server-plugin/.settings-cache.json
+
+# Local-only eval harness + testing data. Scrubbed from history; never
+# re-commit. Includes the retrieval eval scripts, the arc-builder grid
+# sweep harness, questions, corpus, results, and any generated bundles.
+eval/
+scripts/eval-arcs.js
+/tmp/haiku-bundle/
+/tmp/haiku-split/
+/tmp/haiku-results/
+/tmp/gemini-results/
+
+# Session-private planning docs
+IMPROVEMENTS.md
+RESEARCH.md
+RETRIEVAL_TODO.md
+CODE_REVIEW.md
+
+# Claude
+.claude/
+
+# Coverage
+coverage/

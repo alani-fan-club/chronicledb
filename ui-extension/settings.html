@@ -1,0 +1,312 @@
+<div class="chronicle-db-settings">
+  <div class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+      <b>ChronicleDB</b>
+      <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+
+      <!--
+        First-run setup panel. Shown INSTEAD of the normal settings body when
+        the server plugin is unreachable (GET /api/plugins/chronicle-db/status
+        returns 404 or a network error). Lives inside the same drawer and
+        is swapped in/out by index.js via #chronicle_setupPanel /
+        #chronicle_normalPanel visibility.
+      -->
+      <div id="chronicle_setupPanel" class="chronicle-setup-panel" style="display: none;">
+        <h4 class="chronicle-setup-headline">Almost there — one manual step</h4>
+        <p class="chronicle-hint chronicle-setup-blurb">
+          ChronicleDB needs SillyTavern's server plugins enabled. Add this one line to your
+          <code>config.yaml</code>, then restart SillyTavern:
+        </p>
+
+        <div class="chronicle-setup-codeblock">
+          <code id="chronicle_setupConfigLine">enableServerPlugins: true</code>
+          <button type="button" id="chronicle_setupCopyBtn" class="menu_button menu_button_small chronicle-setup-copy" title="Copy to clipboard">Copy line</button>
+        </div>
+
+        <p class="chronicle-hint chronicle-setup-paths-label">Likely locations for <code>config.yaml</code>:</p>
+        <ul class="chronicle-setup-paths">
+          <li><b>Windows:</b> <code>%USERPROFILE%\SillyTavern\config.yaml</code> (or under <code>SillyTavern-Launcher</code>)</li>
+          <li><b>macOS:</b> <code>~/SillyTavern/config.yaml</code></li>
+          <li><b>Linux:</b> <code>~/SillyTavern/config.yaml</code></li>
+        </ul>
+
+        <div class="chronicle-setup-actions">
+          <input type="button" id="chronicle_setupRecheck" class="menu_button" value="I've done it — recheck">
+          <input type="button" id="chronicle_setupDismiss" class="menu_button menu_button_small chronicle-setup-dismiss" value="I know what I'm doing — hide this">
+        </div>
+        <div id="chronicle_setupRecheckHint" class="chronicle-hint chronicle-setup-recheck-hint" style="display: none;"></div>
+      </div>
+
+      <!--
+        Normal settings body. Hidden until the server plugin is confirmed
+        reachable (or the user explicitly dismisses the setup panel).
+      -->
+      <div id="chronicle_normalPanel" style="display: none;">
+
+      <!-- Enable toggle -->
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enabled">
+          <input type="checkbox" id="chronicle_enabled">
+          <span>Enable ChronicleDB</span>
+        </label>
+      </div>
+
+      <!-- Connection status -->
+      <div class="chronicle-setting">
+        <span class="chronicle-status-label">Status:</span>
+        <span id="chronicle_statusBadge" class="chronicle-status chronicle-status-unknown">Checking…</span>
+        <span id="chronicle_statusDetail" class="chronicle-hint"></span>
+      </div>
+
+      <hr>
+
+      <!-- Memory mode -->
+      <div class="chronicle-setting">
+        <label for="chronicle_sessionMode">Memory mode:</label>
+        <select id="chronicle_sessionMode" class="text_pole">
+          <option value="persistent">Persistent — remember across chats</option>
+          <option value="isolated">Isolated — fresh start, no prior memory</option>
+          <option value="readonly">Read-only — use existing memory, don't add new</option>
+        </select>
+      </div>
+
+      <hr>
+
+      <!-- Database settings -->
+      <h4>Database</h4>
+      <p class="chronicle-hint">Memory is stored in an embedded PGlite database under <code>~/.chronicledb/pgdata</code>. No setup, no Postgres install — click <strong>Connect &amp; initialize</strong> below to provision it on first run.</p>
+
+      <!-- Advanced storage. Collapsed for the 99% of users who are happy
+           with embedded PGlite. Auto-expanded by bindSettings when the
+           resolved backend is "external" (legacy upgraders with pgHost
+           set, or anyone who's already flipped the toggle) so their
+           current config is visible without a click. -->
+      <details id="chronicle_advancedStorage" class="chronicle-setting" style="margin-top:.5rem;">
+        <summary style="cursor:pointer;">Advanced storage <span class="chronicle-hint" style="display:inline;margin-left:.5rem;">— bring your own Postgres (Neon, Supabase, local pg)</span></summary>
+
+        <div class="chronicle-setting" style="margin-top:.75rem;">
+          <label for="chronicle_dbBackend">Storage backend:</label>
+          <select id="chronicle_dbBackend" class="text_pole">
+            <option value="embedded">Embedded — PGlite, runs inside the plugin (default)</option>
+            <option value="external">External Postgres — connect to your own</option>
+          </select>
+          <p class="chronicle-hint">Switching here changes which store the plugin reads and writes — your data does not move between them.</p>
+        </div>
+
+        <!-- External Postgres connection. Hidden when Embedded is selected. -->
+        <div id="chronicle_externalDbFields">
+          <p class="chronicle-hint">PostgreSQL connection for the memory store. The DB needs the <code>vector</code> and <code>pg_trgm</code> extensions enabled.</p>
+          <div class="chronicle-setting-row">
+            <div class="chronicle-setting">
+              <label for="chronicle_pgHost">Host:</label>
+              <input type="text" id="chronicle_pgHost" class="text_pole" placeholder="localhost">
+            </div>
+            <div class="chronicle-setting">
+              <label for="chronicle_pgPort">Port:</label>
+              <input type="number" id="chronicle_pgPort" class="text_pole" placeholder="5432">
+            </div>
+          </div>
+          <div class="chronicle-setting">
+            <label for="chronicle_pgDatabase">Database:</label>
+            <input type="text" id="chronicle_pgDatabase" class="text_pole" placeholder="chronicledb">
+          </div>
+          <div class="chronicle-setting-row">
+            <div class="chronicle-setting">
+              <label for="chronicle_pgUser">User:</label>
+              <input type="text" id="chronicle_pgUser" class="text_pole" placeholder="chronicledb">
+            </div>
+            <div class="chronicle-setting">
+              <label for="chronicle_pgPassword">Password:</label>
+              <input type="password" id="chronicle_pgPassword" class="text_pole" placeholder="">
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div class="chronicle-setting">
+        <label for="chronicle_stDataRoot">SillyTavern data root (optional):</label>
+        <input type="text" id="chronicle_stDataRoot" class="text_pole" placeholder="auto-detected">
+        <p class="chronicle-hint">Leave blank to auto-detect. Only set this if your ST install uses a non-default layout and the server can't find your chats or character cards on its own.</p>
+      </div>
+      <div class="chronicle-setting">
+        <input type="button" id="chronicle_initDb" class="menu_button" value="Connect &amp; initialize">
+      </div>
+
+      <hr>
+
+      <!-- Memory LLM -->
+      <h4>Memory model</h4>
+      <p class="chronicle-hint">LLM that reads your chats and builds the memory. Any OpenAI-compatible or Gemini endpoint works. A cheap, fast model is fine.</p>
+      <div class="chronicle-setting">
+        <label for="chronicle_extractionApiUrl">API URL:</label>
+        <input type="text" id="chronicle_extractionApiUrl" class="text_pole" placeholder="https://generativelanguage.googleapis.com/v1beta">
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_extractionApiKey">API key:</label>
+          <input type="password" id="chronicle_extractionApiKey" class="text_pole" placeholder="">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_extractionModel">Model:</label>
+          <input type="text" id="chronicle_extractionModel" class="text_pole" placeholder="e.g. gemini-3.1-flash-lite-preview">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_extractionApiType">API type:</label>
+        <select id="chronicle_extractionApiType" class="text_pole">
+          <option value="gemini">Gemini</option>
+          <option value="vertex">Vertex AI (Express key)</option>
+          <option value="openai">OpenAI-compatible</option>
+        </select>
+      </div>
+
+      <!-- Embedding model -->
+      <h4>Embedding model</h4>
+      <p class="chronicle-hint">Converts memories into vectors for semantic search. Gemini, Vertex AI (Express mode), and any OpenAI-compatible endpoint are supported (OpenAI proper, Mistral, Voyage, Ollama, LM Studio, vLLM, OpenRouter, LiteLLM, ...). The schema is fixed at 768 dimensions — pick a 768-dim model, or one that supports a dimensions parameter (OpenAI's text-embedding-3-small / 3-large and Vertex's text-embedding-004 / 005 do).</p>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingApiType">API type:</label>
+          <select id="chronicle_embeddingApiType" class="text_pole">
+            <option value="gemini">Gemini</option>
+            <option value="vertex">Vertex AI (Express key)</option>
+            <option value="openai">OpenAI-compatible</option>
+          </select>
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingDimension">Dimension:</label>
+          <input type="number" id="chronicle_embeddingDimension" class="text_pole" value="768" readonly disabled>
+          <p class="chronicle-hint">Fixed at 768 — the schema's <code>vector(768)</code> columns are baked into the indexes. Pick an embedding model that natively outputs 768, or one that accepts a <code>dimensions</code> parameter (OpenAI 3-small / 3-large, Vertex 004 / 005, Voyage) and the plugin will truncate. Setting any other value here would only desync embed-time from store-time and break inserts.</p>
+        </div>
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingModel">Model:</label>
+          <input type="text" id="chronicle_embeddingModel" class="text_pole" placeholder="gemini-embedding-2-preview or text-embedding-3-small">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_embeddingApiUrl">API URL (optional):</label>
+          <input type="text" id="chronicle_embeddingApiUrl" class="text_pole" placeholder="leave blank for the provider default">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_embeddingApiKey">API key (leave blank to reuse the memory model's key):</label>
+        <input type="password" id="chronicle_embeddingApiKey" class="text_pole" placeholder="sk-... or AIza...">
+      </div>
+
+      <hr>
+
+      <!-- Behavior -->
+      <h4>Behavior</h4>
+      <p class="chronicle-hint">How memory gets built while you chat.</p>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_autoIngest">
+          <input type="checkbox" id="chronicle_autoIngest">
+          <span>Auto-build memory on new chats</span>
+        </label>
+        <p class="chronicle-hint">When on, every reply automatically updates memory for the current chat — no manual ingest needed. Turn off if you only want memory from chats you explicitly ingest.</p>
+      </div>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting">
+          <label for="chronicle_extractEveryN">Update memory every N replies:</label>
+          <input type="number" id="chronicle_extractEveryN" class="text_pole" min="1" max="20" placeholder="1">
+        </div>
+        <div class="chronicle-setting">
+          <label for="chronicle_maxInjectionTokens">Memory budget (tokens):</label>
+          <input type="number" id="chronicle_maxInjectionTokens" class="text_pole" min="200" max="8000" placeholder="3000">
+        </div>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_ingestionPadding">Keep last N messages raw (don't ingest):</label>
+        <input type="number" id="chronicle_ingestionPadding" class="text_pole" min="0" max="50" placeholder="5">
+        <p class="chronicle-hint">Recent messages stay in ST's native context until they're N turns behind. Skipping ingest on the latest N means swiping or editing recent replies doesn't need cleanup because nothing was written to the graph yet. Default 5.</p>
+      </div>
+      <div class="chronicle-setting">
+        <label for="chronicle_arcRebuildEveryN">Refresh story arcs every N events:</label>
+        <input type="number" id="chronicle_arcRebuildEveryN" class="text_pole" min="0" max="200" placeholder="30">
+        <p class="chronicle-hint">Recomputes the story-arc structure (super-arcs / arcs / episodes) on the auto-ingest path every N new events. Cluster titles are recycled when their centerpiece event is unchanged, so the per-fire LLM cost is near zero on stable partitions. 0 disables — only the manual full-chat ingest will rebuild arcs.</p>
+      </div>
+
+      <!-- Memory type toggles -->
+      <h4>What to remember</h4>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableRelationships">
+          <input type="checkbox" id="chronicle_enableRelationships">
+          <span>Relationships</span>
+        </label>
+      </div>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableEvents">
+          <input type="checkbox" id="chronicle_enableEvents">
+          <span>Events &amp; timeline</span>
+        </label>
+      </div>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableKnowledge">
+          <input type="checkbox" id="chronicle_enableKnowledge">
+          <span>What each character knows</span>
+        </label>
+      </div>
+      <div class="chronicle-setting">
+        <label class="checkbox_label" for="chronicle_enableWorldState">
+          <input type="checkbox" id="chronicle_enableWorldState">
+          <span>World state</span>
+        </label>
+      </div>
+
+      <hr>
+
+      <!-- Per-character chat memory selector -->
+      <h4>Character memory</h4>
+      <p class="chronicle-hint">Pick which past chats this character remembers. Unchecked chats are hidden from them.</p>
+      <div id="chronicle_chatSelector" class="chronicle-chat-selector">
+        <p class="chronicle-hint">Open a chat to see available sessions.</p>
+      </div>
+      <div class="chronicle-setting-row" style="margin-top: 6px;">
+        <input type="button" id="chronicle_selectAllChats" class="menu_button menu_button_small" value="Select all">
+        <input type="button" id="chronicle_selectNoneChats" class="menu_button menu_button_small" value="Select none">
+        <input type="button" id="chronicle_ingestAllChats" class="menu_button menu_button_small" value="Build memory from all" title="Read every chat and build memory from them">
+      </div>
+      <div id="chronicle_ingestStatus" class="chronicle-hint" style="margin-top: 4px;"></div>
+
+      <hr>
+
+      <!-- Lorebook ingestion -->
+      <h4>Lorebook import</h4>
+      <p class="chronicle-hint">Pull in a lorebook so the world's facts, people, and places become part of memory.</p>
+      <div class="chronicle-setting-row">
+        <div class="chronicle-setting" style="flex: 2;">
+          <select id="chronicle_lorebookSelect" class="text_pole">
+            <option value="">-- Select lorebook --</option>
+          </select>
+        </div>
+        <div class="chronicle-setting">
+          <input type="button" id="chronicle_ingestLorebook" class="menu_button" value="Import">
+        </div>
+      </div>
+      <div id="chronicle_lorebookStatus" class="chronicle-hint"></div>
+
+      <hr>
+
+      <!-- Debug: recent LLM calls -->
+      <h4>Debug: recent LLM calls</h4>
+      <p class="chronicle-hint">Last 200 LLM requests the plugin has made. Useful for spotting stalls, retries, and rate limits. Buffer clears on restart.</p>
+      <div class="chronicle-setting-row">
+        <input type="button" id="chronicle_refreshLlmMonitor" class="menu_button menu_button_small" value="Refresh">
+        <input type="button" id="chronicle_clearLlmMonitor" class="menu_button menu_button_small" value="Clear view">
+      </div>
+      <div id="chronicle_llmMonitorTable" class="chronicle-hint" style="max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 11px;"></div>
+
+      <hr>
+
+      <!-- Actions -->
+      <div class="chronicle-setting">
+        <input type="button" id="chronicle_openMindMap" class="menu_button" value="Open mind map">
+      </div>
+
+      </div><!-- /#chronicle_normalPanel -->
+
+    </div>
+  </div>
+</div>

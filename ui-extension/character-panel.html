@@ -1,0 +1,50 @@
+<div class="chronicle-db-settings chronicle-char-panel-wrap">
+  <div class="inline-drawer flex-container flexFlowColumn flexNoGap">
+    <div class="inline-drawer-toggle inline-drawer-header padding0 gap5px standoutHeader">
+      <div class="title_restorable flexGap5 wide100p">
+        <span class="flex1"><b>ChronicleDB memory</b> — <span id="chronicle_char_panel_name" class="chronicle-hint">&nbsp;</span></span>
+      </div>
+      <div class="flex-container widthFitContent">
+        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down interactable"></div>
+      </div>
+    </div>
+    <div class="inline-drawer-content">
+      <div id="chronicle_char_panel_body">
+
+        <div id="chronicle_char_panel_stats" class="chronicle-char-stats">
+          <span class="chronicle-hint">Loading…</span>
+        </div>
+
+        <div class="chronicle-setting">
+          <label for="chronicle_char_panel_mode">Memory for this character:</label>
+          <select id="chronicle_char_panel_mode" class="text_pole">
+            <option value="persistent">Persistent — remember across chats</option>
+            <option value="isolated">Isolated — fresh start, no prior memory</option>
+            <option value="readonly">Read-only — use existing memory, don't add new</option>
+          </select>
+          <p class="chronicle-hint">Overrides the global memory mode just for this character.</p>
+        </div>
+
+        <hr>
+
+        <h4>Recent memories</h4>
+        <div id="chronicle_char_panel_events" class="chronicle-char-list">
+          <span class="chronicle-hint">Loading…</span>
+        </div>
+
+        <h4>Relationships</h4>
+        <div id="chronicle_char_panel_rels" class="chronicle-char-list">
+          <span class="chronicle-hint">Loading…</span>
+        </div>
+
+        <hr>
+
+        <div class="chronicle-setting">
+          <input type="button" id="chronicle_char_panel_clear" class="menu_button" value="Clear memories for this character">
+          <p class="chronicle-hint">Removes this character's traits, relationships, and presence from memory. Events and other characters are kept.</p>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>

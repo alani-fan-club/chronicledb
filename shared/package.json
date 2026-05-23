@@ -1,0 +1,6 @@
+{
+  "name": "chronicledb-shared",
+  "private": true,
+  "description": "Shared retrieval primitives used by both the eval client (ESM TS) and the SillyTavern plugin (CJS).",
+  "type": "commonjs"
+}

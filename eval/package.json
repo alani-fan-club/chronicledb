@@ -1,0 +1,22 @@
+{
+  "name": "chronicledb-eval",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "generate": "tsx scripts/generate_questions.ts",
+    "run": "tsx scripts/run_eval.ts",
+    "run:dry": "tsx scripts/run_eval.ts --dry-run",
+    "score": "tsx scripts/score.ts",
+    "report": "tsx scripts/report.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

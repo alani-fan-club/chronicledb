@@ -1,0 +1,36 @@
+{
+  "name": "chronicledb",
+  "version": "0.3.2",
+  "description": "Persistent memory system for SillyTavern roleplays — hybrid graph + vector architecture",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.4.4",
+    "cytoscape": "^3.30.4",
+    "express": "^4.21.1",
+    "openai": "^4.77.0",
+    "p-queue": "^8.0.1",
+    "pg": "^8.13.1",
+    "pgvector": "^0.2.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@vitest/coverage-v8": "^2.1.9",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "overrides": {
+    "esbuild": ">=0.25.0",
+    "vite": ">=6.4.2",
+    "postcss": ">=8.5.10"
+  }
+}

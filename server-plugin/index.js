@@ -1,0 +1,1451 @@
+/**
+ * ChronicleDB — SillyTavern Server Plugin
+ * Persistent graph+vector memory for RP.
+ *
+ * ST server plugins export: init(router), exit(), info
+ */
+
+const db = require("./db");
+const { isEmbeddedBackend } = require("./db/client");
+const {
+  extract,
+  embed,
+  embedBatch,
+  applyExtractionToGraph,
+  applyMessagesToVectorStore,
+  resolveUserName,
+} = require("./extractor");
+const { retrieve, formatMemoryBlock } = require("./retriever");
+const { ingestLorebook, listLorebooks } = require("./lorebook");
+const { parseChatJsonl, buildChatBatches } = require("./chat-jsonl");
+const { safeResolveUnder } = require("./path-safety");
+const { setWithBoundedEviction } = require("./bounded-map");
+const { resolveStDataRoot } = require("./st-paths");
+const {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  statSync,
+  realpathSync,
+  createReadStream,
+  chmodSync,
+} = require("fs");
+const { resolve: pathResolve, dirname: pathDirname, join: pathJoin } = require("path");
+
+let settings = {};
+// Tracks live DB state so /status can report it without touching the pool.
+let connectionState = { connected: false, error: null, initializedAt: null };
+
+// Settings are cached on disk so the server can auto-reconnect on ST boot
+// without waiting for the UI extension to push them via /settings.
+const SETTINGS_CACHE_PATH = pathResolve(__dirname, ".settings-cache.json");
+
+// Allowlist of settings fields the UI extension is permitted to mutate via
+// POST /settings. Anything else in the request body is dropped. Path-typed
+// fields (embeddedDataDir, stDataRoot) are intentionally excluded — they
+// must come from the on-disk config only, since a remote attacker should
+// never be able to repoint the embedded DB or the ST data root.
+const SETTINGS_ALLOWLIST = new Set([
+  // Backend selection
+  "dbBackend", "initialized",
+  // Embedded backend (PGlite) — non-path tunables only
+  "embeddedAutoInit",
+  // External Postgres
+  "pgHost", "pgPort", "pgDatabase", "pgUser", "pgPassword",
+  // LLM extraction
+  "apiType", "extractionModel", "extractionApiUrl", "extractionApiKey",
+  "extractionTemperature", "extractionMaxTokens", "extractionTimeoutMs",
+  // Embeddings
+  "embeddingApiType", "embeddingModel", "embeddingApiUrl", "embeddingApiKey",
+  "embeddingDimensions", "embeddingTimeoutMs",
+  // Gemini-specific
+  "geminiApiKey",
+  // Retrieval / pipeline tunables
+  "retrievalDepth", "memoryWindowSize", "extractionBatchSize",
+  "ingestionBatchSize", "extractMessageCharCap",
+  // Misc UI-managed flags
+  "autoExtractEnabled",
+  // NOTE: `debugSurfaceEnabled` is intentionally NOT in this allowlist.
+  // It gates /debug/llm-calls (which exposes raw chat content via the
+  // llm-monitor ring buffer), so an attacker who can reach POST /settings
+  // must not be able to flip their own gate. The flag must be set via
+  // the on-disk config layer (edit .settings-cache.json locally, or via
+  // a future env-var override).
+]);
+
+// Fields that are credentials/secrets — never echoed back over the wire on
+// GET /settings. We expose only a "set / not set" signal plus a 4-char
+// prefix so the UI can show "sk-A…" without round-tripping the secret.
+const SECRET_FIELDS = new Set([
+  "pgPassword", "extractionApiKey", "embeddingApiKey", "geminiApiKey",
+]);
+
+// Allowlist of LLM provider hosts the user can configure. Anyone on the
+// network (or in any browser tab if ST is running on localhost without
+// auth) can hit POST /settings, and rebinding extraction/embedding URLs
+// to an attacker host trivially exfiltrates chat content + the user's
+// API key. Allow only the providers we actually support.
+const ALLOWED_LLM_HOSTS = [
+  "generativelanguage.googleapis.com",
+  "api.openai.com",
+  "us-central1-aiplatform.googleapis.com",
+];
+function isSafeLlmUrl(u) {
+  if (typeof u !== "string" || u.length === 0) return false;
+  let url;
+  try { url = new URL(u); } catch { return false; }
+  if (url.protocol !== "https:") return false;
+  return ALLOWED_LLM_HOSTS.some(
+    (host) => url.hostname === host || url.hostname.endsWith("." + host),
+  );
+}
+
+function redactSettings(s) {
+  const out = { ...s };
+  for (const k of SECRET_FIELDS) {
+    const v = s?.[k];
+    if (typeof v === "string" && v.length > 0) {
+      out[k] = `set:${v.slice(0, 4)}…`;
+    } else {
+      out[k] = null;
+    }
+  }
+  return out;
+}
+
+function loadCachedSettings() {
+  try {
+    if (!existsSync(SETTINGS_CACHE_PATH)) return null;
+    return JSON.parse(readFileSync(SETTINGS_CACHE_PATH, "utf-8"));
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to read cached settings:", err.message);
+    return null;
+  }
+}
+
+function saveCachedSettings(s) {
+  try {
+    const dir = pathDirname(SETTINGS_CACHE_PATH);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(SETTINGS_CACHE_PATH, JSON.stringify(s, null, 2), { mode: 0o600 });
+    // chmod separately to handle a pre-existing cache file that was
+    // written by an older revision under the default umask (often 0o644).
+    // writeFileSync's mode option only applies on creation, not on
+    // overwrite, so this second call is what makes the fix retroactive.
+    try { chmodSync(SETTINGS_CACHE_PATH, 0o600); } catch {}
+  } catch (err) {
+    console.warn("[ChronicleDB] Failed to cache settings:", err.message);
+  }
+}
+
+// Recognize pg/node connectivity failures so routes can flip
+// connectionState. Covers: refused / DNS / timeout / admin shutdown /
+// crash shutdown / cannot_connect_now, plus the catch-all "Connection
+// terminated" message pg emits when an active client loses its socket.
+// Used by /extract, /retrieve, and the /status probe; intentionally
+// over-inclusive so a real outage always flips state even if pg adds
+// new error codes in future versions.
+function isDbConnectivityError(err) {
+  if (!err) return false;
+  const code = err.code || "";
+  if (["ECONNREFUSED", "ENOTFOUND", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH",
+       "57P01", "57P02", "57P03", "08000", "08003", "08006"].includes(code)) return true;
+  const msg = String(err.message || "").toLowerCase();
+  return /connect|terminat|socket|refused|not found|timeout/.test(msg);
+}
+
+function markDisconnected(err) {
+  connectionState = {
+    connected: false,
+    error: err?.message || String(err),
+    initializedAt: null,
+  };
+}
+
+function readOptionalQueryString(query, key) {
+  const raw = query && typeof query[key] === "string"
+    ? query[key].trim()
+    : "";
+  return raw.length > 0 ? raw : null;
+}
+
+function readOptionalChatId(query) {
+  return readOptionalQueryString(query, "chat_id");
+}
+
+function readOptionalChatIds(query) {
+  const raw = readOptionalChatId(query);
+  if (!raw) return null;
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function readRequiredRequestValue(res, source, key) {
+  const value = source && source[key];
+  if (value) return value;
+  res.status(400).json({ error: `${key} required` });
+  return null;
+}
+
+// Marker class for errors whose `.message` was deliberately curated as
+// user-facing text and is safe to expose to the client. Use this for
+// configuration-mismatch / validation errors where the message is the
+// product UX (e.g. "Connected as 'bob' but settings configured user
+// 'alice'."). Bare `Error`/pg errors continue to get the generic
+// scrub in sendInternalError so we don't leak connection strings,
+// role names, schema names, dataDir paths, or stack traces.
+class ExpectedClientError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ExpectedClientError";
+  }
+}
+
+function sendInternalError(res, err) {
+  // Log full error (with stack) server-side for debugging.
+  console.error("[ChronicleDB] internal error:", err);
+  // Surface deliberately-curated user-facing errors to the client.
+  // Everything else gets a generic message — callers can correlate via
+  // the server log timestamp.
+  if (err instanceof ExpectedClientError) {
+    res.status(500).json({ error: err.message });
+    return;
+  }
+  res.status(500).json({ error: "Internal error" });
+}
+
+function sendBadRequest(res, message) {
+  return res.status(400).json({ error: message });
+}
+
+function withInternalError(handler, options = {}) {
+  const { onError } = options;
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (err) {
+      if (typeof onError === "function") {
+        onError(err, req, res);
+      }
+      if (!res.headersSent) {
+        sendInternalError(res, err);
+      }
+    }
+  };
+}
+
+async function queryRows(sql, params = []) {
+  const { rows } = await db.getPool(settings).query(sql, params);
+  return rows;
+}
+
+function resolveStChatsDir() {
+  return pathResolve(resolveStDataRoot(settings), "chats");
+}
+
+function resolveStCharactersDir() {
+  return pathResolve(resolveStDataRoot(settings), "characters");
+}
+
+function findMatchingChatDirectoryName(chatsBase, characterName) {
+  // Exact match only. Prefix matching used to let a request for
+  // characterName="A" surface "Alice"'s chat directory, leaking other
+  // characters' data when an attacker could only guess a prefix. ST
+  // already stores chats keyed by exact character directory name, so
+  // exact match is what callers actually want.
+  const entries = readdirSync(chatsBase);
+  return entries.find((entry) => entry === characterName) || null;
+}
+
+function stripJsonlSuffix(value) {
+  return (value || "").replace(/\.jsonl$/, "");
+}
+
+function readOptionalIntegerQuery(query, key, fallback, radix) {
+  const raw = query ? query[key] : undefined;
+  const parsed = typeof radix === "number" ? parseInt(raw, radix) : parseInt(raw);
+  return isNaN(parsed) ? fallback : parsed;
+}
+
+function safeResolveUnderOrBadRequest(res, basePath, requestedPath) {
+  try {
+    return safeResolveUnder(basePath, requestedPath);
+  } catch (err) {
+    sendBadRequest(res, err.message);
+    return null;
+  }
+}
+
+async function fetchAndVerifyConfiguredDbIdentity(activeSettings) {
+  // Embedded PGlite always reports current_database() = "postgres" and
+  // current_user = "postgres" regardless of settings — skip the drift
+  // check that only matters for external Postgres connections.
+  if (isEmbeddedBackend(activeSettings)) return null;
+
+  const pool = db.getPool(activeSettings);
+  const { rows: [verify] } = await pool.query(
+    `SELECT current_user AS u, current_database() AS d`,
+  );
+
+  const expectedUser = (activeSettings.pgUser || "").trim();
+  const expectedDb = (activeSettings.pgDatabase || "").trim();
+
+  if (expectedUser && verify.u !== expectedUser) {
+    throw new ExpectedClientError(
+      `Connected as "${verify.u}" but settings configured user "${expectedUser}". ` +
+      `Postgres trust/peer auth ignored your username — fix pg_hba.conf to require ` +
+      `password auth, or update the user field to "${verify.u}" to match what Postgres ` +
+      `actually logged you in as.`,
+    );
+  }
+  if (expectedDb && verify.d !== expectedDb) {
+    throw new ExpectedClientError(
+      `Connected to database "${verify.d}" but settings configured "${expectedDb}". ` +
+      `Check the database name field.`,
+    );
+  }
+
+  return verify;
+}
+
+async function tryAutoConnect() {
+  if (!settings.pgHost || !settings.pgDatabase) {
+    connectionState = { connected: false, error: null, initializedAt: null };
+    return;
+  }
+  try {
+    await db.initSchema(settings);
+    // Postgres trust auth (and peer auth on Unix sockets) ignore the
+    // username field — they accept the connection as whatever role
+    // the OS user maps to. So a typo in pgUser will silently "succeed"
+    // and then every subsequent query runs as a different role than
+    // the user thinks. Verify after connect: query SELECT current_user
+    // and current_database, compare to the configured values, and
+    // surface a hard error if either drifts. This catches the
+    // "I had a wrong username for the database and the plugin didn't
+    // catch it" failure mode reported by friends during install.
+    const verify = await fetchAndVerifyConfiguredDbIdentity(settings);
+    connectionState = {
+      connected: true,
+      error: null,
+      initializedAt: new Date().toISOString(),
+    };
+    if (verify) {
+      console.log(`[ChronicleDB] Auto-connected to database "${verify.d}" as "${verify.u}".`);
+    } else {
+      console.log("[ChronicleDB] Auto-connected (embedded PGlite).");
+    }
+  } catch (err) {
+    connectionState = {
+      connected: false,
+      error: err.message,
+      initializedAt: null,
+    };
+    console.error("[ChronicleDB] Auto-connect failed:", err.message);
+  }
+}
+
+/**
+ * Plugin info — displayed in ST's plugin list.
+ */
+const info = {
+  id: "chronicle-db",
+  name: "ChronicleDB",
+  description: "Persistent graph+vector memory for roleplay — tracks relationships, events, knowledge boundaries, and world state",
+};
+
+/**
+ * Initialize the plugin. ST passes an Express router scoped to
+ * /api/plugins/chronicle-db/
+ */
+async function init(router) {
+  console.log("[ChronicleDB] Initializing server plugin...");
+
+  // Hook pool-level idle-client errors so a DB restart or network blip
+  // flips connectionState instead of silently killing queries. Without
+  // this the plugin would keep reporting connected=true while every
+  // subsequent query fails.
+  db.setPoolErrorHandler((err) => {
+    console.error("[ChronicleDB] Pool error (idle client):", err?.message || err);
+    markDisconnected(err);
+  });
+
+  // Hydrate settings from the on-disk cache so we can auto-reconnect before
+  // the UI extension pushes anything via POST /settings.
+  const cached = loadCachedSettings();
+  if (cached) {
+    settings = { ...settings, ...cached };
+    if (cached.initialized) {
+      // Fire and forget — don't block plugin init on DB reachability.
+      tryAutoConnect().catch(() => {});
+    }
+  }
+
+  // ── Serve mind map UI ────────────────────────────────────────
+  const express = require("express");
+  // Resolve through symlink to find the actual project root
+  const pluginRealDir = realpathSync(__dirname);
+  const mapPath = pathResolve(pluginRealDir, "..", "src", "ui");
+  console.log("[ChronicleDB] Mind map path:", mapPath);
+  router.use("/map", express.static(mapPath));
+
+  // ── Settings endpoint (UI extension saves/loads settings here) ──
+
+  router.post("/settings", withInternalError(async (req, res) => {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+
+    // URL-validate before merging — reject early so a partial merge can't
+    // happen on a body that mixes a valid field with a hostile URL field.
+    for (const key of ["extractionApiUrl", "embeddingApiUrl"]) {
+      if (key in body && body[key] !== "" && body[key] != null && !isSafeLlmUrl(body[key])) {
+        return res.status(400).json({
+          error: `${key} must point at a known LLM provider over https. ` +
+                 `Allowed hosts: ${ALLOWED_LLM_HOSTS.join(", ")}.`,
+        });
+      }
+    }
+
+    // Merge only allowlisted fields. Path-typed fields (embeddedDataDir,
+    // stDataRoot) are deliberately not in SETTINGS_ALLOWLIST — those must
+    // come from the on-disk config only.
+    const next = { ...settings };
+    for (const key of Object.keys(body)) {
+      if (SETTINGS_ALLOWLIST.has(key)) next[key] = body[key];
+    }
+    const prev = settings;
+    settings = next;
+    saveCachedSettings(settings);
+
+    // If credentials changed while we weren't connected, attempt reconnect
+    // in the background. Idempotent initSchema makes this safe to re-run.
+    const credsChanged =
+      prev.pgHost !== settings.pgHost ||
+      prev.pgPort !== settings.pgPort ||
+      prev.pgDatabase !== settings.pgDatabase ||
+      prev.pgUser !== settings.pgUser ||
+      prev.pgPassword !== settings.pgPassword;
+    if (settings.initialized && (credsChanged || !connectionState.connected)) {
+      tryAutoConnect().catch(() => {});
+    }
+
+    res.json({ ok: true });
+  }));
+
+  router.get("/settings", (_req, res) => {
+    res.json(redactSettings(settings));
+  });
+
+  // ── Connection status ────────────────────────────────────────
+
+  router.get("/status", withInternalError(async (_req, res) => {
+    // Probe the pool on every poll so the UI catches runtime DB outages
+    // (DB restart, network blip, admin shutdown) without waiting for the
+    // next /extract or /retrieve to fail. Also surfaces recovery: if we
+    // previously flipped to error but the DB is back, SELECT 1 succeeds
+    // and we restore connected=true. SELECT 1 on a warm pool is
+    // microseconds so a 30s client poll is effectively free.
+    if (settings.pgHost && settings.pgDatabase) {
+      try {
+        await db.getPool(settings).query("SELECT 1");
+        if (!connectionState.connected) {
+          connectionState = {
+            connected: true,
+            error: null,
+            initializedAt: new Date().toISOString(),
+          };
+          console.log("[ChronicleDB] DB reachable again — connectionState restored.");
+        }
+      } catch (err) {
+        if (connectionState.connected || !connectionState.error) {
+          console.warn("[ChronicleDB] /status probe failed:", err.message);
+        }
+        markDisconnected(err);
+      }
+    }
+    res.json({
+      connected: connectionState.connected,
+      // Generic "unavailable" string when the DB probe is failing — we
+      // don't echo err.message to the client because it can include pg
+      // connection strings, role names, schema names, dataDir paths.
+      // Full error stays in server logs via markDisconnected/console.warn.
+      error: connectionState.connected ? null : (connectionState.error ? "unavailable" : null),
+      initializedAt: connectionState.initializedAt,
+      configured: Boolean(settings.pgHost && settings.pgDatabase),
+    });
+  }));
+
+  // ── Schema init ──────────────────────────────────────────────
+
+  router.post("/init-db", withInternalError(async (_req, res) => {
+    await db.initSchema(settings);
+    // Same trust-auth verification as tryAutoConnect — a user clicking
+    // "Connect & initialize" with a wrong username typo should see a
+    // clear error in the UI, not a green checkmark followed by silent
+    // query failures later.
+    const verify = await fetchAndVerifyConfiguredDbIdentity(settings);
+    connectionState = {
+      connected: true,
+      error: null,
+      initializedAt: new Date().toISOString(),
+    };
+    // Persist the fact that we've initialized so subsequent ST boots
+    // know to auto-reconnect. The UI also sets this flag, but doing it
+    // here too means standalone /init-db POSTs still work.
+    settings.initialized = true;
+    saveCachedSettings(settings);
+    res.json({ ok: true, user: verify?.u ?? null, database: verify?.d ?? null });
+  }, {
+    onError: (err) => {
+      connectionState = { connected: false, error: err.message, initializedAt: null };
+      console.error("[ChronicleDB] DB init error:", err);
+    },
+  }));
+
+  // ── Extraction endpoint ──────────────────────────────────────
+  // Called by UI ext after GENERATION_ENDED (async, non-blocking)
+
+  // Per-chat state for the incremental arc-rebuild trigger. Tracks the
+  // event_count value as of the last rebuild and a mutex so concurrent
+  // /extract calls for the same chat can't double-rebuild.
+  // Resets on plugin restart, which is fine — the worst case is the very
+  // first /extract after restart waits a few extra messages to fire.
+  const ARC_REBUILD_CACHE_MAX = 200;
+  const arcRebuildLastCount = new Map(); // chatId -> int
+  const arcRebuildInFlight = new Set();  // chatId
+  // When a rebuild is in flight and a new /extract trigger arrives for the
+  // same chat, coalesce the (possibly many) follow-up triggers into a single
+  // pending rebuild that fires once the in-flight one completes. Bounds the
+  // rebuild fan-out to 2 (current + one follow-up) regardless of how many
+  // /extract calls land mid-rebuild.
+  const arcRebuildPending = new Set(); // chatId
+
+  // Bounded eviction. Both maps accumulate one entry per chat_id forever,
+  // so a long-running ST process with many chats grows unboundedly. Cap at
+  // ARC_REBUILD_CACHE_MAX entries and evict the oldest (Map preserves insertion order, so
+  // `keys().next().value` is the least-recently-inserted). Use this wrapper
+  // instead of `arcRebuildLastCount.set(chatId, n)` directly.
+  function setArcRebuildCount(chatId, n) {
+    setWithBoundedEviction(arcRebuildLastCount, chatId, n, ARC_REBUILD_CACHE_MAX, {
+      // Set.delete(value) is a no-op if the value isn't present, so this is
+      // safe even when the evicted chat has no in-flight rebuild.
+      onEvict: (evictedChatId) => {
+        arcRebuildInFlight.delete(evictedChatId);
+        arcRebuildPending.delete(evictedChatId);
+      },
+    });
+  }
+
+  // Fire-and-forget arc rebuild with coalesced follow-up. If another
+  // /extract sets arcRebuildPending[chatId] while this is running, we
+  // re-fire once on completion (capturing all events that arrived during
+  // the in-flight rebuild). Errors are logged only — never thrown to a
+  // caller because the HTTP response was already sent.
+  function startArcRebuild(chatId) {
+    arcRebuildInFlight.add(chatId);
+    (async () => {
+      try {
+        const { rebuildArcsForChat } = require("./arc-builder");
+        const r = await rebuildArcsForChat(settings, chatId, {
+          nameArcs: true, nameHierarchy: true,
+        });
+        console.log(
+          `[ChronicleDB] Incremental arc rebuild for ${chatId}: ` +
+          `${r.builtArcs} arcs (${r.namedArcs ?? 0} new LLM-named, ${r.recycledArcs ?? 0} recycled), ` +
+          `${r.superArcs} super (${r.namedSuperArcs ?? 0} new, ${r.recycledSuperArcs ?? 0} recycled), ` +
+          `${r.episodes} episodes (${r.namedEpisodes ?? 0} new, ${r.recycledEpisodes ?? 0} recycled), ` +
+          `Q=${(r.modularityQ ?? 0).toFixed(3)}, N=${r.totalEvents}`,
+        );
+      } catch (err) {
+        console.warn(`[ChronicleDB] Incremental arc rebuild failed for ${chatId}: ${err.message}`);
+      } finally {
+        arcRebuildInFlight.delete(chatId);
+        if (arcRebuildPending.delete(chatId)) {
+          // Refresh the last-count baseline so the next coalesced rebuild
+          // reflects events that landed during the prior run.
+          try {
+            const { rows: [{ n }] } = await db.getPool(settings).query(
+              `SELECT COUNT(*)::int AS n FROM events WHERE chat_id = $1`,
+              [chatId],
+            );
+            setArcRebuildCount(chatId, n);
+          } catch (err) {
+            console.warn(`[ChronicleDB] Arc-rebuild follow-up counter check failed: ${err.message}`);
+          }
+          startArcRebuild(chatId);
+        }
+      }
+    })();
+  }
+
+  // Per-(chatId, messageIndex) extract mutex. When two /extract calls
+  // land for the same message — typically because the user generated
+  // a swipe, then immediately swiped to regenerate before the first
+  // extract finished — they would otherwise race: the slower one's
+  // INSERTs land last and overwrite the faster one's, regardless of
+  // which is "current". This Map keys an in-flight Promise per
+  // (chatId, messageIndex) so the second call awaits the first to
+  // finish before running its own DELETE+INSERT cycle. Latest writer
+  // (in completion order) wins, which because of the swipe-cleanup
+  // hook always corresponds to the user's currently-active swipe.
+  const extractMutex = new Map(); // key: `${chatId}::${messageIndex}` -> Promise
+
+  router.post("/extract", withInternalError(async (req, res) => {
+    const { characterName, userName, messages, chatId, messageIndex } = req.body;
+    const mutexKey = chatId && typeof messageIndex === "number"
+      ? `${chatId}::${messageIndex}`
+      : null;
+    // Wait for any in-flight extract on the same message to finish so
+    // we serialize concurrent writers for the same (chatId, msgIdx).
+    // The key is intentionally per-message: parallel extracts for
+    // different messages still run concurrently.
+    if (mutexKey && extractMutex.has(mutexKey)) {
+      try { await extractMutex.get(mutexKey); } catch { /* prior call's error is its own */ }
+    }
+    let release;
+    let myPromise = null;
+    if (mutexKey) {
+      myPromise = new Promise((resolve) => { release = resolve; });
+      extractMutex.set(mutexKey, myPromise);
+    }
+    try {
+      // 0. Idempotent: if a previous extract wrote rows for this exact
+      //    (chatId, messageIndex), wipe them before re-extracting. Keeps
+      //    the live path's per-message extraction overwrite-clean even
+      //    when the swipe-cleanup hook hasn't fired yet (or fired late).
+      //    /ingest-chat keeps its own drop-and-rebuild semantics so
+      //    bulk ingests are unaffected.
+      if (mutexKey) {
+        // Wrap the pre-clean in a transaction so a partial failure can't
+        // leave orphaned rows (e.g. participated_in deleted but events kept,
+        // or vice versa). On error, rollback and let withInternalError
+        // surface a 500 — proceeding past a failed pre-clean would write
+        // duplicates on top of stale rows.
+        const client = await db.getPool(settings).connect();
+        try {
+          await client.query("BEGIN");
+          await client.query(
+            `DELETE FROM participated_in
+             WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
+            [chatId, messageIndex],
+          );
+          await client.query(`DELETE FROM events           WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM dialogue_quotes  WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2`, [chatId, messageIndex]);
+          await client.query(`DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2`, [chatId, messageIndex]);
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => {});
+          throw err;
+        } finally {
+          client.release();
+        }
+      }
+
+      // 1. Extract structured data from messages. chatId is plumbed in so
+      //    the extractor can fetch already-known entities for this chat
+      //    and inject them into the prompt, so the LLM stops re-naming
+      //    existing characters/locations/items on every batch.
+      //
+      //    Resolve userName ONCE here so extract() and applyExtractionToGraph()
+      //    converge on the same persona name. The fallback derives from the
+      //    actual is_user messages when ctx.name1 is empty/missing — without
+      //    this, isPersonaName silently returned false and the global persona
+      //    pool never accumulated anything.
+      const resolvedUserName = resolveUserName(userName, messages);
+      const extraction = await extract(settings, {
+        characterName,
+        userName: resolvedUserName,
+        messages,
+        chatId,
+        messageIndex,
+      });
+
+      // 2. Graph writes — single source of truth in extractor.js. Previously
+      //    this route reimplemented ~180 lines of upserts and was missing
+      //    event_chains, story_arcs, locations_detail, items, and present_at.
+      await applyExtractionToGraph(settings, {
+        extraction,
+        chatId,
+        charName: characterName,
+        userName: resolvedUserName,
+        messageIndex,
+        batchSize: (messages || []).length,
+      });
+
+      // 3. Vector writes — chunk + situating blurb + per-msg embed +
+      //    dialogue quote extraction. Previously this route only stored a
+      //    single "conversation" blob embed per batch, losing chunking and
+      //    missing dialogue quotes entirely. In the live path `messages`
+      //    is only the recent batch (not the full chat), so batchStart=0
+      //    but messageIndexOffset is whatever ST told us the batch sits at
+      //    in the full-chat timeline.
+      const ctxWindow = settings.ingestContextWindow ?? 4;
+      await applyMessagesToVectorStore(settings, {
+        messages,
+        chatBatch: messages,
+        batchStart: 0,
+        messageIndexOffset: typeof messageIndex === "number" ? messageIndex : 0,
+        chatId,
+        ctxWindow,
+      });
+
+      // Respond to ST immediately — arc rebuild fires async below.
+      res.json({ ok: true, extraction });
+
+      // 4. Periodic arc rebuild on the auto-ingest path. Fire ~every N
+      //    new events (default 30, settings.arcRebuildEveryN). Skipped
+      //    when the setting is 0, when chatId is missing, when a previous
+      //    rebuild for the same chat is still in flight, or when the
+      //    chat hasn't accumulated enough new events since the last
+      //    rebuild. Recycled-title snapshot in arc-builder.js means the
+      //    typical incremental rebuild only LLM-names new clusters
+      //    (usually 0-3) instead of all 35, so cost stays bounded.
+      const rebuildEveryN = Number(settings.arcRebuildEveryN ?? 30);
+      if (rebuildEveryN > 0 && chatId) {
+        if (arcRebuildInFlight.has(chatId)) {
+          // Coalesce: a rebuild is already running for this chat. Mark a
+          // pending follow-up so the in-flight rebuild's finally re-fires
+          // once. Multiple /extract calls landing here all collapse into
+          // the same single follow-up.
+          arcRebuildPending.add(chatId);
+        } else {
+          try {
+            const pool = db.getPool(settings);
+            const { rows: [{ n }] } = await pool.query(
+              `SELECT COUNT(*)::int AS n FROM events WHERE chat_id = $1`,
+              [chatId],
+            );
+            const lastN = arcRebuildLastCount.get(chatId) || 0;
+            if (n - lastN >= rebuildEveryN) {
+              setArcRebuildCount(chatId, n);
+              startArcRebuild(chatId);
+            }
+          } catch (err) {
+            // Counting query failed — log and continue, don't break ingest
+            console.warn(`[ChronicleDB] Arc-rebuild counter check failed: ${err.message}`);
+          }
+        }
+      }
+    } finally {
+      // Release the per-message mutex so the next /extract for the same
+      // (chatId, messageIndex) can proceed. Done in `finally` so failures,
+      // background-rebuild errors, and the success path all release.
+      if (mutexKey) {
+        try {
+          if (release) release();
+          // Only delete the entry if it is *identically* our own promise.
+          // The previous check (`extractMutex.get(mutexKey) && release`)
+          // was always true when `release` was truthy, so a stale finally
+          // could delete a newer call's in-flight promise, causing a
+          // third call to skip the mutex entirely and race. Identity
+          // compare to `myPromise` so newer calls keep their own entries
+          // and clean up in their own finally.
+          if (extractMutex.get(mutexKey) === myPromise) {
+            extractMutex.delete(mutexKey);
+          }
+        } catch (_) { /* never block the request on cleanup */ }
+      }
+    }
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Extraction error:", err);
+      // Connectivity failures (DB down, pool can't connect) flip the
+      // plugin's connectionState so the UI's /status poll sees the outage
+      // immediately instead of waiting for an idle-client error to bubble
+      // up through pool.on('error').
+      if (isDbConnectivityError(err)) markDisconnected(err);
+    },
+  }));
+
+  // ── Swipe cleanup endpoint ───────────────────────────────────
+  // Called by the UI extension when the user changes the active swipe on an
+  // already-extracted message. Without this, every swipe-right leaves the
+  // previous swipe's events / quotes / embeddings in the DB forever.
+  //
+  // Caveats:
+  //  - Traits don't carry message_index, so a swipe that introduces or
+  //    removes traits will leave stale traits behind. The trait dedup
+  //    pipeline (lexicon gate + canonical-row kNN) means most stale traits
+  //    eventually get re-merged or rejected on the next extraction, but
+  //    pure noise-traits from a discarded swipe will linger. Tagging traits
+  //    with a source (chat_id, message_index) is a separate follow-up.
+  //  - arc_events.event_id has ON DELETE CASCADE (schema.sql:234), so the
+  //    rows referencing events we delete here are cleaned up automatically
+  //    by the events DELETE below. event_chains.from_event_id /
+  //    to_event_id are also CASCADE (schema.sql:243-244).
+  //  - participated_in.event_id does NOT have ON DELETE CASCADE
+  //    (schema.sql:124), so we have to clear those rows by hand before
+  //    deleting events — same pattern as the manual reingest scripts.
+  //  - The next /extract for the new active swipe will rewrite events with
+  //    new content-addressed ids, so re-extraction is the rebuild step.
+  router.post("/clear-message-extractions", withInternalError(async (req, res) => {
+    const { chatId, messageIndex } = req.body;
+    if (!chatId || typeof messageIndex !== "number") {
+      return sendBadRequest(res, "chatId and messageIndex required");
+    }
+    const pool = db.getPool(settings);
+    // Order matters: participated_in references events.id without ON
+    // DELETE CASCADE, so clear those rows first. After that, the remaining
+    // DELETEs are independent and run in parallel.
+    await pool.query(
+      `DELETE FROM participated_in
+       WHERE event_id IN (SELECT id FROM events WHERE chat_id = $1 AND message_index = $2)`,
+      [chatId, messageIndex],
+    );
+    // Trait cleanup: traits now carry source_message_index (added in the
+    // schema migration that introduced this column). Rows pre-dating the
+    // column have NULL and are intentionally skipped — we don't know
+    // which message they came from. Future swipes on the same message
+    // clean up cleanly because new traits are tagged at write time.
+    const [eventsRes, memRes, quoteRes, snapRes, traitRes] = await Promise.all([
+      pool.query(
+        `DELETE FROM events WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM memory_embeddings WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM dialogue_quotes WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM context_snapshots WHERE chat_id = $1 AND message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+      pool.query(
+        `DELETE FROM traits WHERE source_chat = $1 AND source_message_index = $2 RETURNING id`,
+        [chatId, messageIndex],
+      ),
+    ]);
+    res.json({
+      ok: true,
+      deleted: {
+        events: eventsRes.rowCount,
+        memory_embeddings: memRes.rowCount,
+        dialogue_quotes: quoteRes.rowCount,
+        context_snapshots: snapRes.rowCount,
+        traits: traitRes.rowCount,
+      },
+    });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] /clear-message-extractions error:", err);
+    },
+  }));
+
+  // ── Retrieval endpoint ───────────────────────────────────────
+  // Called by UI ext before GENERATION_STARTED
+
+  router.post("/retrieve", withInternalError(async (req, res) => {
+    const {
+      chatId,
+      characterName,
+      activeCharacters,
+      recentText,
+      sessionId,
+      maxTokens,
+      budgetProfile,
+      budgetOverrides,
+      pov,
+    } = req.body;
+
+    // Load per-character config to know which chats to remember
+    const charConfig = characterName
+      ? await db.getCharacterMemoryConfig(settings, characterName)
+      : { sessionMode: "persistent", selectedChats: [] };
+
+    // Honor the chat picker. If the user hasn't picked any chats, fall back
+    // to the current chatId so retrieval is at least scoped to this chat
+    // (avoids cross-chat pollution between e.g. ChatB and Protagonist).
+    const configuredChats = Array.isArray(charConfig.selectedChats) ? charConfig.selectedChats : [];
+    const selectedChats = configuredChats.length > 0
+      ? configuredChats
+      : (chatId ? [chatId] : []);
+
+    // AGARS per-character epistemic mask: optional `pov` payload on
+    // the /retrieve request threads through to retriever.js as a
+    // post-filter over the omniscient result. When the caller omits
+    // `pov`, retrieve() behaves bit-for-bit as before.
+    //
+    // Shape: `{ characterName: string, upToMessageIndex?: number }`.
+    // Defensive normalization: accept either a string characterName
+    // or nothing; an empty string is treated as "no POV" so the
+    // downstream call can no-op without a special case.
+    const povArg = (pov && typeof pov === "object" && typeof pov.characterName === "string" && pov.characterName.trim().length > 0)
+      ? {
+          characterName: pov.characterName.trim(),
+          upToMessageIndex: typeof pov.upToMessageIndex === "number" ? pov.upToMessageIndex : undefined,
+        }
+      : undefined;
+
+    const result = await retrieve(settings, {
+      chatId,
+      activeCharacters: activeCharacters || [],
+      recentText: recentText || "",
+      sessionMode: charConfig.sessionMode || "persistent",
+      sessionId,
+      selectedChats, // scoped chat IDs (defaults to [chatId] when no preference set)
+      budgetProfile,
+      budgetOverrides,
+      pov: povArg,
+    });
+
+    // Precedence for the render ceiling:
+    //   1. explicit req.body.maxTokens (legacy one-off override)
+    //   2. result.budgets.maxTokens (from the resolved profile, which
+    //      already honors settings.maxInjectionTokens and explicit
+    //      per-field budgetOverrides)
+    //   3. 1500 fallback (unchanged)
+    // retriever.js::formatMemoryBlock already prefers result.budgets
+    // when no maxTokens is passed, so we only pass a value when the
+    // caller explicitly asked for one.
+    const memoryBlock = typeof maxTokens === "number"
+      ? formatMemoryBlock(result, maxTokens)
+      : formatMemoryBlock(result);
+    res.json({ result, memoryBlock });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Retrieval error:", err);
+      if (isDbConnectivityError(err)) markDisconnected(err);
+    },
+  }));
+
+  // ── Per-character memory config ────────────────────────────────
+  // Tied to character card: stores which chats this character remembers
+
+  router.get("/character-config/:characterName", withInternalError(async (req, res) => {
+    const config = await db.getCharacterMemoryConfig(settings, req.params.characterName);
+    res.json(config);
+  }));
+
+  router.post("/character-config/:characterName", withInternalError(async (req, res) => {
+    await db.saveCharacterMemoryConfig(settings, {
+      characterName: req.params.characterName,
+      sessionMode: req.body.sessionMode,
+      selectedChats: req.body.selectedChats,
+    });
+    res.json({ ok: true });
+  }));
+
+  // ── List chats for a character (reads ST data dir) ───────────
+
+  router.get("/chats/:characterName", withInternalError(async (req, res) => {
+    const chatsBase = resolveStChatsDir();
+    const charName = req.params.characterName;
+    const matchingDir = findMatchingChatDirectoryName(chatsBase, charName);
+
+    if (!matchingDir) return res.json([]);
+
+    const dirPath = pathJoin(chatsBase, matchingDir);
+    if (!statSync(dirPath).isDirectory()) return res.json([]);
+
+    const chatFiles = readdirSync(dirPath)
+      .filter((f) => f.endsWith(".jsonl"))
+      .sort()
+      .map((f) => {
+        const stat = statSync(pathJoin(dirPath, f));
+        const dateMatch = f.match(/(\d{4}[-/]\d{1,2}[-/]\d{1,2})/);
+        // Count actual message lines (subtract 1 for metadata header)
+        let messageCount;
+        try {
+          const content = readFileSync(pathJoin(dirPath, f), "utf-8");
+          messageCount = content.split("\n").filter((l) => l.trim()).length - 1;
+        } catch {
+          messageCount = Math.max(1, Math.floor(stat.size / 2000));
+        }
+        return {
+          filename: f,
+          chatId: stripJsonlSuffix(f),
+          date: dateMatch ? dateMatch[1] : "",
+          size: stat.size,
+          messageEstimate: Math.max(0, messageCount),
+        };
+      });
+
+    // Enrich with ingestion status
+    try {
+      const statuses = await queryRows(
+        `SELECT chat_file, status, batches_done, ingested_at FROM ingestion_status WHERE character_name = $1`,
+        [charName],
+      );
+      const statusMap = new Map(statuses.map((s) => [s.chat_file, s]));
+      for (const chat of chatFiles) {
+        const s = statusMap.get(chat.filename);
+        if (s) {
+          chat.ingested = s.status === "done";
+          chat.ingestStatus = s.status;
+          chat.ingestedAt = s.ingested_at;
+          chat.batchesDone = s.batches_done;
+        }
+      }
+    } catch { /* status table might not exist yet */ }
+
+    res.json(chatFiles);
+  }));
+
+  // ── Chat ingestion (backfill a specific chat file) ───────────
+
+  router.post("/ingest-chat", withInternalError(async (req, res) => {
+      const { characterName, filename } = req.body;
+      if (!characterName || !filename) {
+        return sendBadRequest(res, "characterName and filename required");
+      }
+      // Reject traversal-y characterName up front. Even though
+      // findMatchingChatDirectoryName is now exact-match-only, we still
+      // refuse names containing `..`, slashes, or NUL so that downstream
+      // filename joins (and any future relaxation of the matcher) can't
+      // resolve outside `chatsBase`.
+      if (typeof characterName !== "string"
+          || characterName.length === 0
+          || characterName.includes("..")
+          || characterName.includes("\0")
+          || characterName.includes("/")
+          || characterName.includes("\\")) {
+        return sendBadRequest(res, `unsafe characterName: "${characterName}"`);
+      }
+
+      const chatsBase = resolveStChatsDir();
+
+      // Find matching directory
+      const matchingDir = findMatchingChatDirectoryName(chatsBase, characterName);
+      if (!matchingDir) return res.status(404).json({ error: "Character chat dir not found" });
+
+      // Re-verify the selected directory actually lives under chatsBase
+      // (readdirSync can't normally return traversal entries, but this is
+      // defense-in-depth against a compromised ST data dir or a follower
+      // symlink). Then resolve the chat JSONL filename safely under that
+      // directory so `filename` can't escape either.
+      const matchedDir = safeResolveUnderOrBadRequest(res, chatsBase, matchingDir);
+      if (!matchedDir) return;
+      const filePath = safeResolveUnderOrBadRequest(res, matchedDir, filename);
+      if (!filePath) return;
+      const raw = readFileSync(filePath, "utf-8");
+      let parsed;
+      try {
+        parsed = parseChatJsonl(raw, { characterNameFallback: characterName });
+      } catch (err) {
+        if (err.message === "Empty chat file") return sendBadRequest(res, err.message);
+        throw err;
+      }
+      const charName = parsed.characterName;
+      const chatId = stripJsonlSuffix(filename);
+      const messages = parsed.messages;
+      // Resolve persona name with fallback: parser-reported userName wins,
+      // else derive from is_user messages across the full chat. Done once
+      // at the request boundary so every batch agrees on the same name.
+      const userName = resolveUserName(parsed.userName, messages);
+
+      // Process in batches with parallel extraction. Concurrency is
+      // settings-driven (default 1) because the Gemini free tier chokes
+      // at higher concurrency; paid tiers can safely run 2-4.
+      const batchSize = settings.extractionBatchSize ?? 10;
+      const concurrency = Math.max(1, settings.extractionConcurrency ?? 1);
+      const ctxWindow = settings.ingestContextWindow ?? 4;
+      let extracted = 0;
+      const totalBatches = Math.ceil(messages.length / batchSize);
+
+      const allBatches = buildChatBatches(messages, batchSize);
+
+      for (let g = 0; g < allBatches.length; g += concurrency) {
+        const group = allBatches.slice(g, g + concurrency);
+
+        // Parallel extraction LLM calls — the only part that benefits from
+        // concurrency; DB writes downstream must stay serial to avoid
+        // deadlocks on shared entity rows.
+        const extractionResults = await Promise.allSettled(
+          group.map(({ batchIdx, batch }) =>
+            extract(settings, {
+              characterName: charName,
+              userName,
+              messages: batch,
+              chatId,
+              // Treat the LAST message of the batch as "current" for
+              // staleness annotation. The world_state list still reflects
+              // the chat's latest state, so a row with source_message_index
+              // > batch end (set by a future batch) just renders without a
+              // stale tag — listKnownEntitiesForChat clamps negative diffs
+              // to null.
+              messageIndex: batchIdx + Math.max(0, (batch?.length || 1) - 1),
+            })
+          ),
+        );
+
+        for (let k = 0; k < group.length; k++) {
+          const { batchIdx: i, batch } = group[k];
+          const er = extractionResults[k];
+          if (er.status !== "fulfilled") {
+            console.warn(`[ChronicleDB] Batch ${i} extraction failed:`, er.reason?.message);
+            continue;
+          }
+          const extraction = er.value;
+
+          try {
+            await applyExtractionToGraph(settings, {
+              extraction,
+              chatId,
+              charName,
+              userName,
+              messageIndex: i,
+              batchSize: batch.length,
+            });
+            await applyMessagesToVectorStore(settings, {
+              messages,
+              chatBatch: batch,
+              batchStart: i,
+              messageIndexOffset: i,
+              chatId,
+              ctxWindow,
+            });
+            extracted++;
+          } catch (err) {
+            console.warn(`[ChronicleDB] Ingest batch ${i} error:`, err.message, err.stack?.split("\n").slice(0, 3).join(" | "));
+          }
+        }
+      }
+
+      // Path 1: after the batch loop completes, rebuild arcs structurally
+      // over the full chat's events via Louvain community detection on a
+      // weighted event graph. Non-fatal — ingest succeeds even if clustering
+      // fails. See RESEARCH_ARCS.md §5 Path 1 and arc-builder.js.
+      //
+      // Path 4 + 5: `nameArcs: true` LLM-names level-1 arcs; `nameHierarchy:
+      // true` extends naming to level-0 super-arcs and level-2 episodes
+      // (gated on per-cluster density; low-coherence clusters still fall
+      // back to the templated name). Eval harnesses leave both off so grid
+      // sweeps don't pay the LLM cost per iteration.
+      try {
+        const { rebuildArcsForChat } = require("./arc-builder");
+        const r = await rebuildArcsForChat(settings, chatId, { nameArcs: true, nameHierarchy: true });
+        console.log(
+          `[ChronicleDB] Arc rebuild for ${chatId}: ${r.builtArcs} arcs (${r.namedArcs ?? 0} LLM-named), ${r.superArcs} super-arcs (${r.namedSuperArcs ?? 0} LLM-named), ${r.episodes} episodes (${r.namedEpisodes ?? 0} LLM-named), ${r.prunedArcs} pruned, Q=${(r.modularityQ ?? 0).toFixed(3)}, N=${r.totalEvents}`,
+        );
+      } catch (err) {
+        console.warn(`[ChronicleDB] Arc rebuild failed for ${chatId}:`, err.message);
+      }
+
+      // Record ingestion status
+      const p = db.getPool(settings);
+      await p.query(
+        `INSERT INTO ingestion_status (chat_file, character_name, status, messages_total, batches_done, ingested_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+         ON CONFLICT (chat_file) DO UPDATE SET status = $3, messages_total = $4, batches_done = $5, ingested_at = NOW(), updated_at = NOW()`,
+        [filename, charName, extracted > 0 ? "done" : "failed", messages.length, extracted],
+      );
+
+      res.json({
+        ok: true,
+        character: charName,
+        chatId,
+        messagesTotal: messages.length,
+        batchesProcessed: extracted,
+        batchesTotal: totalBatches,
+      });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Ingest chat error:", err);
+    },
+  }));
+
+  // ── Lorebook ingestion ───────────────────────────────────────
+
+  router.get("/lorebooks", withInternalError(async (_req, res) => {
+    const books = listLorebooks(settings);
+    res.json(books);
+  }));
+
+  router.post("/lorebooks/ingest", withInternalError(async (req, res) => {
+    const { filename } = req.body;
+    const result = await ingestLorebook(settings, filename, { embedFn: embed, embedBatchFn: embedBatch });
+    res.json(result);
+  }, {
+    onError: (err, _req, res) => {
+      // ingestLorebook() throws validation errors from the path-traversal
+      // guard with recognizable prefixes. Map those to 400; anything else
+      // is a real server failure and returns 500.
+      const msg = err.message || "";
+      if (msg.startsWith("unsafe filename:")
+          || msg.startsWith("path traversal blocked:")
+          || msg === "filename required") {
+        sendBadRequest(res, msg);
+        return;
+      }
+      console.error("[ChronicleDB] Lorebook ingest error:", err);
+    },
+  }));
+
+  // ── All-chats list for the mind map filter dropdown ─────────
+
+  router.get("/chats", withInternalError(async (req, res) => {
+    // Union batch-ingested chats (ingestion_status) with live chats
+    // (derived from events). ingestion_status is empty for live chats —
+    // without the events fallback the sidebar's recency lookup misses
+    // the chat the user is actively in. Character name is taken from
+    // ingestion_status when known and falls back to parsing the
+    // chat_id ("Character Name - YYYY-...").
+    const rows = await queryRows(
+      `WITH combined AS (
+         SELECT regexp_replace(chat_file, '\.jsonl$', '') AS chat_id, character_name, ingested_at AS recent
+           FROM ingestion_status WHERE status = 'done'
+         UNION ALL
+         SELECT chat_id,
+                split_part(chat_id, ' - ', 1) AS character_name,
+                MAX(timestamp) AS recent
+           FROM events WHERE chat_id IS NOT NULL AND chat_id <> ''
+           GROUP BY chat_id
+       )
+       SELECT chat_id,
+              MAX(character_name) AS character_name,
+              MAX(recent) AS recent
+       FROM combined
+       GROUP BY chat_id
+       ORDER BY recent DESC NULLS LAST, chat_id`,
+    );
+    res.json(rows.map((r) => ({
+      chatId: r.chat_id,
+      character: r.character_name,
+      label: `${r.character_name || "?"} — ${r.chat_id}`,
+    })));
+  }));
+
+  // ── Graph data for mind map ──────────────────────────────────
+
+  router.get("/graph", withInternalError(async (req, res) => {
+    const scope = req.query.scope || "global";
+    const depth = readOptionalIntegerQuery(req.query, "depth", 3);
+    // Accept chat_id as single value or comma-separated list. When set,
+    // every edge query filters to the given chat(s); characters and
+    // locations reached by those edges still render as nodes.
+    const chatIds = readOptionalChatIds(req.query);
+
+    // Hard-reject global scope with no chat filter. Without this the user
+    // gets an empty payload from the db-level guard and has no idea why.
+    // The db.getGraphData guard stays in place as defense-in-depth.
+    if (scope === "global" && (!chatIds || chatIds.length === 0)) {
+      return res.status(400).json({
+        error: "scope=global requires a chat_id query parameter to avoid unbounded payloads. Pass ?chat_id=... or use scope=character.",
+      });
+    }
+
+    let data;
+
+    if (scope === "character" && req.query.character) {
+      data = await db.traverseFromCharacter(settings, req.query.character, depth, chatIds);
+    } else {
+      data = await db.getGraphData(settings, { scope, character: req.query.character, chatIds });
+    }
+    res.json(data);
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Graph query error:", err);
+    },
+  }));
+
+  // ── Characters list (for mind map dropdown) ──────────────────
+
+  router.get("/characters", withInternalError(async (req, res) => {
+    const rows = await queryRows(`SELECT name FROM characters ORDER BY name`);
+    res.json(rows.map((r) => r.name));
+  }));
+
+  router.get("/character/:name/traits", withInternalError(async (req, res) => {
+    const name = req.params.name;
+    // Accept chat_id as a filter so the standalone mindmap detail panel
+    // can scope character traits to the currently-selected chat filter.
+    // Unscoped (no chat_id) still returns all traits for the character —
+    // the "show everything about X" fallback behavior the page defaults to.
+    const chatId = readOptionalChatId(req.query);
+    // User-visible trait read: filter out merged variant rows so the
+    // same trait never surfaces twice. Path 1's canonical-row dedup
+    // pipeline keeps merged rows in place for provenance, but they
+    // must never reach the UI.
+    const idsByName = await db.resolveCharacterIdsForNames(settings, [name], chatId ? [chatId] : null);
+    const charIds = idsByName.get(name) || [db.slugify(name)];
+    const sql = chatId
+      ? `SELECT t.category, t.content, t.source_chat FROM traits t
+         WHERE t.character_id = ANY($1::text[])
+           AND t.canonical_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM traits v
+             WHERE (v.id = t.id OR v.canonical_id = t.id)
+               AND (v.source_chat = $2 OR v.source_chat IS NULL)
+           )
+         ORDER BY t.category, t.content`
+      : `SELECT t.category, t.content, t.source_chat FROM traits t
+         WHERE t.character_id = ANY($1::text[]) AND t.canonical_id IS NULL
+         ORDER BY t.category, t.content`;
+    const params = chatId ? [charIds, chatId] : [charIds];
+    const rows = await queryRows(sql, params);
+    res.json(rows);
+  }));
+
+  // ── Character memory panel ───────────────────────────────────
+  // Feeds the per-character "Memory Management" section in the ST
+  // character card sidebar (separate from the global settings panel).
+
+  router.get("/character-stats", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const chatId = readOptionalChatId(req.query);
+    const stats = await db.getCharacterPanelStats(settings, name, chatId);
+    res.json(stats);
+  }));
+
+  router.get("/character-recent-events", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const limit = readOptionalIntegerQuery(req.query, "limit", 5, 10);
+    const chatId = readOptionalChatId(req.query);
+    const events = await db.getCharacterRecentEvents(settings, name, limit, chatId);
+    res.json(events);
+  }));
+
+  router.get("/character-relationships", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const chatId = readOptionalChatId(req.query);
+    const rels = await db.getCharacterOutboundRelationships(settings, name, chatId);
+    res.json(rels);
+  }));
+
+  router.get("/character-memory-config", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.query, "name");
+    if (!name) return;
+    const config = await db.getCharacterMemoryConfig(settings, name);
+    res.json({ sessionMode: config.sessionMode || "persistent" });
+  }));
+
+  router.post("/character-memory-config", withInternalError(async (req, res) => {
+    const { sessionMode } = req.body || {};
+    const name = readRequiredRequestValue(res, req.body, "name");
+    if (!name) return;
+    // Preserve the user's chat picker selection — saveCharacterMemoryConfig
+    // rewrites the whole row, so we have to read-modify-write.
+    const existing = await db.getCharacterMemoryConfig(settings, name);
+    await db.saveCharacterMemoryConfig(settings, {
+      characterName: name,
+      sessionMode: sessionMode || existing.sessionMode || "persistent",
+      selectedChats: existing.selectedChats || [],
+    });
+    res.json({ ok: true });
+  }));
+
+  router.post("/character-clear-memories", withInternalError(async (req, res) => {
+    const name = readRequiredRequestValue(res, req.body, "name");
+    if (!name) return;
+    const rawChatIds = Array.isArray(req.body?.chatIds)
+      ? req.body.chatIds
+      : (req.body?.chatId ? [req.body.chatId] : null);
+    const chatIds = Array.isArray(rawChatIds)
+      ? rawChatIds.filter((id) => typeof id === "string" && id.length > 0)
+      : null;
+    const cleared = await db.clearCharacterMemories(settings, name, chatIds);
+    res.json({ ok: true, cleared });
+  }));
+
+  // ── Character summary-embedding rollup ───────────────────────
+  // Admin endpoint: iterate every character and rebuild its
+  // `summary_embedding` as the mean-pool of its personality-trait
+  // embeddings. Safe to run repeatedly. Intended to be fired after a
+  // one-shot backfill once traits have real contextual embeddings
+  // (Path 1). Per-row updates are no-ops until any trait embeddings
+  // exist, at which point the aggregate starts populating.
+
+  router.post("/recompute-character-summaries", withInternalError(async (req, res) => {
+    const rows = await queryRows("SELECT id FROM characters");
+    let updated = 0;
+    for (const row of rows) {
+      await db.recomputeCharacterSummary(settings, row.id);
+      updated++;
+    }
+    res.json({ updated });
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Recompute summaries error:", err);
+    },
+  }));
+
+  // ── Character cards (all ST character PNGs) ──────────────────
+
+  router.get("/character-cards", withInternalError(async (req, res) => {
+    const charsDir = resolveStCharactersDir();
+    const files = readdirSync(charsDir)
+      .filter((f) => f.endsWith(".png"))
+      .sort()
+      .map((f) => ({
+        filename: f,
+        name: f.replace(".png", ""),
+        // Card PNG served by ST at this path
+        imagePath: `/characters/${encodeURIComponent(f)}`,
+      }));
+    res.json(files);
+  }, {
+    onError: (err) => {
+      console.error("[ChronicleDB] Character cards error:", err);
+    },
+  }));
+
+  // Proxy character PNGs so the mind map page can access them
+  router.get("/character-image/:filename", withInternalError(async (req, res) => {
+    const charsDir = resolveStCharactersDir();
+    // Reject `..`, forward/back slashes, NUL bytes up front, and
+    // confirm the resolved path stays under `charsDir`. A request for
+    // `../../etc/passwd` throws here and becomes a 400.
+    const imgPath = safeResolveUnderOrBadRequest(res, charsDir, req.params.filename);
+    if (!imgPath) return;
+    if (!existsSync(imgPath)) return res.status(404).send("Not found");
+    res.setHeader("Content-Type", "image/png");
+    createReadStream(imgPath).pipe(res);
+  }));
+
+  // ── Memory CRUD ──────────────────────────────────────────────
+
+  router.get("/memories/:chatId", withInternalError(async (req, res) => {
+    const rows = await queryRows(
+      `SELECT id, chat_id, node_type, node_id, content, character_scope,
+              created_at, message_index, raw_text, tsv, context_prefix, embedding
+         FROM memory_embeddings
+        WHERE chat_id = $1
+        ORDER BY created_at DESC`,
+      [req.params.chatId],
+    );
+    res.json(rows);
+  }));
+
+  router.delete("/memories/:id", withInternalError(async (req, res) => {
+    const p = db.getPool(settings);
+    await p.query(`DELETE FROM memory_embeddings WHERE id = $1`, [req.params.id]);
+    res.json({ ok: true });
+  }));
+
+  // ── Debug: recent LLM calls ──────────────────────────────────
+  // In-memory ring buffer surface for the settings panel. Empty until
+  // extractor.js is wired in a follow-up (intentionally deferred to avoid
+  // conflicting with parallel edits to that file).
+  // /debug/llm-calls returns a 200-entry ring buffer of LLM call previews
+  // (500 chars of prompt + response per entry — see llm-monitor.js). Those
+  // previews contain raw chat content, so the buffer is sensitive. Default
+  // off; the UI extension flips settings.debugSurfaceEnabled when the
+  // operator opts in for troubleshooting.
+  router.get("/debug/llm-calls", withInternalError(async (_req, res) => {
+    if (!settings.debugSurfaceEnabled) {
+      return res.status(404).json({ error: "Not found" });
+    }
+    res.json({ calls: require("./llm-monitor").list() });
+  }));
+
+  console.log("[ChronicleDB] Server plugin ready.");
+}
+
+/**
+ * Cleanup on ST shutdown.
+ */
+async function exit() {
+  console.log("[ChronicleDB] Shutting down...");
+  await db.closePool();
+}
+
+module.exports = { init, exit, info };

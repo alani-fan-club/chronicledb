@@ -1,0 +1,583 @@
+-- ChronicleDB schema — PostgreSQL 17 + pgvector
+-- No Apache AGE needed: graph stored as relational tables
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Migrations: drop vestigial objects from earlier schema versions that
+-- have zero readers/writers in the current codebase.
+DROP TABLE IF EXISTS chronicle_sessions;
+DROP INDEX IF EXISTS idx_events_major;
+DROP INDEX IF EXISTS idx_dialogue_quotes_chat_speaker;
+
+-- ── Node tables ────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS characters (
+    id                TEXT PRIMARY KEY,
+    name              TEXT NOT NULL,
+    chat_id           TEXT,
+    aliases           TEXT[] DEFAULT '{}',
+    description       TEXT DEFAULT '',
+    faction           TEXT,
+    role              TEXT DEFAULT '',
+    status            TEXT DEFAULT 'active',
+    significance      INT DEFAULT 3,
+    first_seen        TEXT,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ DEFAULT NOW(),
+    summary_embedding vector(768)
+);
+
+-- Per-chat character scoping: drop the old global UNIQUE(name) and replace
+-- with UNIQUE(chat_id, name) NULLS NOT DISTINCT. NULL chat_id rows act as
+-- the legacy "global" characters; new extractions in a chat get a chat-
+-- scoped row keyed by the same (chat_id, name). NULLS NOT DISTINCT means
+-- only one global row per name (matching the prior semantics).
+--
+-- Persona-row exemption (added 2026-05-06): the global persona pool stores
+-- the user persona at (chat_id=NULL, name=<persona name>, is_persona=TRUE).
+-- That key collides with any legacy (chat_id=NULL) character row sharing
+-- the same name (e.g. a `chr-alice` row from the pre-36d77a3 era that
+-- never got cleaned up by migrate-cleanup-2026-05-03.sql). The fix is to
+-- make the (chat_id, name) uniqueness PARTIAL — only enforce on non-
+-- persona rows. Persona rows live in a separate id namespace
+-- (`persona-<slug>`) and have their own status='persona' marker, so
+-- excluding them from the (chat_id, name) collision class is safe.
+--
+-- The transformation goes through three states for in-place upgrades:
+--   v1 (pre-2026-05-03): UNIQUE constraint `characters_chat_name_uniq`
+--                        on (chat_id, name) NULLS NOT DISTINCT, no
+--                        persona awareness.
+--   v2 (the post-36d77a3 release): same constraint, but ensurePersona-
+--                        Character could trip it on legacy collisions.
+--   v3 (this commit):    partial UNIQUE INDEX of the same name, keyed
+--                        on (chat_id, name) NULLS NOT DISTINCT, with
+--                        WHERE (is_persona IS NOT TRUE).
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS chat_id TEXT;
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS is_persona BOOLEAN DEFAULT FALSE;
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint
+             WHERE conname = 'characters_name_key' AND conrelid = 'characters'::regclass) THEN
+    ALTER TABLE characters DROP CONSTRAINT characters_name_key;
+  END IF;
+  -- v1/v2 → v3: drop the table-level UNIQUE constraint if it still
+  -- exists. It will be replaced by a partial unique INDEX below. The
+  -- index keeps the same name so ON CONFLICT inference (and any human
+  -- doing pg_constraint forensics) finds the constraint where it was.
+  IF EXISTS (SELECT 1 FROM pg_constraint
+             WHERE conname = 'characters_chat_name_uniq' AND conrelid = 'characters'::regclass) THEN
+    ALTER TABLE characters DROP CONSTRAINT characters_chat_name_uniq;
+  END IF;
+END $$;
+-- Partial unique index. NULLS NOT DISTINCT keeps the original "one row
+-- per (chat_id, name) including (NULL, name)" semantics. The WHERE
+-- clause excises persona rows from the uniqueness check.
+CREATE UNIQUE INDEX IF NOT EXISTS characters_chat_name_uniq
+    ON characters (chat_id, name)
+    NULLS NOT DISTINCT
+    WHERE is_persona IS NOT TRUE;
+CREATE INDEX IF NOT EXISTS idx_characters_chat ON characters(chat_id);
+
+-- Per-character rollup embedding: mean-pool of dispositional trait embeddings
+-- for that character. Recomputed by recomputeCharacterSummary on trait
+-- insert/delete and via the /recompute-character-summaries admin route.
+-- Used for "find similar characters across chats" retrieval and cheap
+-- character-archetype prefetch. HNSW-indexed for cosine kNN.
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS summary_embedding vector(768);
+CREATE INDEX IF NOT EXISTS idx_characters_summary_hnsw
+    ON characters USING hnsw (summary_embedding vector_cosine_ops);
+
+CREATE TABLE IF NOT EXISTS locations (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL UNIQUE,
+    description     TEXT DEFAULT '',
+    importance      INT DEFAULT 3,
+    current_state   TEXT DEFAULT '',
+    parent_location TEXT REFERENCES locations(id),
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS events (
+    id                TEXT PRIMARY KEY,
+    summary           TEXT NOT NULL,
+    source_text       TEXT DEFAULT '',
+    significance      INT DEFAULT 3,
+    message_index     INT,
+    location_id       TEXT REFERENCES locations(id),
+    chat_id           TEXT,
+    timestamp         TIMESTAMPTZ DEFAULT NOW(),
+    tier              TEXT DEFAULT 'recent',
+    condensed_summary TEXT,
+    is_major          BOOLEAN GENERATED ALWAYS AS (significance >= 4) STORED,
+    embedding         vector(768)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_chat ON events (chat_id);
+
+ALTER TABLE events ADD COLUMN IF NOT EXISTS source_text TEXT DEFAULT '';
+ALTER TABLE events ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'recent';
+ALTER TABLE events ADD COLUMN IF NOT EXISTS condensed_summary TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS embedding vector(768);
+
+CREATE INDEX IF NOT EXISTS idx_events_source_tsv
+    ON events USING GIN (to_tsvector('english', source_text));
+CREATE INDEX IF NOT EXISTS idx_events_embed_hnsw
+    ON events USING hnsw (embedding vector_cosine_ops);
+
+CREATE TABLE IF NOT EXISTS facts (
+    id         TEXT PRIMARY KEY,
+    content    TEXT NOT NULL,
+    domain     TEXT DEFAULT 'other',
+    confidence REAL DEFAULT 0.8,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS world_state (
+    id         SERIAL PRIMARY KEY,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    reason     TEXT DEFAULT '',
+    valid_from TIMESTAMPTZ DEFAULT NOW(),
+    valid_until TIMESTAMPTZ,
+    chat_id    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_world_state_current
+    ON world_state (key) WHERE valid_until IS NULL;
+
+-- ── Post-initial-schema migrations (idempotent ALTERs) ─────────
+-- world_state.source_message_index — message index that produced this row.
+-- Used by closeStaleSnapshotKeys to TTL out snapshot-shaped state (boarding,
+-- weather, ship motion, etc.) when the extractor stops re-emitting it.
+-- Nullable: legacy rows stay NULL and are skipped by the TTL sweep.
+ALTER TABLE world_state ADD COLUMN IF NOT EXISTS source_message_index INT;
+
+-- characters.is_persona — TRUE for the user's persona character. The user
+-- persona's identity is consistent across every chat ("Alice" the user
+-- is the same person whether she's playing Pirate Alice, Nomad Alice,
+-- Tokyo-Pianist Alice, etc.). Per-chat character rows still get created
+-- normally; we ADDITIONALLY maintain a single global persona row
+-- (chat_id IS NULL, is_persona=TRUE, id="persona-<slug>") into which the
+-- extractor mirrors trait writes. Retrieval surfaces those persona-level
+-- traits in every chat the persona appears in, in a separate "## Persona
+-- Traits" section so the user can tell what's globally consistent vs
+-- chat-scoped.
+ALTER TABLE characters ADD COLUMN IF NOT EXISTS is_persona BOOLEAN DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_characters_persona
+    ON characters (lower(name)) WHERE is_persona = TRUE AND chat_id IS NULL;
+
+-- ── Edge tables ────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS feels_about (
+    id          SERIAL PRIMARY KEY,
+    from_char   TEXT NOT NULL REFERENCES characters(id),
+    to_char     TEXT NOT NULL REFERENCES characters(id),
+    sentiment   REAL DEFAULT 0,
+    intensity   REAL DEFAULT 0.5,
+    description TEXT DEFAULT '',
+    session_id  TEXT,
+    updated_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(from_char, to_char, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feels_about_session ON feels_about (session_id);
+
+CREATE TABLE IF NOT EXISTS knows (
+    id          SERIAL PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id),
+    fact_id     TEXT NOT NULL REFERENCES facts(id),
+    learned_at  TIMESTAMPTZ DEFAULT NOW(),
+    source      TEXT DEFAULT 'witnessed',
+    chat_id     TEXT,
+    CONSTRAINT knows_char_fact_chat_uniq UNIQUE (character_id, fact_id, chat_id)
+);
+
+ALTER TABLE knows ADD COLUMN IF NOT EXISTS chat_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_knows_fact ON knows (fact_id);
+CREATE INDEX IF NOT EXISTS idx_knows_chat ON knows (chat_id);
+
+-- H3 migration: widen the UNIQUE from (character_id, fact_id) to
+-- (character_id, fact_id, chat_id). The old auto-named constraint lived
+-- at `knows_character_id_fact_id_key`; the new one is explicitly named
+-- knows_char_fact_chat_uniq so upsertFact's ON CONFLICT can target it.
+--
+-- ADD CONSTRAINT has no IF NOT EXISTS form, so we wrap it in a DO block
+-- that checks pg_constraint first. Required because db.js::initSchema
+-- now runs the schema as one multi-statement query — a non-idempotent
+-- failure here would abort every statement that follows.
+--
+-- Why this matters: with the old (character_id, fact_id) key, a fact
+-- learned by the same character in two different chats could only
+-- store one chat_id (upsertFact's COALESCE kept the earlier one),
+-- which made the C2 fix in getKnowledgeBoundaries silently drop
+-- multi-chat facts from the second chat's view.
+ALTER TABLE knows DROP CONSTRAINT IF EXISTS knows_character_id_fact_id_key;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'knows_char_fact_chat_uniq'
+      AND conrelid = 'knows'::regclass
+  ) THEN
+    ALTER TABLE knows ADD CONSTRAINT knows_char_fact_chat_uniq
+      UNIQUE (character_id, fact_id, chat_id);
+  END IF;
+END $$;
+
+CREATE TABLE IF NOT EXISTS participated_in (
+    id           SERIAL PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id),
+    event_id     TEXT NOT NULL REFERENCES events(id),
+    role         TEXT DEFAULT 'participant',
+    UNIQUE(character_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_participated_event ON participated_in (event_id);
+-- M3: participated_in queries that filter by character_id (used by
+-- clearCharacterMemories and getCharacterPanelStats event-count
+-- rollups) previously had to walk the whole table. The (event_id)
+-- index above only helps the reverse direction.
+CREATE INDEX IF NOT EXISTS idx_participated_character
+    ON participated_in (character_id);
+
+CREATE TABLE IF NOT EXISTS present_at (
+    id           SERIAL PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id),
+    location_id  TEXT NOT NULL REFERENCES locations(id),
+    since        TIMESTAMPTZ DEFAULT NOW(),
+    until_time   TIMESTAMPTZ,
+    is_current   BOOLEAN DEFAULT TRUE,
+    chat_id      TEXT
+);
+
+ALTER TABLE present_at ADD COLUMN IF NOT EXISTS chat_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_present_at_current
+    ON present_at (character_id) WHERE is_current = TRUE;
+CREATE INDEX IF NOT EXISTS idx_present_at_chat ON present_at (chat_id);
+
+-- ── Context snapshots (scene state at a point in time) ─────────
+
+CREATE TABLE IF NOT EXISTS context_snapshots (
+    id              TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    message_index   INT NOT NULL,
+    summary         TEXT NOT NULL,
+    location_id     TEXT REFERENCES locations(id),
+    present_chars   TEXT[] DEFAULT '{}',
+    emotional_tone  TEXT DEFAULT '',
+    world_state_snapshot JSONB DEFAULT '{}',
+    timestamp       TIMESTAMPTZ DEFAULT NOW(),
+    embedding       vector(768)
+);
+
+ALTER TABLE context_snapshots ADD COLUMN IF NOT EXISTS embedding vector(768);
+
+CREATE INDEX IF NOT EXISTS idx_ctx_chat
+    ON context_snapshots (chat_id, message_index);
+CREATE INDEX IF NOT EXISTS idx_ctx_embed_hnsw
+    ON context_snapshots USING hnsw (embedding vector_cosine_ops);
+
+-- ── Plot threads (foreshadowing, pending events, unresolved arcs)
+
+CREATE TABLE IF NOT EXISTS plot_threads (
+    id              TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    thread_type     TEXT NOT NULL DEFAULT 'pending',
+    title           TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    -- involved_chars duplicates the plot_thread_characters join. It is
+    -- the primary read path (retrieval-core.getPlotThreads, graph-domain
+    -- both project this column directly), so the join is the secondary
+    -- queryable form. Keep both writes in upsertPlotThread in sync.
+    involved_chars  TEXT[] DEFAULT '{}',
+    planted_at      INT,
+    resolved_at     INT,
+    importance      INT DEFAULT 3,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_plot_active
+    ON plot_threads (chat_id) WHERE resolved_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS plot_thread_characters (
+    plot_id      TEXT NOT NULL REFERENCES plot_threads(id) ON DELETE CASCADE,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    PRIMARY KEY (plot_id, character_id)
+);
+
+-- ── Story arcs (manga-style narrative containers) ─────────────
+
+CREATE TABLE IF NOT EXISTS story_arcs (
+    id              TEXT PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    arc_type        TEXT DEFAULT 'main',   -- main | subplot | character_arc | world_arc
+    status          TEXT DEFAULT 'active', -- active | resolved | ongoing | abandoned
+    importance      INT DEFAULT 3,          -- 1-5
+    start_msg_idx   INT,
+    end_msg_idx     INT,
+    spine_event_id  TEXT,                   -- the defining event
+    source          TEXT DEFAULT 'llm',     -- llm | structural (RESEARCH_ARCS Path 1)
+    parent_arc_id   TEXT REFERENCES story_arcs(id) ON DELETE SET NULL,
+    hierarchy_level INT DEFAULT 1,          -- 0 = super-arc, 1 = arc, 2 = episode (RESEARCH_ARCS Path 5)
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Path 1 arc rebuild (RESEARCH_ARCS.md §5): distinguishes Leiden/Louvain-built
+-- rows from legacy per-batch LLM rows. 'llm' is the default for backward
+-- compatibility; rebuildArcsForChat inserts with 'structural'. The chat index
+-- supports the post-ingest DELETE + INSERT cycle.
+ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'llm';
+CREATE INDEX IF NOT EXISTS idx_story_arcs_chat ON story_arcs (chat_id);
+
+-- Path 5 hierarchical arcs (RESEARCH_ARCS.md §5 Path 5): three-level Louvain
+-- resolution sweep (γ=0.25 super-arcs, γ=0.5 arcs, γ=1.0 episodes). Existing
+-- flat rows default to hierarchy_level=1 and parent_arc_id=NULL, which
+-- preserves the Path 1 semantics exactly. Parent index speeds up child→parent
+-- walks; (chat_id, hierarchy_level) speeds up "fetch all level-1 arcs for
+-- this chat" which retrieval's fetchArcExpansion filters on.
+ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS parent_arc_id TEXT REFERENCES story_arcs(id) ON DELETE SET NULL;
+ALTER TABLE story_arcs ADD COLUMN IF NOT EXISTS hierarchy_level INT DEFAULT 1;
+CREATE INDEX IF NOT EXISTS idx_story_arcs_parent ON story_arcs (parent_arc_id);
+CREATE INDEX IF NOT EXISTS idx_story_arcs_level ON story_arcs (chat_id, hierarchy_level);
+
+-- Arc membership: events can belong to multiple arcs
+CREATE TABLE IF NOT EXISTS arc_events (
+    arc_id      TEXT NOT NULL REFERENCES story_arcs(id) ON DELETE CASCADE,
+    event_id    TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    position    INT DEFAULT 0,
+    is_anchor   BOOLEAN DEFAULT FALSE,
+    PRIMARY KEY (arc_id, event_id)
+);
+
+-- Causal chains: event → event
+CREATE TABLE IF NOT EXISTS event_chains (
+    id              SERIAL PRIMARY KEY,
+    from_event_id   TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    to_event_id     TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    chain_type      TEXT DEFAULT 'caused',  -- caused | followed_by | triggered | led_to
+    description     TEXT DEFAULT '',
+    UNIQUE(from_event_id, to_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_arc_events_arc ON arc_events (arc_id);
+CREATE INDEX IF NOT EXISTS idx_event_chains_from ON event_chains (from_event_id);
+CREATE INDEX IF NOT EXISTS idx_event_chains_to ON event_chains (to_event_id);
+
+-- ── Character traits (innate properties, distinct from knows) ─
+
+CREATE TABLE IF NOT EXISTS traits (
+    id           TEXT PRIMARY KEY,
+    character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+    category     TEXT DEFAULT 'personality',
+    content      TEXT NOT NULL,
+    confidence   REAL DEFAULT 0.8,
+    source_chat  TEXT,
+    source_message_index INT,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    verified_at  TIMESTAMPTZ,
+    embedding    vector(768),
+    normalized_content TEXT GENERATED ALWAYS AS
+      (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED,
+    stemmed_content TEXT GENERATED ALWAYS AS
+      (strip(to_tsvector('english', content))::text) STORED
+);
+
+-- Case/punctuation variants (Awed / awed / Awe-struck / Awestruck) collapse
+-- via normalized_content. Morphological variants (charmed / charming /
+-- observant / observing) collapse via stemmed_content, which runs the
+-- Postgres English stemmer. upsertTrait uses ON CONFLICT against the
+-- normalized unique index and a pre-check against stemmed_content for
+-- dedup on write.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS normalized_content TEXT
+  GENERATED ALWAYS AS (regexp_replace(lower(content), '[^a-z0-9]', '', 'g')) STORED;
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS stemmed_content TEXT
+  GENERATED ALWAYS AS (strip(to_tsvector('english', content))::text) STORED;
+-- Contextual-embedding column populated lazily by the extractor (Path 1).
+-- Nullable; recomputeCharacterSummary skips rows where embedding IS NULL
+-- when rolling up into characters.summary_embedding.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS embedding vector(768);
+
+-- Path 1: canonical-row dedup. `evidence_sentence` is the one-sentence
+-- quote from the source batch that justifies the trait, used to make the
+-- contextual embedding text. `canonical_id` points at the canonical row
+-- when this row is a merged variant (NULL for canonical rows themselves);
+-- `aliases` carries the raw content/evidence strings merged into this
+-- canonical; `merged_count` is a cheap popularity signal.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS evidence_sentence TEXT;
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS canonical_id TEXT REFERENCES traits(id) ON DELETE SET NULL;
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS aliases TEXT[] DEFAULT '{}';
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS merged_count INT DEFAULT 1;
+-- Path 3: LLM verifier timestamp. Stamped every time the 0.80-0.88 band
+-- verifier evaluates a candidate against this canonical, regardless of
+-- the MERGE / KEEP_DISTINCT / REJECT_NEW outcome. Observability signal.
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS verified_at TIMESTAMPTZ;
+-- Swipe cleanup support: pin every trait to the (chat_id, message_index)
+-- it was extracted from so /clear-message-extractions can remove the
+-- right rows when a user swipes to regenerate a reply. Without this
+-- column, swipe cleanup leaks traits — the four message-indexed tables
+-- (events, memory_embeddings, dialogue_quotes, context_snapshots) clean
+-- up surgically, but trait rows from a discarded swipe linger.
+-- Nullable: pre-existing rows have NULL and are not affected by swipe
+-- cleanup (we don't know which message they came from).
+ALTER TABLE traits ADD COLUMN IF NOT EXISTS source_message_index INT;
+CREATE INDEX IF NOT EXISTS idx_traits_source_msg
+  ON traits (source_chat, source_message_index)
+  WHERE source_message_index IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_traits_char ON traits (character_id);
+CREATE INDEX IF NOT EXISTS idx_traits_cat ON traits (category);
+CREATE INDEX IF NOT EXISTS idx_traits_stem
+  ON traits (character_id, category, stemmed_content);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_traits_unique_norm
+  ON traits (character_id, category, normalized_content);
+-- Path 1 retrieval accelerators. idx_traits_canonical speeds up the
+-- "get all merged variants of this canonical" and `WHERE canonical_id IS
+-- NULL` user-visible filters. The HNSW index is intentionally PARTIAL on
+-- `canonical_id IS NULL` — we only want to kNN-search canonical rows,
+-- not merged aliases, so upsertTrait's kNN lookup must never return the
+-- alias rows.
+CREATE INDEX IF NOT EXISTS idx_traits_canonical
+  ON traits (character_id, canonical_id);
+CREATE INDEX IF NOT EXISTS idx_traits_embedding_hnsw
+  ON traits USING hnsw (embedding vector_cosine_ops)
+  WHERE canonical_id IS NULL;
+
+-- ── Items (key objects with owners, powers, significance) ──────
+
+CREATE TABLE IF NOT EXISTS items (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    description  TEXT DEFAULT '',
+    powers       TEXT DEFAULT '',
+    significance INT DEFAULT 3,
+    owner_id     TEXT REFERENCES characters(id),
+    location_id  TEXT REFERENCES locations(id),
+    status       TEXT DEFAULT 'intact',
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    chat_id      TEXT
+);
+
+ALTER TABLE items ADD COLUMN IF NOT EXISTS chat_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_items_owner ON items (owner_id);
+CREATE INDEX IF NOT EXISTS idx_items_location ON items (location_id);
+CREATE INDEX IF NOT EXISTS idx_items_chat ON items (chat_id);
+
+-- ── Ingestion status tracking ──────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ingestion_status (
+    chat_file      TEXT PRIMARY KEY,
+    character_name TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    messages_total INT DEFAULT 0,
+    batches_done   INT DEFAULT 0,
+    ingested_at    TIMESTAMPTZ,
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ── Vector table ───────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    id              SERIAL PRIMARY KEY,
+    chat_id         TEXT NOT NULL,
+    node_type       TEXT NOT NULL,
+    node_id         TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    embedding       vector(768) NOT NULL,
+    character_scope TEXT[] DEFAULT '{}',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    message_index   INT,
+    raw_text        TEXT,
+    tsv             tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+);
+
+CREATE INDEX IF NOT EXISTS idx_embed_hnsw
+    ON memory_embeddings USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_embed_chat_type
+    ON memory_embeddings (chat_id, node_type);
+-- M1: supports /clear-message-extractions swipe cleanup, which deletes
+-- memory_embeddings rows by (chat_id, message_index) when the user
+-- regenerates a message. Without this index the cleanup scans the
+-- whole table per swipe.
+CREATE INDEX IF NOT EXISTS idx_embed_chat_msg
+    ON memory_embeddings (chat_id, message_index);
+
+-- Ensure raw_text column exists on existing deployments
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS raw_text TEXT;
+
+-- Ensure tsvector lexical search column exists on existing deployments
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+CREATE INDEX IF NOT EXISTS idx_embed_tsv ON memory_embeddings USING gin(tsv);
+
+-- Contextual retrieval: LLM-generated situating blurb prepended at embed time
+-- (Anthropic contextual-retrieval pattern). Nullable, no default.
+ALTER TABLE memory_embeddings ADD COLUMN IF NOT EXISTS context_prefix TEXT;
+
+-- ── Dialogue quotes (separate index for "what did X say" questions) ────
+
+CREATE TABLE IF NOT EXISTS dialogue_quotes (
+    id            TEXT PRIMARY KEY,
+    chat_id       TEXT NOT NULL,
+    session_id    TEXT,
+    speaker       TEXT NOT NULL,
+    quote         TEXT NOT NULL,
+    message_index INTEGER,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_tsv
+    ON dialogue_quotes USING GIN (to_tsvector('english', quote));
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_trgm
+    ON dialogue_quotes USING GIN (quote gin_trgm_ops);
+-- M2: supports /clear-message-extractions swipe cleanup, which
+-- deletes dialogue_quotes by (chat_id, message_index) when the user
+-- regenerates a message. Without this index the cleanup scans the
+-- whole table per swipe.
+CREATE INDEX IF NOT EXISTS idx_dialogue_quotes_chat_msg
+    ON dialogue_quotes (chat_id, message_index);
+
+-- ── Session & config tables ────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS character_memory_config (
+    character_name TEXT PRIMARY KEY,
+    session_mode   TEXT NOT NULL DEFAULT 'persistent',
+    selected_chats TEXT[] DEFAULT '{}',
+    updated_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- AGARS Path: in-story time marker per event. Free-form prose like "next
+-- morning", "Day 3, evening", "three hours later", "dusk". Nullable — most
+-- events have no explicit time marker in the source passage, and we
+-- deliberately do NOT use a numeric day/hour clock (ChronicleDB is a memory
+-- store over free-form prose, not a simulator). upsertEvent writes this via
+-- COALESCE so re-ingesting a null on an already-populated row is a no-op.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS world_time TEXT;
+
+-- AGARS Path: chat-scoped undirected adjacency between two locations,
+-- emitted by the extractor when source prose shows characters moving
+-- between named locations. Content-addressed id: sort a/b lexically then
+-- hash (chat_id, a, b), so (X,Y) and (Y,X) dedupe to the same row.
+-- first_seen_event_id is a rough anchor to the batch that produced this
+-- edge (ON DELETE SET NULL so deleting the anchor doesn't cascade-drop
+-- the edge). Not used for runtime pathing / movement validation — we're
+-- ingesting edges, not policing movement.
+CREATE TABLE IF NOT EXISTS location_adjacency (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT,
+    location_a_id TEXT REFERENCES locations(id) ON DELETE CASCADE,
+    location_b_id TEXT REFERENCES locations(id) ON DELETE CASCADE,
+    first_seen_event_id TEXT REFERENCES events(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (chat_id, location_a_id, location_b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_loc_adj_chat_a ON location_adjacency (chat_id, location_a_id);
+CREATE INDEX IF NOT EXISTS idx_loc_adj_chat_b ON location_adjacency (chat_id, location_b_id);
+
+-- C6 access-pattern indexes.
+CREATE INDEX IF NOT EXISTS idx_feels_about_from_char ON feels_about(from_char);
+CREATE INDEX IF NOT EXISTS idx_feels_about_to_char ON feels_about(to_char);
+CREATE INDEX IF NOT EXISTS idx_traits_char_chat ON traits(character_id, source_chat);
+CREATE INDEX IF NOT EXISTS idx_ingestion_status_char_status ON ingestion_status(character_name, status);
